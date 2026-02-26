@@ -229,6 +229,31 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         return out, residual_out
 
+    def fused_allreduce_gemma_rmsnorm(
+        self, input_: torch.Tensor, res_inp_: torch.Tensor, weight_: torch.Tensor, eps: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        n = input_.shape[-1]
+        total_bytes = input_.numel() * input_.element_size()
+        can_use_fuse = n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_)
+            and can_use_fuse
+        ):
+            out, res_out = ca_comm.fused_allreduce_gemma_rmsnorm(
+                input_, res_inp_, weight_, eps
+            )
+            return out, res_out
+        ar_out = self.all_reduce(input_)
+        res_inp_ = res_inp_ if res_inp_ is not None else torch.zeros_like(ar_out)
+        x = ar_out + res_inp_
+        residual_out = torch.empty_like(x).copy_(x)
+        rms = (x.float().pow(2).mean(dim=-1, keepdim=True) + eps).rsqrt()
+        out = (x.float() * rms * (1.0 + weight_.float())).to(x.dtype)
+        return out, residual_out
+
     def fused_allreduce_rmsnorm_quant(
         self, input_, res_inp_, weight_, eps
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

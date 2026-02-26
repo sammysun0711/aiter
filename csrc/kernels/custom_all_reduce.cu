@@ -560,6 +560,82 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
     }
 }
 
+void fused_allreduce_gemma_rmsnorm(fptr_t _fa,
+                                    torch::Tensor& inp,
+                                    torch::Tensor& res_inp,
+                                    torch::Tensor& res_out,
+                                    torch::Tensor& out,
+                                    torch::Tensor& w,
+                                    float eps,
+                                    std::optional<torch::Tensor> reg_buffer,
+                                    bool use_1stage)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    INSTRUMENTATION("fused_allreduce_gemma_rmsnorm", inp, out, fa->rank_, fa->world_size_);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+    TORCH_CHECK_EQ(inp.scalar_type(), res_inp.scalar_type());
+    TORCH_CHECK_EQ(inp.numel(), out.numel());
+    TORCH_CHECK_EQ(inp.numel(), res_inp.numel());
+    int n = w.numel();
+    int m = inp.numel() / n;
+
+    // Dispatch on input dtype; reg_buffer is byte-backed (uint8), so never use its scalar_type().
+    void* inp_data_ptr =
+        reg_buffer.has_value() ? reg_buffer.value().data_ptr() : inp.data_ptr();
+
+    if(reg_buffer.has_value())
+    {
+        auto input_size = inp.numel() * inp.element_size();
+        TORCH_CHECK(input_size <= reg_buffer.value().numel() * reg_buffer.value().element_size(),
+                    "registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync(reg_buffer.value().data_ptr(),
+                                inp.data_ptr(),
+                                input_size,
+                                hipMemcpyDeviceToDevice,
+                                stream));
+    }
+
+    switch(inp.scalar_type())
+    {
+    case at::ScalarType::Float:
+        fa->dispatchFusedAllReduceGemmaRMSNorm<float>(
+            stream,
+            reinterpret_cast<float*>(inp_data_ptr),
+            reinterpret_cast<float*>(res_inp.data_ptr()),
+            reinterpret_cast<float*>(res_out.data_ptr()),
+            reinterpret_cast<float*>(out.data_ptr()),
+            reinterpret_cast<float*>(w.data_ptr()),
+            eps, m, n, use_1stage);
+        break;
+    case at::ScalarType::Half:
+        fa->dispatchFusedAllReduceGemmaRMSNorm<at::Half>(
+            stream,
+            reinterpret_cast<at::Half*>(inp_data_ptr),
+            reinterpret_cast<at::Half*>(res_inp.data_ptr()),
+            reinterpret_cast<at::Half*>(res_out.data_ptr()),
+            reinterpret_cast<at::Half*>(out.data_ptr()),
+            reinterpret_cast<at::Half*>(w.data_ptr()),
+            eps, m, n, use_1stage);
+        break;
+#if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case at::ScalarType::BFloat16:
+        fa->dispatchFusedAllReduceGemmaRMSNorm<at::BFloat16>(
+            stream,
+            reinterpret_cast<at::BFloat16*>(inp_data_ptr),
+            reinterpret_cast<at::BFloat16*>(res_inp.data_ptr()),
+            reinterpret_cast<at::BFloat16*>(res_out.data_ptr()),
+            reinterpret_cast<at::BFloat16*>(out.data_ptr()),
+            reinterpret_cast<at::BFloat16*>(w.data_ptr()),
+            eps, m, n, use_1stage);
+        break;
+#endif
+    default:
+        throw std::runtime_error("fused_allreduce_gemma_rmsnorm only supports float32, float16 and bfloat16");
+    }
+}
+
 void dispose(fptr_t _fa)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);

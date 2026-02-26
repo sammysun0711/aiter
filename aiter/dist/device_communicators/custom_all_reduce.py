@@ -435,6 +435,31 @@ class CustomAllreduce:
             )
             return out, res_out, scale_out
 
+    def fused_allreduce_gemma_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual_inp_ is None:
+            residual_inp_ = torch.empty_like(input_)
+        res_out = torch.empty_like(input_)
+        out = torch.empty_like(input_)
+        use_1stage = (input_.numel() * input_.element_size()) <= 128 * 1024
+        ops.fused_allreduce_gemma_rmsnorm(
+            self._ptr,
+            input_,
+            residual_inp_,
+            res_out,
+            out,
+            weight_,
+            eps,
+            None if self._IS_CAPTURING else self.input_buffer,
+            use_1stage,
+        )
+        return out, res_out
+
     def custom_fused_ar_rms(
         self,
         input: torch.Tensor,
