@@ -1205,6 +1205,7 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_gemma_rmsnorm_naive
     __shared__ float smem[tnum];
     P* tmps = get_tmp_buf<P>(sg.signals[rank]);
 
+    const int n_packs = n / pack_size;
     for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
         float square_sum = 0.0f;
@@ -1213,21 +1214,24 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_gemma_rmsnorm_naive
 #pragma unroll
         for(int n_iter = 0; n_iter < n_loop; ++n_iter)
         {
-            int read_idx        = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
-            P reduce_out_pack   = tmps[read_idx];
-            P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
-            w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * blockDim.x + threadIdx.x);
-            A reduce_pack;
-#pragma unroll
-            for(int i = 0; i < pack_size; ++i)
+            if(n_iter * tnum + threadIdx.x < n_packs)
             {
-                float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
-                float ar_out  = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
-                float rms_inp = res_inp + ar_out;
-                rms_inp_f32[n_iter].data[i] = rms_inp;
-                reduce_pack.data[i]         = rms_inp * rms_inp;
+                int read_idx = bid * n_packs + n_iter * tnum + threadIdx.x;
+                P reduce_out_pack   = tmps[read_idx];
+                P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+                w_arr[n_iter]       = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
+                A reduce_pack;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+                    float ar_out  = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+                    float rms_inp = res_inp + ar_out;
+                    rms_inp_f32[n_iter].data[i] = rms_inp;
+                    reduce_pack.data[i]         = rms_inp * rms_inp;
+                }
+                square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
             }
-            square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
         }
         smem[threadIdx.x] = square_sum;
         __syncthreads();
@@ -1237,19 +1241,22 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_gemma_rmsnorm_naive
 #pragma unroll
         for(int n_iter = 0; n_iter < n_loop; ++n_iter)
         {
-            P rmsnorm_rslt;
-            P rmsnorm_inp;
-#pragma unroll
-            for(int i = 0; i < pack_size; ++i)
+            if(n_iter * tnum + threadIdx.x < n_packs)
             {
-                float x_f32          = rms_inp_f32[n_iter].data[i];
-                float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
-                rmsnorm_inp.data[i]  = ck_tile::type_convert<T>(x_f32);
-                rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * (1.0f + w_f32) * denom);
+                int write_idx = bid * n_packs + n_iter * tnum + threadIdx.x;
+                P rmsnorm_rslt;
+                P rmsnorm_inp;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    float x_f32          = rms_inp_f32[n_iter].data[i];
+                    float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+                    rmsnorm_inp.data[i]  = ck_tile::type_convert<T>(x_f32);
+                    rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * (1.0f + w_f32) * denom);
+                }
+                *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
+                *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
             }
-            int write_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
-            *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
-            *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
         }
     }
 }
@@ -3014,6 +3021,13 @@ void dispatchFusedAllReduceGemmaRMSNorm(hipStream_t stream,
         {
             printf("fused allreduce gemma rmsnorm shape size error\n");
         }
+    }
+    else if(n_bytes == 512)
+    {
+        // n=256 for bf16/fp16 (e.g. shape (1, 256))
+        block.x             = 256;
+        int naive_grid_size = m;
+        launch_fused_allreduce_gemma_rmsnorm((local_device_load_gemma_rmsnorm_naive<T, 256, 1>));
     }
     else
     {

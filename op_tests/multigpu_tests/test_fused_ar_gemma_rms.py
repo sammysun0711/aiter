@@ -98,6 +98,7 @@ def fused_ar_gemma_rmsnorm(
         @perftest()
         def run_ca():
             graph.replay()
+            torch.cuda.synchronize()
 
         _, us = run_ca()
         if dist.is_initialized():
@@ -162,6 +163,7 @@ def split_ar_gemma_rmsnorm(
         @perftest()
         def run_ca():
             graph.replay()
+            torch.cuda.synchronize()
 
         _, us = run_ca()
         result = out.clone()

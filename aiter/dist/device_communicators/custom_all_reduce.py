@@ -254,7 +254,13 @@ class CustomAllreduce:
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
         handles, offsets = self._gather_ipc_meta((handle, offset))
         logger.info("Registering %d cuda graph addresses", len(offset))
-        ops.register_graph_buffers(self._ptr, handles, offsets)
+        # Serialize C++ register_graph_buffers so only one rank does HIP IPC open
+        # at a time. Concurrent HIP IPC open across ranks can deadlock.
+        for r in range(self.world_size):
+            dist.barrier(group=self.group)
+            if self.rank == r:
+                ops.register_graph_buffers(self._ptr, handles, offsets)
+            dist.barrier(group=self.group)
 
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
@@ -447,6 +453,11 @@ class CustomAllreduce:
         res_out = torch.empty_like(input_)
         out = torch.empty_like(input_)
         use_1stage = (input_.numel() * input_.element_size()) <= 128 * 1024
+        # During graph capture use the actual input tensor (reg_buffer=None) so the
+        # captured graph reads/writes the real pointers; replay then uses the same
+        # tensors and gives correct results. After capture, register_graph_buffers()
+        # (with serialized HIP IPC) runs. When not capturing, use the pre-registered buffer to avoid copies.
+        reg_buffer = None if self._IS_CAPTURING else self.input_buffer
         ops.fused_allreduce_gemma_rmsnorm(
             self._ptr,
             input_,
@@ -455,7 +466,7 @@ class CustomAllreduce:
             out,
             weight_,
             eps,
-            None if self._IS_CAPTURING else self.input_buffer,
+            reg_buffer,
             use_1stage,
         )
         return out, res_out
