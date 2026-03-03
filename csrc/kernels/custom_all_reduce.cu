@@ -471,11 +471,65 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              torch::Tensor& w,
                              float eps,
                              std::optional<torch::Tensor> reg_buffer,
-                             bool use_1stage,
-                             int rmsnorm_type)
+                             bool use_1stage)
 {
+    constexpr int rmsnorm_type = 0;  // standard: scale = weight
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     INSTRUMENTATION("fused_allreduce_rmsnorm", inp, out, fa->rank_, fa->world_size_);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+    TORCH_CHECK_EQ(inp.scalar_type(), res_inp.scalar_type());
+    TORCH_CHECK_EQ(inp.numel(), out.numel());
+    TORCH_CHECK_EQ(inp.numel(), res_inp.numel());
+    int n          = w.numel();
+    int m          = inp.numel() / n;
+    auto scale_out = torch::Tensor();
+
+    if(reg_buffer.has_value())
+    {
+        auto input_size = inp.numel() * inp.element_size();
+        TORCH_CHECK(input_size <= reg_buffer.value().numel() * reg_buffer.value().element_size(),
+                    "registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync(reg_buffer.value().data_ptr(),
+                                inp.data_ptr(),
+                                input_size,
+                                hipMemcpyDeviceToDevice,
+                                stream));
+        _fused_allreduce_rmsnorm(_fa,
+                                 reg_buffer.value(),
+                                 res_inp,
+                                 res_out,
+                                 out,
+                                 scale_out,
+                                 w,
+                                 eps,
+                                 m,
+                                 n,
+                                 use_1stage,
+                                 rmsnorm_type,
+                                 stream);
+    }
+    else
+    {
+        _fused_allreduce_rmsnorm(
+            _fa, inp, res_inp, res_out, out, scale_out, w, eps, m, n, use_1stage, rmsnorm_type, stream);
+    }
+}
+
+void fused_allreduce_gemma_rmsnorm(fptr_t _fa,
+                                   torch::Tensor& inp,
+                                   torch::Tensor& res_inp,
+                                   torch::Tensor& res_out,
+                                   torch::Tensor& out,
+                                   torch::Tensor& w,
+                                   float eps,
+                                   std::optional<torch::Tensor> reg_buffer,
+                                   bool use_1stage)
+{
+    constexpr int rmsnorm_type = 1;  // Gemma: scale = 1 + weight
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    INSTRUMENTATION("fused_allreduce_gemma_rmsnorm", inp, out, fa->rank_, fa->world_size_);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
@@ -526,9 +580,59 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    torch::Tensor& w,
                                    float eps,
                                    std::optional<torch::Tensor> reg_buffer,
-                                   bool use_1stage,
-                                   int rmsnorm_type)
+                                   bool use_1stage)
 {
+    constexpr int rmsnorm_type = 0;  // standard: scale = weight
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    TORCH_CHECK_EQ(inp.scalar_type(), res_inp.scalar_type());
+    TORCH_CHECK_EQ(inp.numel(), res_inp.numel());
+    int n = w.numel();
+    int m = inp.numel() / n;
+
+    if(reg_buffer.has_value())
+    {
+        auto input_size = inp.numel() * inp.element_size();
+        TORCH_CHECK(input_size <= reg_buffer.value().numel() * reg_buffer.value().element_size(),
+                    "registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync(reg_buffer.value().data_ptr(),
+                                inp.data_ptr(),
+                                input_size,
+                                hipMemcpyDeviceToDevice,
+                                stream));
+        _fused_allreduce_rmsnorm(_fa,
+                                 reg_buffer.value(),
+                                 res_inp,
+                                 res_out,
+                                 out,
+                                 scale_out,
+                                 w,
+                                 eps,
+                                 m,
+                                 n,
+                                 use_1stage,
+                                 rmsnorm_type,
+                                 stream);
+    }
+    else
+    {
+        _fused_allreduce_rmsnorm(
+            _fa, inp, res_inp, res_out, out, scale_out, w, eps, m, n, use_1stage, rmsnorm_type, stream);
+    }
+}
+
+void fused_allreduce_gemma_rmsnorm_quant(fptr_t _fa,
+                                         torch::Tensor& inp,
+                                         torch::Tensor& res_inp,
+                                         torch::Tensor& res_out,
+                                         torch::Tensor& out,
+                                         torch::Tensor& scale_out,
+                                         torch::Tensor& w,
+                                         float eps,
+                                         std::optional<torch::Tensor> reg_buffer,
+                                         bool use_1stage)
+{
+    constexpr int rmsnorm_type = 1;  // Gemma: scale = 1 + weight
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), res_inp.scalar_type());

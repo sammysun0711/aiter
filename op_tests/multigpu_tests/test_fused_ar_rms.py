@@ -26,6 +26,8 @@ from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
     tensor_model_parallel_fused_allreduce_rmsnorm_quant,
+    tensor_model_parallel_fused_allreduce_gemma_rmsnorm,
+    tensor_model_parallel_fused_allreduce_gemma_rmsnorm_quant,
 )
 from aiter.test_common import (
     checkAllclose,
@@ -40,59 +42,37 @@ logger = logging.getLogger("aiter")
 set_start_method("spawn", force=True)
 
 
-def fused_ar_rmsnorm(
-    tp_size,
-    pp_size,
-    rankID,
+def _fused_ar_rmsnorm_impl(
     x,
     weight,
     eps,
-    withGraph=False,
-    distributed_init_method: Optional[str] = None,
-    post_per_token_quant: bool = False,
-    rmsnorm_type: int = 0,
+    withGraph,
+    post_per_token_quant,
+    use_gemma,
 ):
-    device = torch.device(f"cuda:{rankID}")
-    torch.cuda.set_device(device)
-    # init
-    logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
-    set_custom_all_reduce(True)
-    init_distributed_environment(
-        world_size=tp_size,
-        rank=rankID,
-        distributed_init_method=distributed_init_method,
-    )
-    ensure_model_parallel_initialized(tp_size, pp_size)
-    x = x.to(device)
-    weight = weight.to(device)
-    # dist.barrier(device_ids=[i for i in range(tp_size)])
-
-    # warmup and align all gpu
-    group = get_tp_group().device_group
-    dist.all_reduce(torch.zeros(1).cuda(), group=group)
-    torch.cuda.synchronize()
+    """Shared impl: use_gemma=True -> Gemma API, else standard RMSNorm."""
+    if use_gemma:
+        fused_fn = tensor_model_parallel_fused_allreduce_gemma_rmsnorm
+        fused_quant_fn = tensor_model_parallel_fused_allreduce_gemma_rmsnorm_quant
+    else:
+        fused_fn = tensor_model_parallel_fused_allreduce_rmsnorm
+        fused_quant_fn = tensor_model_parallel_fused_allreduce_rmsnorm_quant
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
                 if not post_per_token_quant:
-                    out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
-                        x, x, weight, eps, rmsnorm_type=rmsnorm_type
-                    )
+                    out, res_out = fused_fn(x, x, weight, eps)
                 else:
-                    out, res_out, scale_out = (
-                        tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-                            x, x, weight, eps, rmsnorm_type=rmsnorm_type
-                        )
-                    )
+                    out, res_out, scale_out = fused_quant_fn(x, x, weight, eps)
         out.fill_(0)
         res_out.fill_(0)
 
         @perftest()
         def run_ca():
             graph.replay()
-            torch.cuda.synchronize()
+            #torch.cuda.synchronize()
 
         _, us = run_ca()
         if not post_per_token_quant:
@@ -104,16 +84,10 @@ def fused_ar_rmsnorm(
         @perftest()
         def run_ca(x):
             if not post_per_token_quant:
-                out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
-                    x, x, weight, eps, rmsnorm_type=rmsnorm_type
-                )
+                out, res_out = fused_fn(x, x, weight, eps)
                 return out
             else:
-                out, res_out, scale_out = (
-                    tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-                        x, x, weight, eps, rmsnorm_type=rmsnorm_type
-                    )
-                )
+                out, res_out, scale_out = fused_quant_fn(x, x, weight, eps)
                 return out, scale_out
 
         if not post_per_token_quant:
@@ -121,8 +95,80 @@ def fused_ar_rmsnorm(
         else:
             out = run_ca(x)
             out = (out[0][0].float() * out[0][1], out[1])
+    return out
 
-    # destroy
+
+def fused_ar_rmsnorm(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    weight,
+    eps,
+    withGraph=False,
+    distributed_init_method: Optional[str] = None,
+    post_per_token_quant: bool = False,
+):
+    """Standard RMSNorm (scale = weight)."""
+    device = torch.device(f"cuda:{rankID}")
+    torch.cuda.set_device(device)
+    logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp_size,
+        rank=rankID,
+        distributed_init_method=distributed_init_method,
+    )
+    ensure_model_parallel_initialized(tp_size, pp_size)
+    x = x.to(device)
+    weight = weight.to(device)
+    group = get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    torch.cuda.synchronize()
+
+    out = _fused_ar_rmsnorm_impl(
+        x, weight, eps, withGraph, post_per_token_quant, use_gemma=False
+    )
+
+    if dist.is_initialized():
+        destroy_model_parallel()
+        destroy_distributed_environment()
+        torch.cuda.empty_cache()
+    return out
+
+
+def fused_ar_gemma_rmsnorm(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    weight,
+    eps,
+    withGraph=False,
+    distributed_init_method: Optional[str] = None,
+    post_per_token_quant: bool = False,
+):
+    """Gemma RMSNorm (scale = 1 + weight)."""
+    device = torch.device(f"cuda:{rankID}")
+    torch.cuda.set_device(device)
+    logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp_size,
+        rank=rankID,
+        distributed_init_method=distributed_init_method,
+    )
+    ensure_model_parallel_initialized(tp_size, pp_size)
+    x = x.to(device)
+    weight = weight.to(device)
+    group = get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    torch.cuda.synchronize()
+
+    out = _fused_ar_rmsnorm_impl(
+        x, weight, eps, withGraph, post_per_token_quant, use_gemma=True
+    )
+
     if dist.is_initialized():
         destroy_model_parallel()
         destroy_distributed_environment()
@@ -172,7 +218,7 @@ def get_acc_value_with_cudagraph(
 
     def run_ca():
         graph.replay()
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
         rslt = out.clone()
         out.fill_(0)
         return rslt
@@ -280,7 +326,7 @@ def split_ar_rmsnorm(
         @perftest()
         def run_ca():
             graph.replay()
-            torch.cuda.synchronize()
+            #torch.cuda.synchronize()
 
         _, us = run_ca()
         out = (out, us)
@@ -463,7 +509,7 @@ def test_fused_ar_rmsnorm_gemma(
     distributed_init_method: Optional[str] = None,
     post_per_token_quant=False,
 ):
-    """Test fused allreduce + GemmaRMSNorm (rmsnorm_type=1): output = x_norm * (1 + weight)."""
+    """Test fused allreduce + Gemma RMSNorm (separate API): output = x_norm * (1 + weight)."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     pool = Pool(processes=tp_size)
@@ -474,7 +520,6 @@ def test_fused_ar_rmsnorm_gemma(
     res_inp = []
     m, n = shape[0], shape[1]
     eps = 1e-6
-    rmsnorm_type = 1  # Gemma
     for i in range(tp_size):
         x = torch.randn(shape, dtype=dtype)
         res_inp.append(x)
@@ -484,7 +529,7 @@ def test_fused_ar_rmsnorm_gemma(
         weight_list.append(weight)
         rets.append(
             pool.apply_async(
-                fused_ar_rmsnorm,
+                fused_ar_gemma_rmsnorm,
                 args=(
                     tp_size,
                     pp_size,
@@ -495,7 +540,6 @@ def test_fused_ar_rmsnorm_gemma(
                     withGraph,
                     distributed_init_method,
                     False,  # post_per_token_quant
-                    rmsnorm_type,
                 ),
             )
         )
@@ -758,3 +802,14 @@ if __name__ == "__main__":
         #     ),
         #     post_per_token_quant=True,
         # )
+        test_fused_ar_rmsnorm_gemma(
+            tp,
+            pp,
+            shape,
+            dtype,
+            withGraph=graph_on,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+            post_per_token_quant=True,
+        )

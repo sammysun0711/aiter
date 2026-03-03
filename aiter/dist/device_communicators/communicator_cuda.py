@@ -191,7 +191,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return out
 
     def fused_allreduce_rmsnorm(
-        self, input_, res_inp_, weight_, eps, rmsnorm_type: int = 0
+        self, input_, res_inp_, weight_, eps
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n = input_.shape[-1]
         total_bytes = input_.numel() * input_.element_size()
@@ -207,12 +207,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             use_1stage = True if total_bytes <= 128 * 1024 else False
             out, res_out = ca_comm.custom_fused_ar_rms(
-                input_, res_inp_, weight_, eps, use_1stage, rmsnorm_type
+                input_, res_inp_, weight_, eps, use_1stage
             )
             assert out is not None
             assert res_out is not None
             return out, res_out
-        # call split kernel
+        # call split kernel (standard RMSNorm)
         ar_out = self.all_reduce(input_)
         out = torch.empty_like(ar_out)
         residual_out = torch.empty_like(ar_out)
@@ -225,12 +225,51 @@ class CudaCommunicator(DeviceCommunicatorBase):
             residual_out,
             weight_,
             eps,
-            0,
+            0,  # standard
+        )
+        return out, residual_out
+
+    def fused_allreduce_gemma_rmsnorm(
+        self, input_, res_inp_, weight_, eps
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        n = input_.shape[-1]
+        total_bytes = input_.numel() * input_.element_size()
+        can_use_fuse_ar_rms = (
+            n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
+        )
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_)
+            and can_use_fuse_ar_rms
+            and hasattr(ca_comm, "custom_fused_ar_gemma_rms")
+        ):
+            use_1stage = True if total_bytes <= 128 * 1024 else False
+            out, res_out = ca_comm.custom_fused_ar_gemma_rms(
+                input_, res_inp_, weight_, eps, use_1stage
+            )
+            if out is not None and res_out is not None:
+                return out, res_out
+        # fallback: split kernel with Gemma scale (1+weight)
+        ar_out = self.all_reduce(input_)
+        out = torch.empty_like(ar_out)
+        residual_out = torch.empty_like(ar_out)
+        from aiter import rmsnorm2d_fwd_with_add
+
+        rmsnorm2d_fwd_with_add(
+            out,
+            ar_out,
+            res_inp_,
+            residual_out,
+            weight_,
+            eps,
+            1,  # Gemma
         )
         return out, residual_out
 
     def fused_allreduce_rmsnorm_quant(
-        self, input_, res_inp_, weight_, eps, rmsnorm_type: int = 0
+        self, input_, res_inp_, weight_, eps
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         total_bytes = input_.numel() * input_.element_size()
         if (
@@ -239,17 +278,42 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             use_1stage = True if total_bytes <= 128 * 1024 else False
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
-                input_, res_inp_, weight_, eps, use_1stage, rmsnorm_type
+                input_, res_inp_, weight_, eps, use_1stage
             )
         else:
             out_, res_out = self.fused_allreduce_rmsnorm(
-                input_, res_inp_, weight_, eps, rmsnorm_type
+                input_, res_inp_, weight_, eps
             )
             hip_quant = get_hip_quant(QuantType.per_Token)
             out, scale_out = hip_quant(out_, quant_dtype=fp8)
         assert out is not None
         assert res_out is not None
         assert scale_out is not None
+        return out, res_out, scale_out
+
+    def fused_allreduce_gemma_rmsnorm_quant(
+        self, input_, res_inp_, weight_, eps
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        total_bytes = input_.numel() * input_.element_size()
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is not None
+            and hasattr(ca_comm, "custom_fused_ar_gemma_rms_quant")
+            and int(input_.shape[-1]) in [512, 1024, 2048, 4096]
+            and total_bytes <= 4096 * 1024
+        ):
+            use_1stage = True if total_bytes <= 128 * 1024 else False
+            result = ca_comm.custom_fused_ar_gemma_rms_quant(
+                input_, res_inp_, weight_, eps, use_1stage
+            )
+            if result is not None:
+                out, res_out, scale_out = result
+                return out, res_out, scale_out
+        out_, res_out = self.fused_allreduce_gemma_rmsnorm(
+            input_, res_inp_, weight_, eps
+        )
+        hip_quant = get_hip_quant(QuantType.per_Token)
+        out, scale_out = hip_quant(out_, quant_dtype=fp8)
         return out, res_out, scale_out
 
     def reduce_scatter(

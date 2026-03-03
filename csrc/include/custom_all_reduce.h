@@ -44,7 +44,7 @@ void all_gather_unreg(fptr_t _fa,
                       torch::Tensor& inp,
                       torch::Tensor& reg_buffer,
                       torch::Tensor& out);
-// rmsnorm_type: 0 = standard (output = x_norm * weight), 1 = Gemma (output = x_norm * (1 + weight))
+// Standard RMSNorm (scale = weight)
 void fused_allreduce_rmsnorm(fptr_t _fa,
                              torch::Tensor& inp,
                              torch::Tensor& res_inp,
@@ -53,8 +53,17 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              torch::Tensor& w,
                              float eps,
                              std::optional<torch::Tensor> reg_buffer,
-                             bool use_1stage,
-                             int rmsnorm_type = 0);
+                             bool use_1stage);
+// Gemma RMSNorm (scale = 1 + weight), separate API for backward compatibility
+void fused_allreduce_gemma_rmsnorm(fptr_t _fa,
+                                   torch::Tensor& inp,
+                                   torch::Tensor& res_inp,
+                                   torch::Tensor& res_out,
+                                   torch::Tensor& out,
+                                   torch::Tensor& w,
+                                   float eps,
+                                   std::optional<torch::Tensor> reg_buffer,
+                                   bool use_1stage);
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    torch::Tensor& inp,
                                    torch::Tensor& res_inp,
@@ -64,8 +73,17 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    torch::Tensor& w,
                                    float eps,
                                    std::optional<torch::Tensor> reg_buffer,
-                                   bool use_1stage,
-                                   int rmsnorm_type = 0);
+                                   bool use_1stage);
+void fused_allreduce_gemma_rmsnorm_quant(fptr_t _fa,
+                                         torch::Tensor& inp,
+                                         torch::Tensor& res_inp,
+                                         torch::Tensor& res_out,
+                                         torch::Tensor& out,
+                                         torch::Tensor& scale_out,
+                                         torch::Tensor& w,
+                                         float eps,
+                                         std::optional<torch::Tensor> reg_buffer,
+                                         bool use_1stage);
 
 void dispose(fptr_t _fa);
 int64_t meta_size();
