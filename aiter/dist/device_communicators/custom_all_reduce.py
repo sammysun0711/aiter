@@ -400,6 +400,7 @@ class CustomAllreduce:
         registered: bool = False,
         use_1stage: bool = False,
         post_per_token_quant: bool = False,
+        rmsnorm_type: int = 0,
     ):
         if res_out is None:
             res_out = torch.empty_like(inp)
@@ -416,6 +417,7 @@ class CustomAllreduce:
                 eps,
                 None if registered else self.input_buffer,
                 use_1stage,
+                rmsnorm_type,
             )
             return out, res_out
         else:
@@ -434,6 +436,7 @@ class CustomAllreduce:
                 eps,
                 None if registered else self.input_buffer,
                 use_1stage,
+                rmsnorm_type,
             )
             return out, res_out, scale_out
 
@@ -444,6 +447,7 @@ class CustomAllreduce:
         weight: torch.Tensor,
         eps: float,
         use_1stage: bool,
+        rmsnorm_type: int = 0,
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -451,15 +455,15 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.fused_ar_rms(
-                    input, residual_inp, w=weight, eps=eps, registered=True, use_1stage=use_1stage,
+                    input, residual_inp, w=weight, eps=eps, registered=True, use_1stage=use_1stage, rmsnorm_type=rmsnorm_type,
                 )
             else:
                 return torch.zeros_like(input), torch.zeros_like(input)
         else:
             return self.fused_ar_rms(
-                input, residual_inp, w=weight, eps=eps, registered=False, use_1stage=use_1stage,
+                input, residual_inp, w=weight, eps=eps, registered=False, use_1stage=use_1stage, rmsnorm_type=rmsnorm_type,
             )
-    
+
     def custom_fused_ar_rms_quant(
         self,
         input: torch.Tensor,
@@ -467,6 +471,7 @@ class CustomAllreduce:
         weight: torch.Tensor,
         eps: float,
         use_1stage: bool,
+        rmsnorm_type: int = 0,
     ):
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -474,7 +479,7 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.fused_ar_rms(
-                    input, residual_inp, w=weight, eps=eps, registered=True, use_1stage=use_1stage, post_per_token_quant=True,
+                    input, residual_inp, w=weight, eps=eps, registered=True, use_1stage=use_1stage, post_per_token_quant=True, rmsnorm_type=rmsnorm_type,
                 )
             else:
                 dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
@@ -482,7 +487,7 @@ class CustomAllreduce:
                 return dummy_out, torch.zeros_like(input), dummy_scale_out
         else:
             return self.fused_ar_rms(
-                input, residual_inp, w=weight, eps=eps, registered=False, use_1stage=use_1stage, post_per_token_quant=True,
+                input, residual_inp, w=weight, eps=eps, registered=False, use_1stage=use_1stage, post_per_token_quant=True, rmsnorm_type=rmsnorm_type,
             )
 
     def close(self):

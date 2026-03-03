@@ -1078,7 +1078,8 @@ __global__ void __launch_bounds__(tnum, 1)
                                     float eps,
                                     int rank,
                                     int m,
-                                    int n)
+                                    int n,
+                                    int rmsnorm_type)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1125,8 +1126,9 @@ __global__ void __launch_bounds__(tnum, 1)
             {
                 float x_f32          = rms_inp_f32[n_iter][i];
                 float w_f32          = upcast_s(w_arr[n_iter][i]);
+                float scale          = (rmsnorm_type == 1) ? (1.0f + w_f32) : w_f32;  // 1 = Gemma
                 rmsnorm_inp[i]  = downcast_s<T>(x_f32);
-                rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
+                rmsnorm_rslt[i] = downcast_s<T>(x_f32 * scale * denom);
             }
             int write_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
             *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
@@ -1148,7 +1150,8 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                                                                      float eps,
                                                                      int rank,
                                                                      int m,
-                                                                     int n)
+                                                                     int n,
+                                                                     int rmsnorm_type)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1200,8 +1203,9 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                 {
                     float x_f32          = rms_inp_f32[n_iter][i];
                     float w_f32          = upcast_s(w_arr[n_iter][i]);
+                    float scale          = (rmsnorm_type == 1) ? (1.0f + w_f32) : w_f32;  // 1 = Gemma
                     rmsnorm_inp[i]  = downcast_s<T>(x_f32);
-                    rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
+                    rmsnorm_rslt[i] = downcast_s<T>(x_f32 * scale * denom);
                 }
                 int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
                 *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
@@ -1221,7 +1225,8 @@ __global__ void __launch_bounds__(256, 1)
                                    float eps,
                                    int rank,
                                    int m,
-                                   int n)
+                                   int n,
+                                   int rmsnorm_type)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1268,8 +1273,9 @@ __global__ void __launch_bounds__(256, 1)
             {
                 float x_f32          = rms_inp_f32[n_iter][i];
                 float w_f32          = upcast_s(w_arr[n_iter][i]);
+                float scale          = (rmsnorm_type == 1) ? (1.0f + w_f32) : w_f32;  // 1 = Gemma
                 rmsnorm_inp[i]  = downcast_s<T>(x_f32);
-                rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
+                rmsnorm_rslt[i] = downcast_s<T>(x_f32 * scale * denom);
             }
             int write_idx = bid * 64 * n_loop + n_iter * 64 + lane_id;
             *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
@@ -1297,7 +1303,8 @@ __device__ __forceinline__ T ar_fusion_epilogue_block_reduce(T val)
 }
 
 template <typename P, typename A, typename O, typename OT, int PACK_SIZE, int BLOCK_SIZE, int WARP_SIZE = 32>
-__device__ __forceinline__ void ar_fusion_epilogue_rms_norm(O &out, A &in, P &weight, float eps, int hidden_dim)
+__device__ __forceinline__ void ar_fusion_epilogue_rms_norm(
+    O &out, A &in, P &weight, float eps, int hidden_dim, int rmsnorm_type)
 {
     __shared__ float s_val;
     float acc = 0.f;
@@ -1313,7 +1320,9 @@ __device__ __forceinline__ void ar_fusion_epilogue_rms_norm(O &out, A &in, P &we
     __syncthreads();
 #pragma unroll
     for (int i = 0; i < PACK_SIZE; ++i) {
-        float out_ = in[i] * s_val * upcast_s(weight[i]);
+        float w = upcast_s(weight[i]);
+        float scale = (rmsnorm_type == 1) ? (1.0f + w) : w;  // 1 = Gemma: output = x_norm * (1 + weight)
+        float out_ = in[i] * s_val * scale;
         out[i] = downcast_s<OT>(out_);
     }
 }
@@ -1347,18 +1356,19 @@ __device__ __forceinline__ void ar_fusion_epilogue(
     int idx,
     int tidx,
     OutT* __restrict__ output,
-    float* __restrict__ scale_out)
+    float* __restrict__ scale_out,
+    int rmsnorm_type)
 {
     if constexpr (std::is_same_v<T, OutT>) {
         P out;
-        ar_fusion_epilogue_rms_norm<P, A, P, T, PACK_SIZE, BLOCK_SIZE>(out, in, weight, eps, hidden_dim);
+        ar_fusion_epilogue_rms_norm<P, A, P, T, PACK_SIZE, BLOCK_SIZE>(out, in, weight, eps, hidden_dim, rmsnorm_type);
         *reinterpret_cast<P *>(output + idx) = out;
     } else {
         float FP8_UPBOUND = opus::cast<opus::fp32_t>(opus::numeric_limits<opus::fp8_t>::max());
         using OP = opus::vector_t<OutT, PACK_SIZE>;
         OP out_quant;
         A out;
-        ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE, BLOCK_SIZE>(out, in, weight, eps, hidden_dim);
+        ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE, BLOCK_SIZE>(out, in, weight, eps, hidden_dim, rmsnorm_type);
         float amax = ar_fusion_epilogue_reduce_abs_max<A, PACK_SIZE, BLOCK_SIZE>(out);
         float scale = amax == 0.f ? 1.f : amax / FP8_UPBOUND;
         out_quant = packQuant<opus::fp32_t, PACK_SIZE>(out, scale);
@@ -1381,7 +1391,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_1stage(
     float* __restrict__ scale_out,
     int size,
     int hidden_dim,
-    float eps)
+    float eps,
+    int rmsnorm_type)
 {
     constexpr int pack_size = 16 / sizeof(T);
     constexpr int tnum_gpu  = BLOCK_SIZE / ngpus;
@@ -1431,7 +1442,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_1stage(
     *reinterpret_cast<P *>(residual_out + idx) = vec;
     P weight_p = *reinterpret_cast<P *>(weight + access_id_in_token);
     ar_fusion_epilogue<P, A, T, OutT, pack_size, BLOCK_SIZE>(
-        acc, weight_p, hidden_dim, eps, idx, tidx, output, scale_out);
+        acc, weight_p, hidden_dim, eps, idx, tidx, output, scale_out, rmsnorm_type);
 }
 
 template <typename T, typename OutT, int NGPUS, int HIDDEN_DIM>
@@ -1447,6 +1458,7 @@ void allreduce_fusion_kernel_1stage_launcher(
     float *scale_out,
     int size,
     float eps,
+    int rmsnorm_type,
     hipStream_t stream)
 {
     constexpr int PACK_SIZE = 16 / sizeof(T);
@@ -1457,7 +1469,7 @@ void allreduce_fusion_kernel_1stage_launcher(
     dim3 threadsPerBlock(BLOCK_SIZE);
     dim3 numBlocks(token_num);
     allreduce_fusion_kernel_1stage<T, OutT, NGPUS, BLOCK_SIZE><<<numBlocks, threadsPerBlock, 0, stream>>>(
-        _dp, sg, self_sg, rank, residual_inp, residual_out, output, weight, scale_out, size, HIDDEN_DIM, eps);
+        _dp, sg, self_sg, rank, residual_inp, residual_out, output, weight, scale_out, size, HIDDEN_DIM, eps, rmsnorm_type);
 }
 
 template <typename T, typename OutT, int ngpus, int BLOCK_SIZE>
@@ -1473,7 +1485,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
                                    float* __restrict__ scale_out,
                                    int size,
                                    int hidden_dim,
-                                   float eps)
+                                   float eps,
+                                   int rmsnorm_type)
 {
     constexpr int pack_size = 16 / sizeof(T);
     constexpr int tnum_gpu  = BLOCK_SIZE / ngpus;
@@ -1549,7 +1562,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
             acc[v] = upcast_s(vec[v]);
         }
         ar_fusion_epilogue<P, A, T, OutT, pack_size, BLOCK_SIZE>(
-            acc, weight_p, hidden_dim, eps, idx, tidx, output, scale_out);
+            acc, weight_p, hidden_dim, eps, idx, tidx, output, scale_out, rmsnorm_type);
     }
 }
 
@@ -1565,6 +1578,7 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                              float* scale_out,
                                              int size,
                                              float eps,
+                                             int rmsnorm_type,
                                              hipStream_t stream)
 {
     constexpr int PACK_SIZE  = 16 / sizeof(T);
@@ -1585,7 +1599,8 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                                     scale_out,
                                                     size,
                                                     HIDDEN_DIM,
-                                                    eps);
+                                                    eps,
+                                                    rmsnorm_type);
 }
 
 template <typename T, typename OutT, int BLOCK_SIZE>
@@ -1599,7 +1614,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
                                           float* __restrict__ scale_out,
                                           int size,
                                           int hidden_dim,
-                                          float eps)
+                                          float eps,
+                                          int rmsnorm_type)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1625,7 +1641,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
             acc[v] = upcast_s(vec[v]);
         }
         ar_fusion_epilogue<P, A, T, OutT, pack_size, BLOCK_SIZE>(
-            acc, weight_p, hidden_dim, eps, idx, tidx, output, scale_out);
+            acc, weight_p, hidden_dim, eps, idx, tidx, output, scale_out, rmsnorm_type);
     }
 }
 
@@ -1641,6 +1657,7 @@ void allreduce_fusion_kernel_split_launcher(RankData* _dp,
                                             float* scale_out,
                                             int size,
                                             float eps,
+                                            int rmsnorm_type,
                                             hipStream_t stream)
 {
     // step 1, run reduce-scatter + allgather cross device save
@@ -1671,7 +1688,7 @@ void allreduce_fusion_kernel_split_launcher(RankData* _dp,
     dim3 numBlocks(nblocks);
     local_device_load_rmsnorm_quant_naive<T, OutT, BLOCK_SIZE>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(
-            sg, rank, residual_inp, residual_out, output, weight, scale_out, size, HIDDEN_DIM, eps);
+            sg, rank, residual_inp, residual_out, output, weight, scale_out, size, HIDDEN_DIM, eps, rmsnorm_type);
 }
 
 using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
@@ -2316,7 +2333,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    float eps,
                                    int m,
                                    int n,
-                                   bool use_1stage)
+                                   bool use_1stage,
+                                   int rmsnorm_type)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -2347,6 +2365,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                                                 nullptr,      \
                                                                 size,         \
                                                                 eps,          \
+                                                                rmsnorm_type, \
                                                                 stream);      \
         return;                                                               \
     }
@@ -2403,7 +2422,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);       \
         setGrid(naive_grid_size, kernel_ptr);                                   \
         template_kernel<<<grid, block, 0, stream>>>(                            \
-            sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
+            sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, rmsnorm_type); \
     } while(0)
 
     if(n_bytes % 1024 == 0)
@@ -2496,7 +2515,8 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
                                         float eps,
                                         int m,
                                         int n,
-                                        bool use_1stage)
+                                        bool use_1stage,
+                                        int rmsnorm_type)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -2523,6 +2543,7 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
                                 scale_out,           \
                                 size,                \
                                 eps,                 \
+                                rmsnorm_type,        \
                                 stream);             \
         return;                                      \
     }

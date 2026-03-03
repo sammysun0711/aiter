@@ -44,6 +44,7 @@ void all_gather_unreg(fptr_t _fa,
                       torch::Tensor& inp,
                       torch::Tensor& reg_buffer,
                       torch::Tensor& out);
+// rmsnorm_type: 0 = standard (output = x_norm * weight), 1 = Gemma (output = x_norm * (1 + weight))
 void fused_allreduce_rmsnorm(fptr_t _fa,
                              torch::Tensor& inp,
                              torch::Tensor& res_inp,
@@ -52,7 +53,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              torch::Tensor& w,
                              float eps,
                              std::optional<torch::Tensor> reg_buffer,
-                             bool use_1stage);
+                             bool use_1stage,
+                             int rmsnorm_type = 0);
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    torch::Tensor& inp,
                                    torch::Tensor& res_inp,
@@ -62,7 +64,8 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    torch::Tensor& w,
                                    float eps,
                                    std::optional<torch::Tensor> reg_buffer,
-                                   bool use_1stage);
+                                   bool use_1stage,
+                                   int rmsnorm_type = 0);
 
 void dispose(fptr_t _fa);
 int64_t meta_size();

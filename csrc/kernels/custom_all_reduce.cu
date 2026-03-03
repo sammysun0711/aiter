@@ -396,10 +396,11 @@ void _fused_allreduce_rmsnorm(fptr_t _fa,
                               torch::Tensor& out,
                               torch::Tensor& scale_out,
                               torch::Tensor& w,
-                              int eps,
+                              float eps,
                               int m,
                               int n,
                               bool use_1stage,
+                              int rmsnorm_type,
                               hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -419,7 +420,8 @@ void _fused_allreduce_rmsnorm(fptr_t _fa,
             eps,                                                 \
             m,                                                   \
             n,                                                   \
-            use_1stage);                                         \
+            use_1stage,                                          \
+            rmsnorm_type);                                       \
     }                                                            \
     else                                                         \
     {                                                            \
@@ -434,7 +436,8 @@ void _fused_allreduce_rmsnorm(fptr_t _fa,
             eps,                                                 \
             m,                                                   \
             n,                                                   \
-            use_1stage);                                         \
+            use_1stage,                                          \
+            rmsnorm_type);                                       \
     }
 
     switch(residual_inp.scalar_type())
@@ -468,7 +471,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              torch::Tensor& w,
                              float eps,
                              std::optional<torch::Tensor> reg_buffer,
-                             bool use_1stage)
+                             bool use_1stage,
+                             int rmsnorm_type)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     INSTRUMENTATION("fused_allreduce_rmsnorm", inp, out, fa->rank_, fa->world_size_);
@@ -503,12 +507,13 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                                  m,
                                  n,
                                  use_1stage,
+                                 rmsnorm_type,
                                  stream);
     }
     else
     {
         _fused_allreduce_rmsnorm(
-            _fa, inp, res_inp, res_out, out, scale_out, w, eps, m, n, use_1stage, stream);
+            _fa, inp, res_inp, res_out, out, scale_out, w, eps, m, n, use_1stage, rmsnorm_type, stream);
     }
 }
 
@@ -521,7 +526,8 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    torch::Tensor& w,
                                    float eps,
                                    std::optional<torch::Tensor> reg_buffer,
-                                   bool use_1stage)
+                                   bool use_1stage,
+                                   int rmsnorm_type)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
@@ -551,12 +557,13 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                  m,
                                  n,
                                  use_1stage,
+                                 rmsnorm_type,
                                  stream);
     }
     else
     {
         _fused_allreduce_rmsnorm(
-            _fa, inp, res_inp, res_out, out, scale_out, w, eps, m, n, use_1stage, stream);
+            _fa, inp, res_inp, res_out, out, scale_out, w, eps, m, n, use_1stage, rmsnorm_type, stream);
     }
 }
 

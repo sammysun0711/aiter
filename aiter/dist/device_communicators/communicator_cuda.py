@@ -191,7 +191,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return out
 
     def fused_allreduce_rmsnorm(
-        self, input_, res_inp_, weight_, eps
+        self, input_, res_inp_, weight_, eps, rmsnorm_type: int = 0
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n = input_.shape[-1]
         total_bytes = input_.numel() * input_.element_size()
@@ -207,7 +207,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             use_1stage = True if total_bytes <= 128 * 1024 else False
             out, res_out = ca_comm.custom_fused_ar_rms(
-                input_, res_inp_, weight_, eps, use_1stage
+                input_, res_inp_, weight_, eps, use_1stage, rmsnorm_type
             )
             assert out is not None
             assert res_out is not None
@@ -230,7 +230,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return out, residual_out
 
     def fused_allreduce_rmsnorm_quant(
-        self, input_, res_inp_, weight_, eps
+        self, input_, res_inp_, weight_, eps, rmsnorm_type: int = 0
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         total_bytes = input_.numel() * input_.element_size()
         if (
@@ -239,10 +239,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             use_1stage = True if total_bytes <= 128 * 1024 else False
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
-                input_, res_inp_, weight_, eps, use_1stage
+                input_, res_inp_, weight_, eps, use_1stage, rmsnorm_type
             )
         else:
-            out_, res_out = self.fused_allreduce_rmsnorm(input_, res_inp_, weight_, eps)
+            out_, res_out = self.fused_allreduce_rmsnorm(
+                input_, res_inp_, weight_, eps, rmsnorm_type
+            )
             hip_quant = get_hip_quant(QuantType.per_Token)
             out, scale_out = hip_quant(out_, quant_dtype=fp8)
         assert out is not None
