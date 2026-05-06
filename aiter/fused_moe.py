@@ -147,9 +147,11 @@ def fused_moe(
     if os.environ.get('AITER_MOE_SMALL_BATCH', '0') == '1' and hidden_states.shape[0] <= 32 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and \
         ((quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)):
 
-        from pyhip.contrib.moe import moe_gemm_batch1, moe_gemm_batch, moe_2stage_splitk
+        from pyhip.contrib.moe import moe_gemm_batch1, moe_gemm_batch, moe_2stage_splitk, moe_2stage_down_loopn
         fp8_ptpc = ((quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz))
         B = hidden_states.shape[0]
+        HIDDEN_SIZE = hidden_states.shape[1]
+        #print("=============================== HIDDEN_SIZE =================================", HIDDEN_SIZE)
         E, N1, K1 = w1.shape
         N2, K2 = w2.shape[1], w2.shape[2]
         TOPK = topk_ids.shape[1]
@@ -186,13 +188,45 @@ def fused_moe(
             moe_gemm_batch([N1 // 32, grid], [256],
                             w1.dtype, True,
                             hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B, N1, K1, TOPK)
-            BLOCK_TILE_SIZE_M = 16
-            BLOCK_TILE_SIZE_N = 64
-            moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, grid], [64],
-                            w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                            gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc)
+            # BLOCK_TILE_SIZE_M = 16
+            # BLOCK_TILE_SIZE_N = 64
+            # moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, grid], [64],
+            #                 w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+            #                 gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc)
 
-            return cur_out
+            # return cur_out
+
+
+            num_CU = torch.cuda.get_device_properties().multi_processor_count
+            BLOCK_N = 1024
+            #print("=============================== num_CU =================================", num_CU)
+            #print("=============================== N2 // BLOCK_N * grid >= num_CU {} N2 // BLOCK_N * grid = {} num_CU = {}".format(N2 // BLOCK_N * grid >= num_CU, N2 // BLOCK_N * grid, num_CU))
+            if (w1.dtype == torch.float8_e4m3fn or w1.dtype == torch.float8_e4m3fnuz) and fp8_ptpc and N2 // BLOCK_N * grid >= num_CU:
+                #print("------------------------- use moe_2stage_down_loopn -----------------------")
+                BLOCK_TILE_SIZE_M = 16
+                BLOCK_TILE_SIZE_N = 16
+                assert N2 % BLOCK_N == 0
+                use_atomic_write = B < 8
+                NUM_STAGES = 3
+                gemm2_out = cur_out
+                if not use_atomic_write:
+                    gemm2_out = torch.empty([B, TOPK, HIDDEN_SIZE], dtype=torch.bfloat16)
+                moe_2stage_down_loopn([N2 // BLOCK_N, grid], [256],
+                                w1.dtype, TOPK, K2, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                gemm1_out.data_ptr(), w2.data_ptr(), gemm2_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(),
+                                w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc, BLOCK_N, use_atomic_write, NUM_STAGES)
+                if not use_atomic_write:
+                    cur_out = torch.sum(gemm2_out, dim=1)
+                    return cur_out
+                return gemm2_out
+            else:
+                #print("=============================== use moe_2stage_splitk =================================")
+                BLOCK_TILE_SIZE_M = 16
+                BLOCK_TILE_SIZE_N = 64
+                moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, grid], [64],
+                                   w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                   gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc)
+                return cur_out
 
     if not block_size_M:
         block_size_M = -1
