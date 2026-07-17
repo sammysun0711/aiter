@@ -1,0 +1,339 @@
+Compare report for GemmA16W16Tuner
+Shapes: 105
+Batch size: 100
+Total batches: 2
+
+=== Running pre-tune benchmark (batch 1/2) ===
+=== Running post-tune benchmark (verification) for batch 1/2 ===
+=== Running pre-tune benchmark (batch 2/2) ===
+=== Running post-tune benchmark (verification) for batch 2/2 ===
+============= Tune Performance Comparison =============
+Shape                                    |   Pre-E2E(us) |   Post-E2E(us) |  Speedup |   Status
+-----------------------------------------------------------------------------------------------
+(1, 1280, 8192, torch.float16, bias=False) |          9.68 |           9.92 |    0.98x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=1280, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 2560, 8192, torch.float16, bias=False) |         15.61 |          15.79 |    0.99x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=2560, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 4000, 8192, torch.float16, bias=False) |         22.80 |          21.16 |    1.08x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=4000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 7168, 8192, torch.float16, bias=False) |         34.66 |          33.98 |    1.02x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=7168, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 8000, 8192, torch.float16, bias=False) |         46.73 |          41.12 |    1.14x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=8000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 8192, 1024, torch.float16, bias=False) |          8.21 |           7.74 |    1.06x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=8192, K=1024, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 8192, 2048, torch.float16, bias=False) |         13.98 |          12.39 |    1.13x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=8192, K=2048, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 8192, 3584, torch.float16, bias=False) |         20.07 |          17.71 |    1.13x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=8192, K=3584, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 8192, 7168, torch.float16, bias=False) |         31.97 |          31.98 |    1.00x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=8192, K=7168, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 8192, 8192, torch.float16, bias=False) |         50.90 |          37.97 |    1.34x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=8192, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 8192, 28672, torch.float16, bias=False) |        147.35 |         103.98 |    1.42x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=8192, K=28672, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 10240, 8192, torch.float16, bias=False) |         47.36 |          47.61 |    0.99x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=10240, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 14336, 8192, torch.float16, bias=False) |         70.83 |          64.75 |    1.09x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=14336, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 32000, 8192, torch.float16, bias=False) |        145.21 |         128.13 |    1.13x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=32000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(1, 57344, 8192, torch.float16, bias=False) |        241.15 |         225.24 |    1.07x |       OK
+keys: gfx=gfx942, cu_num=304, M=1, N=57344, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 1280, 8192, torch.float16, bias=False) |         10.26 |           9.88 |    1.04x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=1280, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 2560, 8192, torch.float16, bias=False) |         15.68 |          15.79 |    0.99x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=2560, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 4000, 8192, torch.float16, bias=False) |         22.92 |          20.96 |    1.09x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=4000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 7168, 8192, torch.float16, bias=False) |         34.93 |          37.87 |    0.92x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=7168, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 8000, 8192, torch.float16, bias=False) |         39.62 |          39.32 |    1.01x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=8000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 8192, 1024, torch.float16, bias=False) |          8.17 |           7.76 |    1.05x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=8192, K=1024, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 8192, 2048, torch.float16, bias=False) |         13.74 |          13.81 |    0.99x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=8192, K=2048, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 8192, 3584, torch.float16, bias=False) |         20.11 |          17.04 |    1.18x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=8192, K=3584, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 8192, 7168, torch.float16, bias=False) |         32.03 |          32.63 |    0.98x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=8192, K=7168, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 8192, 8192, torch.float16, bias=False) |         45.42 |          37.88 |    1.20x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=8192, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 8192, 28672, torch.float16, bias=False) |        127.77 |         105.40 |    1.21x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=8192, K=28672, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 10240, 8192, torch.float16, bias=False) |         49.85 |          47.69 |    1.05x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=10240, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 14336, 8192, torch.float16, bias=False) |         65.59 |          65.96 |    0.99x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=14336, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 32000, 8192, torch.float16, bias=False) |        144.75 |         127.53 |    1.14x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=32000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(2, 57344, 8192, torch.float16, bias=False) |        234.86 |         212.23 |    1.11x |       OK
+keys: gfx=gfx942, cu_num=304, M=2, N=57344, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 1280, 8192, torch.float16, bias=False) |         10.35 |          10.11 |    1.02x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=1280, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 2560, 8192, torch.float16, bias=False) |         15.60 |          15.89 |    0.98x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=2560, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 4000, 8192, torch.float16, bias=False) |         23.19 |          21.58 |    1.07x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=4000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 7168, 8192, torch.float16, bias=False) |         34.11 |          40.76 |    0.84x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=7168, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 8000, 8192, torch.float16, bias=False) |         40.02 |          40.45 |    0.99x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=8000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 8192, 1024, torch.float16, bias=False) |          8.15 |           8.25 |    0.99x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=8192, K=1024, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 8192, 2048, torch.float16, bias=False) |         13.80 |          13.65 |    1.01x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=8192, K=2048, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 8192, 3584, torch.float16, bias=False) |         19.91 |          14.91 |    1.34x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=8192, K=3584, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 8192, 7168, torch.float16, bias=False) |         33.51 |          27.60 |    1.21x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=8192, K=7168, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 8192, 8192, torch.float16, bias=False) |         48.21 |          44.29 |    1.09x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=8192, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 8192, 28672, torch.float16, bias=False) |        120.43 |         104.98 |    1.15x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=8192, K=28672, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 10240, 8192, torch.float16, bias=False) |         48.13 |          49.14 |    0.98x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=10240, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 14336, 8192, torch.float16, bias=False) |         68.08 |          67.95 |    1.00x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=14336, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 32000, 8192, torch.float16, bias=False) |        146.58 |         133.66 |    1.10x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=32000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(4, 57344, 8192, torch.float16, bias=False) |        243.14 |         228.64 |    1.06x |       OK
+keys: gfx=gfx942, cu_num=304, M=4, N=57344, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 1280, 8192, torch.float16, bias=False) |         10.21 |          10.46 |    0.98x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=1280, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 2560, 8192, torch.float16, bias=False) |         15.56 |          15.18 |    1.03x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=2560, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 4000, 8192, torch.float16, bias=False) |         23.65 |          22.68 |    1.04x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=4000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 7168, 8192, torch.float16, bias=False) |         35.63 |          36.40 |    0.98x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=7168, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 8000, 8192, torch.float16, bias=False) |         39.39 |          37.88 |    1.04x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=8000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 8192, 1024, torch.float16, bias=False) |          7.90 |           8.10 |    0.98x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=8192, K=1024, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 8192, 2048, torch.float16, bias=False) |         13.92 |          14.10 |    0.99x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=8192, K=2048, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 8192, 3584, torch.float16, bias=False) |         20.75 |          16.61 |    1.25x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=8192, K=3584, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 8192, 7168, torch.float16, bias=False) |         32.55 |          29.15 |    1.12x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=8192, K=7168, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 8192, 8192, torch.float16, bias=False) |         43.35 |          44.38 |    0.98x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=8192, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 8192, 28672, torch.float16, bias=False) |        150.60 |         104.90 |    1.44x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=8192, K=28672, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 10240, 8192, torch.float16, bias=False) |         47.24 |          48.48 |    0.97x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=10240, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 14336, 8192, torch.float16, bias=False) |         69.92 |          65.52 |    1.07x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=14336, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 32000, 8192, torch.float16, bias=False) |        147.48 |         134.00 |    1.10x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=32000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(8, 57344, 8192, torch.float16, bias=False) |        248.14 |         228.48 |    1.09x |       OK
+keys: gfx=gfx942, cu_num=304, M=8, N=57344, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 1280, 8192, torch.float16, bias=False) |         10.39 |          10.09 |    1.03x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=1280, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 2560, 8192, torch.float16, bias=False) |         15.50 |          15.53 |    1.00x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=2560, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 4000, 8192, torch.float16, bias=False) |         23.46 |          23.03 |    1.02x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=4000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 7168, 8192, torch.float16, bias=False) |         36.36 |          39.32 |    0.92x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=7168, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 8000, 8192, torch.float16, bias=False) |         39.26 |          40.12 |    0.98x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=8000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 8192, 1024, torch.float16, bias=False) |          8.44 |           8.30 |    1.02x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=8192, K=1024, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 8192, 2048, torch.float16, bias=False) |         13.86 |          14.63 |    0.95x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=8192, K=2048, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 8192, 3584, torch.float16, bias=False) |         19.89 |          16.07 |    1.24x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=8192, K=3584, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 8192, 7168, torch.float16, bias=False) |         32.84 |          28.51 |    1.15x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=8192, K=7168, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 8192, 8192, torch.float16, bias=False) |         43.74 |          39.70 |    1.10x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=8192, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 8192, 28672, torch.float16, bias=False) |        122.62 |         111.75 |    1.10x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=8192, K=28672, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 10240, 8192, torch.float16, bias=False) |         46.70 |          47.31 |    0.99x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=10240, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 14336, 8192, torch.float16, bias=False) |         70.76 |          67.35 |    1.05x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=14336, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 32000, 8192, torch.float16, bias=False) |        148.02 |         129.72 |    1.14x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=32000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(16, 57344, 8192, torch.float16, bias=False) |        238.93 |         211.68 |    1.13x |       OK
+keys: gfx=gfx942, cu_num=304, M=16, N=57344, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 1280, 8192, torch.float16, bias=False) |         11.94 |          12.21 |    0.98x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=1280, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 2560, 8192, torch.float16, bias=False) |         16.84 |          17.37 |    0.97x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=2560, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 4000, 8192, torch.float16, bias=False) |         24.78 |          23.96 |    1.03x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=4000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 7168, 8192, torch.float16, bias=False) |         38.10 |          43.57 |    0.87x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=7168, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 8000, 8192, torch.float16, bias=False) |         42.27 |          43.54 |    0.97x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=8000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 8192, 1024, torch.float16, bias=False) |          9.45 |           9.02 |    1.05x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=8192, K=1024, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 8192, 2048, torch.float16, bias=False) |         14.71 |          15.27 |    0.96x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=8192, K=2048, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 8192, 3584, torch.float16, bias=False) |         19.66 |          17.72 |    1.11x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=8192, K=3584, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 8192, 7168, torch.float16, bias=False) |         31.87 |          35.06 |    0.91x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=8192, K=7168, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 8192, 8192, torch.float16, bias=False) |         42.64 |          42.68 |    1.00x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=8192, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 8192, 28672, torch.float16, bias=False) |        138.06 |         123.53 |    1.12x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=8192, K=28672, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 10240, 8192, torch.float16, bias=False) |         52.34 |          50.59 |    1.03x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=10240, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 14336, 8192, torch.float16, bias=False) |         72.91 |          67.89 |    1.07x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=14336, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 32000, 8192, torch.float16, bias=False) |        161.26 |         140.36 |    1.15x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=32000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(32, 57344, 8192, torch.float16, bias=False) |        251.15 |         241.01 |    1.04x |       OK
+keys: gfx=gfx942, cu_num=304, M=32, N=57344, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 1280, 8192, torch.float16, bias=False) |         14.30 |          14.04 |    1.02x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=1280, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 2560, 8192, torch.float16, bias=False) |         19.87 |          19.37 |    1.03x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=2560, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 4000, 8192, torch.float16, bias=False) |         27.05 |          27.39 |    0.99x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=4000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 7168, 8192, torch.float16, bias=False) |         40.86 |          41.00 |    1.00x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=7168, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 8000, 8192, torch.float16, bias=False) |         48.34 |          48.47 |    1.00x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=8000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 8192, 1024, torch.float16, bias=False) |         10.72 |          10.35 |    1.04x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=8192, K=1024, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 8192, 2048, torch.float16, bias=False) |         15.95 |          16.12 |    0.99x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=8192, K=2048, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 8192, 3584, torch.float16, bias=False) |         22.61 |          22.30 |    1.01x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=8192, K=3584, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 8192, 7168, torch.float16, bias=False) |         38.10 |          37.94 |    1.00x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=8192, K=7168, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 8192, 8192, torch.float16, bias=False) |         50.56 |          50.69 |    1.00x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=8192, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 8192, 28672, torch.float16, bias=False) |        137.39 |         133.39 |    1.03x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=8192, K=28672, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 10240, 8192, torch.float16, bias=False) |         57.32 |          54.87 |    1.04x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=10240, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 14336, 8192, torch.float16, bias=False) |         80.56 |          77.01 |    1.05x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=14336, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 32000, 8192, torch.float16, bias=False) |        166.19 |         151.30 |    1.10x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=32000, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+(64, 57344, 8192, torch.float16, bias=False) |        295.89 |         294.34 |    1.01x |       OK
+keys: gfx=gfx942, cu_num=304, M=64, N=57344, K=8192, bias=False, dtype=torch.float16, outdtype=torch.float16, scaleAB=False, bpreshuffle=False
+============= Compare Report =============
+Total shapes: 105 | Updated: 53 (improved: 53, new: 0) | Skipped: 52
+Threshold: >= 3.0% improvement to update /root/workspace/aiter/aiter/configs/bf16_tuned_gemm.csv
+
+--- Updated (53 shapes) ---
+Shape                                    |    Pre(us) |   Post(us) |   Improve |             Action
+---------------------------------------------------------------------------------------------------
+(1, 4000, 8192, torch.float16, bias=False) |      22.80 |      21.16 |     7.17% |             UPDATE
+(1, 8000, 8192, torch.float16, bias=False) |      46.73 |      41.12 |    12.00% |             UPDATE
+(1, 8192, 1024, torch.float16, bias=False) |       8.21 |       7.74 |     5.73% |             UPDATE
+(1, 8192, 2048, torch.float16, bias=False) |      13.98 |      12.39 |    11.36% |             UPDATE
+(1, 8192, 3584, torch.float16, bias=False) |      20.07 |      17.71 |    11.75% |             UPDATE
+(1, 8192, 8192, torch.float16, bias=False) |      50.90 |      37.97 |    25.42% |             UPDATE
+(1, 8192, 28672, torch.float16, bias=False) |     147.35 |     103.98 |    29.43% |             UPDATE
+(1, 14336, 8192, torch.float16, bias=False) |      70.83 |      64.75 |     8.58% |             UPDATE
+(1, 32000, 8192, torch.float16, bias=False) |     145.21 |     128.13 |    11.77% |             UPDATE
+(1, 57344, 8192, torch.float16, bias=False) |     241.15 |     225.24 |     6.60% |             UPDATE
+(2, 1280, 8192, torch.float16, bias=False) |      10.26 |       9.88 |     3.68% |             UPDATE
+(2, 4000, 8192, torch.float16, bias=False) |      22.92 |      20.96 |     8.54% |             UPDATE
+(2, 8192, 1024, torch.float16, bias=False) |       8.17 |       7.76 |     5.03% |             UPDATE
+(2, 8192, 3584, torch.float16, bias=False) |      20.11 |      17.04 |    15.27% |             UPDATE
+(2, 8192, 8192, torch.float16, bias=False) |      45.42 |      37.88 |    16.60% |             UPDATE
+(2, 8192, 28672, torch.float16, bias=False) |     127.77 |     105.40 |    17.51% |             UPDATE
+(2, 10240, 8192, torch.float16, bias=False) |      49.85 |      47.69 |     4.34% |             UPDATE
+(2, 32000, 8192, torch.float16, bias=False) |     144.75 |     127.53 |    11.90% |             UPDATE
+(2, 57344, 8192, torch.float16, bias=False) |     234.86 |     212.23 |     9.64% |             UPDATE
+(4, 4000, 8192, torch.float16, bias=False) |      23.19 |      21.58 |     6.93% |             UPDATE
+(4, 8192, 3584, torch.float16, bias=False) |      19.91 |      14.91 |    25.13% |             UPDATE
+(4, 8192, 7168, torch.float16, bias=False) |      33.51 |      27.60 |    17.61% |             UPDATE
+(4, 8192, 8192, torch.float16, bias=False) |      48.21 |      44.29 |     8.12% |             UPDATE
+(4, 8192, 28672, torch.float16, bias=False) |     120.43 |     104.98 |    12.83% |             UPDATE
+(4, 57344, 8192, torch.float16, bias=False) |     243.14 |     228.64 |     5.96% |             UPDATE
+(8, 4000, 8192, torch.float16, bias=False) |      23.65 |      22.68 |     4.11% |             UPDATE
+(8, 8000, 8192, torch.float16, bias=False) |      39.39 |      37.88 |     3.82% |             UPDATE
+(8, 8192, 3584, torch.float16, bias=False) |      20.75 |      16.61 |    19.95% |             UPDATE
+(8, 8192, 7168, torch.float16, bias=False) |      32.55 |      29.15 |    10.46% |             UPDATE
+(8, 8192, 28672, torch.float16, bias=False) |     150.60 |     104.90 |    30.34% |             UPDATE
+(8, 14336, 8192, torch.float16, bias=False) |      69.92 |      65.52 |     6.29% |             UPDATE
+(8, 57344, 8192, torch.float16, bias=False) |     248.14 |     228.48 |     7.92% |             UPDATE
+(16, 8192, 3584, torch.float16, bias=False) |      19.89 |      16.07 |    19.22% |             UPDATE
+(16, 8192, 7168, torch.float16, bias=False) |      32.84 |      28.51 |    13.18% |             UPDATE
+(16, 8192, 8192, torch.float16, bias=False) |      43.74 |      39.70 |     9.24% |             UPDATE
+(16, 8192, 28672, torch.float16, bias=False) |     122.62 |     111.75 |     8.87% |             UPDATE
+(16, 14336, 8192, torch.float16, bias=False) |      70.76 |      67.35 |     4.81% |             UPDATE
+(16, 57344, 8192, torch.float16, bias=False) |     238.93 |     211.68 |    11.41% |             UPDATE
+(32, 4000, 8192, torch.float16, bias=False) |      24.78 |      23.96 |     3.32% |             UPDATE
+(32, 8192, 1024, torch.float16, bias=False) |       9.45 |       9.02 |     4.58% |             UPDATE
+(32, 8192, 3584, torch.float16, bias=False) |      19.66 |      17.72 |     9.88% |             UPDATE
+(32, 8192, 28672, torch.float16, bias=False) |     138.06 |     123.53 |    10.53% |             UPDATE
+(32, 10240, 8192, torch.float16, bias=False) |      52.34 |      50.59 |     3.34% |             UPDATE
+(32, 14336, 8192, torch.float16, bias=False) |      72.91 |      67.89 |     6.88% |             UPDATE
+(32, 57344, 8192, torch.float16, bias=False) |     251.15 |     241.01 |     4.04% |             UPDATE
+(64, 8192, 1024, torch.float16, bias=False) |      10.72 |      10.35 |     3.50% |             UPDATE
+(64, 10240, 8192, torch.float16, bias=False) |      57.32 |      54.87 |     4.28% |             UPDATE
+(64, 14336, 8192, torch.float16, bias=False) |      80.56 |      77.01 |     4.41% |             UPDATE
+(4, 32000, 8192, torch.float16, bias=False) |     146.58 |     133.66 |     8.82% |             UPDATE
+(8, 32000, 8192, torch.float16, bias=False) |     147.48 |     134.00 |     9.14% |             UPDATE
+(16, 32000, 8192, torch.float16, bias=False) |     148.02 |     129.72 |    12.37% |             UPDATE
+(32, 32000, 8192, torch.float16, bias=False) |     161.26 |     140.36 |    12.97% |             UPDATE
+(64, 32000, 8192, torch.float16, bias=False) |     166.19 |     151.30 |     8.96% |             UPDATE
+
+--- Skipped (52 shapes) ---
+Shape                                    |    Pre(us) |   Post(us) |   Improve |             Reason
+---------------------------------------------------------------------------------------------------
+(1, 1280, 8192, torch.float16, bias=False) |       9.68 |       9.92 |    -2.43% |     < 3.0% improve
+(1, 2560, 8192, torch.float16, bias=False) |      15.61 |      15.79 |    -1.14% |     < 3.0% improve
+(1, 7168, 8192, torch.float16, bias=False) |      34.66 |      33.98 |     1.96% |     < 3.0% improve
+(1, 8192, 7168, torch.float16, bias=False) |      31.97 |      31.98 |    -0.03% |     < 3.0% improve
+(1, 10240, 8192, torch.float16, bias=False) |      47.36 |      47.61 |    -0.53% |     < 3.0% improve
+(2, 2560, 8192, torch.float16, bias=False) |      15.68 |      15.79 |    -0.74% |     < 3.0% improve
+(2, 7168, 8192, torch.float16, bias=False) |      34.93 |      37.87 |    -8.41% |     < 3.0% improve
+(2, 8000, 8192, torch.float16, bias=False) |      39.62 |      39.32 |     0.76% |     < 3.0% improve
+(2, 8192, 2048, torch.float16, bias=False) |      13.74 |      13.81 |    -0.58% |     < 3.0% improve
+(2, 8192, 7168, torch.float16, bias=False) |      32.03 |      32.63 |    -1.88% |     < 3.0% improve
+(2, 14336, 8192, torch.float16, bias=False) |      65.59 |      65.96 |    -0.57% |     < 3.0% improve
+(4, 1280, 8192, torch.float16, bias=False) |      10.35 |      10.11 |     2.34% |     < 3.0% improve
+(4, 2560, 8192, torch.float16, bias=False) |      15.60 |      15.89 |    -1.87% |     < 3.0% improve
+(4, 7168, 8192, torch.float16, bias=False) |      34.11 |      40.76 |   -19.49% |     < 3.0% improve
+(4, 8000, 8192, torch.float16, bias=False) |      40.02 |      40.45 |    -1.07% |     < 3.0% improve
+(4, 8192, 1024, torch.float16, bias=False) |       8.15 |       8.25 |    -1.19% |     < 3.0% improve
+(4, 8192, 2048, torch.float16, bias=False) |      13.80 |      13.65 |     1.09% |     < 3.0% improve
+(4, 10240, 8192, torch.float16, bias=False) |      48.13 |      49.14 |    -2.10% |     < 3.0% improve
+(4, 14336, 8192, torch.float16, bias=False) |      68.08 |      67.95 |     0.19% |     < 3.0% improve
+(8, 1280, 8192, torch.float16, bias=False) |      10.21 |      10.46 |    -2.42% |     < 3.0% improve
+(8, 2560, 8192, torch.float16, bias=False) |      15.56 |      15.18 |     2.48% |     < 3.0% improve
+(8, 7168, 8192, torch.float16, bias=False) |      35.63 |      36.40 |    -2.17% |     < 3.0% improve
+(8, 8192, 1024, torch.float16, bias=False) |       7.90 |       8.10 |    -2.52% |     < 3.0% improve
+(8, 8192, 2048, torch.float16, bias=False) |      13.92 |      14.10 |    -1.32% |     < 3.0% improve
+(8, 8192, 8192, torch.float16, bias=False) |      43.35 |      44.38 |    -2.38% |     < 3.0% improve
+(8, 10240, 8192, torch.float16, bias=False) |      47.24 |      48.48 |    -2.63% |     < 3.0% improve
+(16, 1280, 8192, torch.float16, bias=False) |      10.39 |      10.09 |     2.96% |     < 3.0% improve
+(16, 2560, 8192, torch.float16, bias=False) |      15.50 |      15.53 |    -0.20% |     < 3.0% improve
+(16, 4000, 8192, torch.float16, bias=False) |      23.46 |      23.03 |     1.83% |     < 3.0% improve
+(16, 7168, 8192, torch.float16, bias=False) |      36.36 |      39.32 |    -8.16% |     < 3.0% improve
+(16, 8000, 8192, torch.float16, bias=False) |      39.26 |      40.12 |    -2.21% |     < 3.0% improve
+(16, 8192, 1024, torch.float16, bias=False) |       8.44 |       8.30 |     1.68% |     < 3.0% improve
+(16, 8192, 2048, torch.float16, bias=False) |      13.86 |      14.63 |    -5.51% |     < 3.0% improve
+(16, 10240, 8192, torch.float16, bias=False) |      46.70 |      47.31 |    -1.31% |     < 3.0% improve
+(32, 1280, 8192, torch.float16, bias=False) |      11.94 |      12.21 |    -2.34% |     < 3.0% improve
+(32, 2560, 8192, torch.float16, bias=False) |      16.84 |      17.37 |    -3.14% |     < 3.0% improve
+(32, 7168, 8192, torch.float16, bias=False) |      38.10 |      43.57 |   -14.36% |     < 3.0% improve
+(32, 8000, 8192, torch.float16, bias=False) |      42.27 |      43.54 |    -2.99% |     < 3.0% improve
+(32, 8192, 2048, torch.float16, bias=False) |      14.71 |      15.27 |    -3.78% |     < 3.0% improve
+(32, 8192, 7168, torch.float16, bias=False) |      31.87 |      35.06 |   -10.00% |     < 3.0% improve
+(32, 8192, 8192, torch.float16, bias=False) |      42.64 |      42.68 |    -0.09% |     < 3.0% improve
+(64, 1280, 8192, torch.float16, bias=False) |      14.30 |      14.04 |     1.84% |     < 3.0% improve
+(64, 2560, 8192, torch.float16, bias=False) |      19.87 |      19.37 |     2.51% |     < 3.0% improve
+(64, 4000, 8192, torch.float16, bias=False) |      27.05 |      27.39 |    -1.28% |     < 3.0% improve
+(64, 7168, 8192, torch.float16, bias=False) |      40.86 |      41.00 |    -0.36% |     < 3.0% improve
+(64, 8000, 8192, torch.float16, bias=False) |      48.34 |      48.47 |    -0.29% |     < 3.0% improve
+(64, 8192, 2048, torch.float16, bias=False) |      15.95 |      16.12 |    -1.11% |     < 3.0% improve
+(64, 8192, 3584, torch.float16, bias=False) |      22.61 |      22.30 |     1.37% |     < 3.0% improve
+(64, 8192, 7168, torch.float16, bias=False) |      38.10 |      37.94 |     0.42% |     < 3.0% improve
+(64, 8192, 8192, torch.float16, bias=False) |      50.56 |      50.69 |    -0.27% |     < 3.0% improve
+(64, 8192, 28672, torch.float16, bias=False) |     137.39 |     133.39 |     2.91% |     < 3.0% improve
+(64, 57344, 8192, torch.float16, bias=False) |     295.89 |     294.34 |     0.53% |     < 3.0% improve
+Compare candidate CSV written to /tmp/aiter_compare/bf16_tuned_gemm.5582.candidate.csv
