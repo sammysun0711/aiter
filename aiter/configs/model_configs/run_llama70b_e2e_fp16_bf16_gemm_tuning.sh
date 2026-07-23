@@ -29,6 +29,7 @@ cmd=(
   --batch "${BATCH}"
   --warmup "${WARMUP}"
   --iters "${ITERS}"
+  --compare --update_improved --min_improvement_pct 1
 )
 
 if [[ "${WITH_HIPBLASLT}" == "1" ]]; then

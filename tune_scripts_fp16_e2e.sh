@@ -1,0 +1,1 @@
+ python csrc/gemm_a16w16/gemm_tuner.py --input_file aiter/configs/model_configs/llama70B_untuned_gemm_fp16_decode.csv --libtype all --with-hipblaslt --compare --update_improved --profile_file llama70B_gemm_fp16_decode_all_candidate.csv  2>&1 | tee llama70B_gemm_fp16_decode_tuning.log
