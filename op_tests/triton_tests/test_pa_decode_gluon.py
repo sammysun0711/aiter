@@ -2528,6 +2528,53 @@ def sliding_window_performance_test():
     parse_arg_and_run_test()
 
 
+@pytest.mark.parametrize(
+    ("context_length", "ps"),
+    [(2048, True), (4097, True), (4097, False)],
+    ids=["causal-split", "persistent-oob", "partitioned-oob"],
+)
+def test_mimo_head_192_full_context_regression(context_length, ps):
+    """Cover MiMo's padded-head paged-attention decode specialization.
+
+    The 2,048-token persistent case catches application of the qlen-4 causal
+    frontier at each local scheduler split instead of at the global context
+    boundary.  With the fixed seed, the 4,097-token cases reference the final
+    physical cache block.  Before padded K/V and reduction loads were masked,
+    rounding head size 192 up to the 256-wide MFMA layout read past that block
+    and produced a GPU memory-access fault.  The rest of the tuple mirrors MiMo
+    target verification: qlen 4, 16Q/1KV, page 64, per-tensor FP8 KV, and
+    transposed 5D V.
+    """
+    global USE_TORCH_FLASH_REF
+
+    old_use_torch_flash_ref = USE_TORCH_FLASH_REF
+    USE_TORCH_FLASH_REF = False
+    try:
+        result = run_pa_gluon_test(
+            context_length=context_length,
+            batch_size=32,
+            num_heads=(16, 1),
+            head_size=192,
+            block_size=64,
+            compute_type=torch.bfloat16,
+            query_length=4,
+            quant_mode="per_tensor",
+            context_partition_size=256,
+            trans_v=True,
+            kv_varlen=False,
+            use_aot_impl=False,
+            quant_q=False,
+            quant_kv=True,
+            use_sinks=False,
+            sliding_window=0,
+            ps=ps,
+        )
+    finally:
+        USE_TORCH_FLASH_REF = old_use_torch_flash_ref
+
+    assert result["err_gluon"] == 0
+
+
 @pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
 def test_multi_case_set(case_set_name):
     if case_set_name == "normal_accuracy":
