@@ -1552,6 +1552,139 @@ def test_batch_prefill_linear_vs_vectorized(
     )
 
 
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len",
+    [(1, 128, 256), (4, 127, 4097)],
+)
+def test_batch_prefill_mimo_fp8_vectorized_page64(
+    batch_size, qo_len, kv_len
+):
+    """Cover MiMo's direct cached-prefill contract and ragged last pages."""
+    torch.manual_seed(20260730)
+    num_qo_heads, num_kv_heads = 16, 1
+    head_dim, page_size = 192, 64
+    pages_per_seq = math.ceil(kv_len / page_size)
+    num_pages = batch_size * pages_per_seq
+
+    q_bf16 = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.25
+    k_bf16 = torch.randn(
+        num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.25
+    v_bf16 = torch.randn_like(k_bf16) * 0.25
+    q_fp8, q_descale = per_tensor_quant(q_bf16, quant_dtype=dtypes.fp8)
+    k_fp8, k_descale = per_tensor_quant(k_bf16, quant_dtype=dtypes.fp8)
+    v_fp8, v_descale = per_tensor_quant(v_bf16, quant_dtype=dtypes.fp8)
+
+    # Reverse each request's physical pages so a linear-addressing accident
+    # cannot pass while still keeping page ownership disjoint across requests.
+    page_table = torch.arange(num_pages, dtype=torch.int32).view(
+        batch_size, pages_per_seq
+    )
+    page_table = page_table.flip(1).contiguous()
+    kv_page_indices = torch.nn.functional.pad(
+        page_table.flatten(), (0, 256), value=0
+    ).to("cuda")
+    cu_seqlens_q = torch.arange(
+        0,
+        (batch_size + 1) * qo_len,
+        qo_len,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    kv_indptr = torch.arange(
+        0,
+        (batch_size + 1) * pages_per_seq,
+        pages_per_seq,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    kv_last_page_lens = torch.full(
+        (batch_size,),
+        (kv_len - 1) % page_size + 1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    k_vec, v_vec = apply_kv_layout(
+        k_fp8,
+        v_fp8,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        get_vector_size(dtypes.fp8),
+        "vectorized",
+    )
+
+    # Use a NaN sentinel so a tile that silently leaves any token/head lane
+    # unwritten cannot pass merely because zero is inside the loose FP8
+    # absolute-error threshold.
+    out = torch.full(
+        (batch_size * qo_len, num_qo_heads, head_dim),
+        float("nan"),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    out = aiter.mha_batch_prefill_func(
+        q_fp8,
+        k_vec,
+        v_vec,
+        cu_seqlens_q,
+        kv_indptr,
+        kv_page_indices,
+        max_seqlen_q=qo_len,
+        max_seqlen_k=kv_len,
+        causal=True,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        kv_last_page_lens=kv_last_page_lens,
+        out=out,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+
+    q_ref = q_fp8.float() * q_descale
+    refs = []
+    for batch_idx in range(batch_size):
+        pages = page_table[batch_idx].long().to("cuda")
+        k_ref = (k_fp8[pages].reshape(-1, num_kv_heads, head_dim)[:kv_len].float())
+        v_ref = (v_fp8[pages].reshape(-1, num_kv_heads, head_dim)[:kv_len].float())
+        k_ref = (k_ref * k_descale).repeat_interleave(
+            num_qo_heads // num_kv_heads, dim=1
+        )
+        v_ref = (v_ref * v_descale).repeat_interleave(
+            num_qo_heads // num_kv_heads, dim=1
+        )
+        q_ref_batch = q_ref[
+            batch_idx * qo_len : (batch_idx + 1) * qo_len
+        ]
+        rows = torch.arange(qo_len, device="cuda").unsqueeze(1)
+        cols = torch.arange(kv_len, device="cuda").unsqueeze(0)
+        causal_mask = cols <= (kv_len - qo_len + rows)
+        refs.append(
+            torch.nn.functional.scaled_dot_product_attention(
+                q_ref_batch.transpose(0, 1).unsqueeze(0),
+                k_ref.transpose(0, 1).unsqueeze(0),
+                v_ref.transpose(0, 1).unsqueeze(0),
+                attn_mask=causal_mask,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+        )
+    reference = torch.cat(refs, dim=0)
+    verify_fp8_output(out.float(), reference.float(), threshold=0.055)
+
+
 def per_page_quant(tensor, page_size, quant_dtype):
     """
     Quantize tensor with per-page scale.

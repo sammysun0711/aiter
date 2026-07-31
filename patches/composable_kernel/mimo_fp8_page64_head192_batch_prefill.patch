@@ -1,0 +1,80 @@
+diff --git a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
+index 475631a88..4fba587a2 100644
+--- a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
++++ b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
+@@ -220,7 +220,7 @@ FMHA_FWD_API_PER_DTYPE = """    {F_if}(t.data_type.compare(\"{F_dtype}\") == 0){
+ {F_hdim_case}
+     }}
+ """
+-FMHA_FWD_API_PER_HDIM_CASE = """        {F_if} (t.hdim_q <= {F_hdim} && t.hdim_v <= {F_hdim_v}) {{
++FMHA_FWD_API_PER_HDIM_CASE = """        {F_if} ({F_hdim_check}) {{
+ {F_inner_dispatch}
+         }}
+ """
+@@ -509,8 +509,22 @@ class FmhaFwdApiPool:
+                         F_kv_load_mode=KV_LOAD_MODE_ENUM_MAP[trait.use_global_load],
+                     )
+                 if_j = "if" if j == 0 else "else if"
++                hdim_check = f"t.hdim_q <= {hdim} && t.hdim_v <= {trait.bn1}"
++                if dtype == "fp8bf16" and int(hdim) == 192:
++                    # The MiMo specialization is deliberately sparse.  Put
++                    # the cache contract in the outer head-dimension branch
++                    # so unsupported D=192 variants fall through to the
++                    # existing padded D=256 bucket instead of returning -1.
++                    hdim_check = (
++                        "t.hdim_q == 192 && t.hdim_v == 192 && "
++                        "t.kv_memory_layout == "
++                        "ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT && "
++                        "t.kv_lookup_table == "
++                        "ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D && "
++                        "t.page_size == 64"
++                    )
+                 per_hdim_case = per_hdim_case + FMHA_FWD_API_PER_HDIM_CASE.format(
+-                    F_if=if_j, F_hdim=hdim, F_hdim_v=trait.bn1, F_inner_dispatch=inners
++                    F_if=if_j, F_hdim_check=hdim_check, F_inner_dispatch=inners
+                 )
+             if_i = "if" if i == 0 else "else if"
+             per_dtypes = per_dtypes + FMHA_FWD_API_PER_DTYPE.format(
+@@ -682,6 +696,19 @@ class KernelComponentFactory:
+         elif dtype in ["fp8bf16"]:
+             return {
+                 128 : [FmhaFwdTileSize(128, 128, 32, 128, 32,  128,  4, 1, 1,  4, 1, 1,  32, 32, 32,  32, 32, 32,  -1)],
++                # MiMo-V2.5-Pro TP8: 16Q/1KV, logical/padded Dq=Dv=192.
++                # The (192, 96) configuration is the fastest long-context tile
++                # that overwrites every output head.  The nominally faster
++                # (192, 128) tile leaves some GQA heads untouched; zero-filled
++                # benchmark output hid that coverage bug behind the FP8 error
++                # tolerance.  The faster 8K
++                # (64, 96) tile is intentionally not promoted yet: batch
++                # prefill does not currently carry a host-visible logical
++                # max_seqlen_k in its dispatch args, so it cannot be selected
++                # safely for a small query appended to a long cached prefix.
++                192 : [
++                    FmhaFwdTileSize(192, 96, 32, 192, 32, 192,  6, 1, 1,  6, 1, 1,  32, 32, 32,  32, 32, 32,  -1),
++                ],
+                 256 : [FmhaFwdTileSize(128, 128, 32, 256, 32,  256,  4, 1, 1,  4, 1, 1,  32, 32, 32,  32, 32, 32,  -1)],
+             }  # fmt: skip
+         else:
+@@ -815,8 +842,20 @@ def get_fwd_blobs(
+                 ):
+                     continue
+ 
+-                # Generate kernels for both page_size=16 and page_size=1024
+-                for page_size in SUPPORTED_PAGE_SIZE:
++                # Keep the tuned head-192 specialization exact: page-64,
++                # vectorized SGLang cache only.  Other page/layout/table
++                # combinations continue to use the padded head-256 kernels.
++                # Besides avoiding a broad JIT-matrix expansion, the tuned
++                # tile is not compile-valid for page-64 LINEAR_LAYOUT.
++                page_sizes = SUPPORTED_PAGE_SIZE
++                if dtype == "fp8bf16" and hdim == 192:
++                    if (
++                        pipeline.F_kv_memory_layout != "vectorized"
++                        or pipeline.F_kv_lookup_table != "sglang"
++                    ):
++                        continue
++                    page_sizes = [64]
++                for page_size in page_sizes:
+                     if page_size == 1 and pipeline.F_kv_memory_layout != "linear":
+                         continue
+                     # kv_blockscale requires page_size >= kN0 (tile.F_bn0)
