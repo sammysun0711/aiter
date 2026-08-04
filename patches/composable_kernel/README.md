@@ -11,8 +11,20 @@ af7118e342580ecd3f71edce7b1d0ba465012ecf
 ```
 
 It adds the guarded FP8/BF16, head-192, vectorized page-64 batch-prefill
-specialization used by MiMo. The patch should be removed after AITER is moved
-to the official exported CK commit containing the same change.
+specialization used by MiMo on both supported CDNA targets:
+
+- gfx942 retains the qualified `(192, 96)` tile;
+- gfx950 selects the qualified `(64, 128)` tile;
+- unsupported D192 cache contracts fall through to the existing padded-D256
+  path, with a page-64 D256 comparator/rollback family generated for gfx950;
+- opt-in gfx950 tile and occupancy overrides remain available for isolated
+  tuning builds.
+
+The target-specific selection requires codegen to receive one explicit GPU
+target. AITER's batch-prefill JIT recipe resolves `get_gfx()` and passes the
+result as `--targets <gfx>` for this reason; do not invoke the patched generator
+with a combined gfx942/gfx950 target list. The patch should be removed after
+AITER is moved to the official exported CK commit containing the same change.
 
 ## Apply
 

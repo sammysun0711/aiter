@@ -1060,6 +1060,7 @@ def cmdGenFunc_mha_batch_prefill(
         filter_fwd += "_nsink*"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
+        f"--targets {get_gfx()} "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
     ]
     return {
