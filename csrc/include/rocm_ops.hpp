@@ -2035,6 +2035,24 @@ namespace py = pybind11;
           py::arg("out"),                    \
           py::arg("input"),                  \
           py::arg("weight"),                 \
+          py::arg("epsilon"));               \
+    m.def("mimo_add_rmsnorm_fp8_group_quant", \
+          &aiter::mimo_add_rmsnorm_fp8_group_quant, \
+          py::arg("quantized"),              \
+          py::arg("normalized"),             \
+          py::arg("scale"),                  \
+          py::arg("input"),                  \
+          py::arg("residual_in"),            \
+          py::arg("residual_out"),           \
+          py::arg("weight"),                 \
+          py::arg("epsilon"));               \
+    m.def("mimo_rmsnorm_fp8_group_quant",    \
+          &aiter::mimo_rmsnorm_fp8_group_quant, \
+          py::arg("quantized"),              \
+          py::arg("normalized"),             \
+          py::arg("scale"),                  \
+          py::arg("input"),                  \
+          py::arg("weight"),                 \
           py::arg("epsilon"));
 
 #define GATED_RMSNORM_QUANT_PYBIND               \

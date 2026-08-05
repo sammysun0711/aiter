@@ -33,4 +33,20 @@ void rmsnorm_quant(torch::Tensor& out,
 
 void rmsnorm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double epsilon);
 
+void mimo_add_rmsnorm_fp8_group_quant(torch::Tensor& quantized,
+                                      torch::Tensor& normalized,
+                                      torch::Tensor& scale,
+                                      torch::Tensor& input,
+                                      torch::Tensor& residual_in,
+                                      torch::Tensor& residual_out,
+                                      torch::Tensor& weight,
+                                      double epsilon);
+
+void mimo_rmsnorm_fp8_group_quant(torch::Tensor& quantized,
+                                  torch::Tensor& normalized,
+                                  torch::Tensor& scale,
+                                  torch::Tensor& input,
+                                  torch::Tensor& weight,
+                                  double epsilon);
+
 } // namespace aiter

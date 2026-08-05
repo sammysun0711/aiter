@@ -244,6 +244,34 @@ def add_rmsnorm_quant(
 
 
 @compile_ops("module_rmsnorm_quant")
+def mimo_add_rmsnorm_fp8_group_quant(
+    quantized: Tensor,
+    normalized: Tensor,
+    scale: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    weight: Tensor,
+    epsilon: float,
+) -> None:
+    """gfx950 MiMo N=6144 fused add + RMSNorm + per-1x128 FP8 quant."""
+    ...
+
+
+@compile_ops("module_rmsnorm_quant")
+def mimo_rmsnorm_fp8_group_quant(
+    quantized: Tensor,
+    normalized: Tensor,
+    scale: Tensor,
+    input: Tensor,
+    weight: Tensor,
+    epsilon: float,
+) -> None:
+    """gfx950 MiMo N=6144 fused RMSNorm + per-1x128 FP8 quant."""
+    ...
+
+
+@compile_ops("module_rmsnorm_quant")
 def add_rmsnorm(
     out: Tensor,
     input: Tensor,

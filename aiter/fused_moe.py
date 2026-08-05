@@ -253,6 +253,7 @@ def fused_moe(
     w1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
+    a1_scale_is_transposed: bool = False,
     a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M=None,
@@ -283,6 +284,7 @@ def fused_moe(
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
+        a1_scale_is_transposed=a1_scale_is_transposed,
         a2_scale=a2_scale,
         block_size_M=block_size_M,
         num_local_tokens=num_local_tokens,
@@ -311,6 +313,7 @@ def fused_moe_fake(
     w1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
+    a1_scale_is_transposed: bool = False,
     a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M: int = -1,
@@ -347,6 +350,7 @@ def fused_moe_(
     w1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
+    a1_scale_is_transposed: bool = False,
     a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M: int = -1,
@@ -495,6 +499,7 @@ def fused_moe_(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
+            a1_scale_is_transposed=a1_scale_is_transposed,
             a2_scale=a2_scale,
             num_local_tokens=num_local_tokens,
             M=M,
@@ -522,6 +527,7 @@ def fused_moe_(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
+            a1_scale_is_transposed=a1_scale_is_transposed,
             a2_scale=a2_scale,
             num_local_tokens=num_local_tokens,
             # following for cktile support
@@ -560,6 +566,7 @@ def fused_moe_1stage(
     w1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
+    a1_scale_is_transposed=False,
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
     M: int = None,
@@ -625,7 +632,10 @@ def fused_moe_1stage(
                     a1_scale is not None or quant_type == QuantType.No
                 ), "a1_scale must be provided for quantized input for fused_moe"
                 a1 = hidden_states
-                if quant_type == QuantType.per_1x128:
+                if (
+                    quant_type == QuantType.per_1x128
+                    and not a1_scale_is_transposed
+                ):
                     scale_t = torch.empty_like(a1_scale)
                     aiter.partial_transpose(
                         scale_t, a1_scale, num_rows=num_local_tokens
@@ -1657,6 +1667,7 @@ def fused_moe_2stages(
     w1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
+    a1_scale_is_transposed=False,
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
     # following for cktile support
@@ -1776,6 +1787,23 @@ def fused_moe_2stages(
             a1_scale is not None or quant_type == QuantType.No
         ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
+        if (
+            quant_type == QuantType.per_1x128
+            and a1_scale_is_transposed
+            and metadata.stage1.func is not asm_stage1
+        ):
+            # FP8 blockscale ASM consumes scales in column-major storage, but
+            # CK two-stage kernels consume the ordinary [M, K/128] row-major
+            # layout.  A producer may emit the ASM layout directly to remove
+            # partial_transpose on the large one-stage prefill path; restore
+            # row-major storage only for the small-M CK route selected here.
+            scale_shape = a1_scale.shape
+            a1_scale = (
+                a1_scale.view(-1, token_num)
+                .transpose(0, 1)
+                .contiguous()
+                .view(scale_shape)
+            )
     if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
         a2 = torch.empty(

@@ -12,6 +12,16 @@
 
 namespace aiter {
 
+__device__ __forceinline__ float precise_reciprocal_for_mimo_quant(float value)
+{
+    float reciprocal;
+    // Match dynamic_per_group_scaled_quant_kernel's production reciprocal.
+    // IEEE division changes a small number of FP8 rounding decisions even
+    // when the BF16 producer and stored group scale are byte-identical.
+    asm volatile("v_rcp_f32 %0, %1" : "=v"(reciprocal) : "v"(value));
+    return reciprocal;
+}
+
 template <typename DTYPE_I, typename DTYPE_O, int BlockSize, int thread_data_size, bool ADD_RESIDUAL=true, bool FUSE_QUANT=true, bool interleave = false, int num_row = 1>
 __global__ void add_rmsnorm_quant_kernel(
     DTYPE_O* out,
@@ -293,6 +303,346 @@ __global__ void add_rmsnorm_quant_kernel(
         }
         core_loop(std::false_type{});
     }
+
+// MiMo-V2.5-Pro's post-attention RMSNorm has N=6144.  The production RMSNorm
+// geometry for that width is 256 threads x 24 values/thread, which cannot form
+// independent 128-value quantization groups.  Keep that first phase byte-for-
+// byte compatible with add_rmsnorm_quant_kernel, materialize its BF16 result,
+// then remap the same block to 48 groups x 4 threads x 32 BF16 values for the
+// production per-1x128 FP8 quantization contract.  This retains the BF16 router
+// input and the column-major FMoE scale layout while using one kernel launch.
+template <typename DTYPE_I, bool ADD_RESIDUAL>
+__global__ void mimo_rmsnorm_fp8_group_quant_6144_kernel(
+    opus::fp8_t* __restrict__ quantized,
+    DTYPE_I* __restrict__ normalized,
+    float* __restrict__ scale,
+    const DTYPE_I* __restrict__ input,
+    const DTYPE_I* __restrict__ residual_in,
+    DTYPE_I* __restrict__ residual_out,
+    const DTYPE_I* __restrict__ weight,
+    double epsilon,
+    int m,
+    int n)
+{
+    static constexpr int hidden_size = 6144;
+    static constexpr int BlockSize = 256;
+    static constexpr int thread_data_size = 24;
+    static constexpr bool interleave = true;
+    static constexpr int32_t load_chunk_bytes = 16;
+    static constexpr int32_t load_vec_size = load_chunk_bytes / sizeof(DTYPE_I);
+    static constexpr int32_t num_load_inst = thread_data_size / load_vec_size;
+    static constexpr int32_t load_aux = GROUP_NT;
+    static constexpr int interleave_size = WARP_SIZE;
+
+    const int idx = blockIdx.x;
+    if(idx >= m)
+    {
+        return;
+    }
+    const int tid = threadIdx.x;
+    const int row_offset =
+        tid % WARP_SIZE * load_vec_size + (tid / WARP_SIZE) * WARP_SIZE * thread_data_size;
+
+    using vec_i = opus::vector_t<DTYPE_I, thread_data_size>;
+    using vec_f = opus::vector_t<float, thread_data_size>;
+    using vec2_f = opus::vector_t<float, 2>;
+
+    const DTYPE_I* input_ptr = input + static_cast<int64_t>(idx) * hidden_size;
+    auto input_buffer = opus::make_gmem<DTYPE_I>(input_ptr, hidden_size * sizeof(DTYPE_I));
+    auto weight_buffer = opus::make_gmem<DTYPE_I>(weight, hidden_size * sizeof(DTYPE_I));
+    vec_i thread_data_i =
+        load_vector_nbytes<DTYPE_I,
+                           thread_data_size,
+                           load_chunk_bytes,
+                           load_aux,
+                           interleave,
+                           interleave_size>(input_buffer, row_offset);
+    vec_i thread_data_weight =
+        load_vector_nbytes<DTYPE_I,
+                           thread_data_size,
+                           load_chunk_bytes,
+                           RT,
+                           interleave,
+                           interleave_size>(weight_buffer, row_offset);
+    vec_f thread_data_float;
+
+    if constexpr(ADD_RESIDUAL)
+    {
+        const DTYPE_I* residual_in_ptr = residual_in + static_cast<int64_t>(idx) * hidden_size;
+        auto residual_in_buffer =
+            opus::make_gmem<DTYPE_I>(residual_in_ptr, hidden_size * sizeof(DTYPE_I));
+        vec_i thread_data_residual =
+            load_vector_nbytes<DTYPE_I,
+                               thread_data_size,
+                               load_chunk_bytes,
+                               load_aux,
+                               interleave,
+                               interleave_size>(residual_in_buffer, row_offset);
+        for(int i = 0; i < thread_data_size; ++i)
+        {
+            thread_data_float[i] = static_cast<float>(thread_data_i[i]) +
+                                   static_cast<float>(thread_data_residual[i]);
+        }
+        DTYPE_I* residual_out_ptr = residual_out + static_cast<int64_t>(idx) * hidden_size;
+        auto residual_out_buffer =
+            opus::make_gmem<DTYPE_I>(residual_out_ptr, hidden_size * sizeof(DTYPE_I));
+        store_vector<DTYPE_I,
+                     float,
+                     thread_data_size,
+                     load_aux,
+                     interleave,
+                     interleave_size,
+                     num_load_inst,
+                     DTYPE_I>(residual_out_buffer, thread_data_float, row_offset);
+    }
+    else
+    {
+        for(int i = 0; i < thread_data_size; ++i)
+        {
+            thread_data_float[i] = static_cast<float>(thread_data_i[i]);
+        }
+    }
+
+    float square_sum = 0.0f;
+    for(int i = 0; i < thread_data_size; ++i)
+    {
+        square_sum += thread_data_float[i] * thread_data_float[i];
+    }
+    auto sum_f = [](float a, float b) { return a + b; };
+    vec2_f rcp;
+    rcp[0] = block_reduce<float, decltype(sum_f), BlockSize, true>(square_sum, sum_f);
+    rcp[0] = rsqrtf(rcp[0] / n + epsilon);
+    rcp[1] = rcp[0];
+
+    vec2_f* thread_data_float2 = reinterpret_cast<vec2_f*>(&thread_data_float);
+    for(int i = 0; i < thread_data_size / 2; ++i)
+    {
+        asm volatile("v_pk_mul_f32 %0, %1, %2"
+                     : "=v"(thread_data_float2[i])
+                     : "v"(thread_data_float2[i]), "v"(rcp));
+    }
+    for(int i = 0; i < thread_data_size / 2; ++i)
+    {
+        vec2_f& thread_data_weight_float2 = rcp;
+        thread_data_weight_float2[0] = static_cast<float>(thread_data_weight[2 * i]);
+        thread_data_weight_float2[1] = static_cast<float>(thread_data_weight[2 * i + 1]);
+        asm volatile("v_pk_mul_f32 %0, %1, %2"
+                     : "=v"(thread_data_float2[i])
+                     : "v"(thread_data_float2[i]), "v"(thread_data_weight_float2));
+    }
+
+    DTYPE_I* normalized_ptr = normalized + static_cast<int64_t>(idx) * hidden_size;
+    auto normalized_buffer =
+        opus::make_gmem<DTYPE_I>(normalized_ptr, hidden_size * sizeof(DTYPE_I));
+    store_vector<DTYPE_I,
+                 float,
+                 thread_data_size,
+                 RT,
+                 interleave,
+                 interleave_size,
+                 num_load_inst,
+                 DTYPE_I>(normalized_buffer, thread_data_float, row_offset);
+
+    // Quantize the BF16-rounded values directly from registers.  With the
+    // production RMSNorm geometry each 64-lane wave owns 1,536 values as
+    // three interleaved 512-value segments.  In one segment, 16 consecutive
+    // lanes x 8 BF16 values form one exact 128-value quantization group, so a
+    // wave produces 3 x 4 groups and the four waves cover all 48 groups.
+    // This keeps the canonical group boundaries and column-major scale
+    // storage while avoiding the first implementation's BF16 HBM reread.
+    static constexpr int quant_values_per_thread = load_vec_size;
+    static constexpr int quant_threads_per_group = 128 / quant_values_per_thread;
+    static constexpr int quant_segments_per_wave = num_load_inst;
+    static constexpr int quant_groups_per_segment = WARP_SIZE / quant_threads_per_group;
+    static constexpr int quant_groups_per_wave =
+        quant_segments_per_wave * quant_groups_per_segment;
+    static constexpr int quant_segment_stride = WARP_SIZE * quant_values_per_thread;
+    using quant_vec_i = opus::vector_t<DTYPE_I, quant_values_per_thread>;
+
+    const int wave_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+    const int group_in_segment = lane_id / quant_threads_per_group;
+    const int thread_in_group = lane_id % quant_threads_per_group;
+    auto output_buffer = opus::make_gmem<opus::fp8_t>(
+        quantized, static_cast<int64_t>(m) * hidden_size * sizeof(opus::fp8_t));
+
+    for(int segment = 0; segment < quant_segments_per_wave; ++segment)
+    {
+        quant_vec_i thread_quant_data;
+        for(int j = 0; j < quant_values_per_thread; ++j)
+        {
+            // Narrow only the active 8-value segment.  Keeping all 24 BF16
+            // values live alongside the FP32 RMSNorm registers increases
+            // VGPR pressure without changing either output.
+            thread_quant_data[j] = static_cast<DTYPE_I>(
+                thread_data_float[segment * quant_values_per_thread + j]);
+        }
+
+        float abs_max = 1e-10f;
+        for(int j = 0; j < quant_values_per_thread; ++j)
+        {
+            abs_max = max(abs_max, abs(static_cast<float>(thread_quant_data[j])));
+        }
+        abs_max =
+            multithread_reduce(abs_max, hipcub::Max(), quant_threads_per_group);
+
+        constexpr float inverted_dtype_max =
+            1.0f / static_cast<float>(opus::finfo<opus::fp8_t>::max());
+        float inverted_scale = abs_max * inverted_dtype_max;
+        const int group_id = wave_id * quant_groups_per_wave +
+                             segment * quant_groups_per_segment + group_in_segment;
+        if(thread_in_group == 0)
+        {
+            scale[static_cast<int64_t>(group_id) * m + idx] = inverted_scale;
+        }
+        inverted_scale = precise_reciprocal_for_mimo_quant(inverted_scale);
+
+        const int64_t output_offset = static_cast<int64_t>(idx) * hidden_size +
+                                      row_offset + segment * quant_segment_stride;
+        store_vector<opus::fp8_t,
+                     DTYPE_I,
+                     quant_values_per_thread,
+                     RT,
+                     false,
+                     WARP_SIZE,
+                     1,
+                     opus::fp8_t>(
+            output_buffer, thread_quant_data, output_offset, inverted_scale);
+    }
+}
+
+static void check_mimo_rmsnorm_fp8_group_quant_6144_inputs(
+    const torch::Tensor& quantized,
+    const torch::Tensor& normalized,
+    const torch::Tensor& scale,
+    const torch::Tensor& input,
+    const torch::Tensor& weight)
+{
+    TORCH_CHECK(get_gpu_arch() == "gfx950",
+                __func__,
+                " is specialized for gfx950, got ",
+                get_gpu_arch());
+    TORCH_CHECK(input.is_cuda(), __func__, " input must be on a HIP device");
+    TORCH_CHECK(input.dim() == 2 && input.size(1) == 6144,
+                __func__,
+                " input must have shape [M, 6144], got ",
+                input.sizes());
+    TORCH_CHECK(input.scalar_type() == torch::kBFloat16,
+                __func__,
+                " input must be bfloat16, got ",
+                input.scalar_type());
+    TORCH_CHECK(input.is_contiguous(), __func__, " input must be contiguous");
+    TORCH_CHECK(weight.is_cuda() && weight.scalar_type() == torch::kBFloat16 &&
+                    weight.dim() == 1 && weight.numel() == 6144 && weight.is_contiguous(),
+                __func__,
+                " weight must be a contiguous HIP bfloat16 tensor with shape [6144]");
+    TORCH_CHECK(normalized.is_cuda() && normalized.scalar_type() == torch::kBFloat16 &&
+                    normalized.sizes() == input.sizes() && normalized.is_contiguous(),
+                __func__,
+                " normalized must be a contiguous HIP bfloat16 tensor matching input");
+    TORCH_CHECK(quantized.is_cuda() && quantized.scalar_type() == torch_fp8 &&
+                    quantized.sizes() == input.sizes() && quantized.is_contiguous(),
+                __func__,
+                " quantized must be a contiguous HIP FP8 tensor matching input");
+    TORCH_CHECK(scale.is_cuda() && scale.scalar_type() == torch::kFloat32 &&
+                    scale.dim() == 2 && scale.size(0) == input.size(0) &&
+                    scale.size(1) == 48 && scale.is_contiguous(),
+                __func__,
+                " scale must be a contiguous HIP float32 tensor with shape [M, 48]");
+    TORCH_CHECK(input.device() == weight.device() && input.device() == normalized.device() &&
+                    input.device() == quantized.device() && input.device() == scale.device(),
+                __func__,
+                " all tensors must be on the same device");
+}
+
+template <bool ADD_RESIDUAL>
+static void launch_mimo_rmsnorm_fp8_group_quant_6144(
+    torch::Tensor& quantized,
+    torch::Tensor& normalized,
+    torch::Tensor& scale,
+    torch::Tensor& input,
+    torch::Tensor* residual_in,
+    torch::Tensor* residual_out,
+    torch::Tensor& weight,
+    double epsilon)
+{
+    check_mimo_rmsnorm_fp8_group_quant_6144_inputs(
+        quantized, normalized, scale, input, weight);
+    if constexpr(ADD_RESIDUAL)
+    {
+        TORCH_CHECK(residual_in != nullptr && residual_out != nullptr,
+                    __func__,
+                    " residual tensors are required");
+        TORCH_CHECK(residual_in->is_cuda() && residual_in->scalar_type() == torch::kBFloat16 &&
+                        residual_in->sizes() == input.sizes() && residual_in->is_contiguous(),
+                    __func__,
+                    " residual_in must be a contiguous HIP bfloat16 tensor matching input");
+        TORCH_CHECK(residual_out->is_cuda() && residual_out->scalar_type() == torch::kBFloat16 &&
+                        residual_out->sizes() == input.sizes() && residual_out->is_contiguous(),
+                    __func__,
+                    " residual_out must be a contiguous HIP bfloat16 tensor matching input");
+        TORCH_CHECK(input.device() == residual_in->device() &&
+                        input.device() == residual_out->device(),
+                    __func__,
+                    " residual tensors must be on the input device");
+    }
+
+    const int m = input.size(0);
+    if(m == 0)
+    {
+        return;
+    }
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const auto* residual_in_ptr = ADD_RESIDUAL
+                                      ? reinterpret_cast<const opus::bf16_t*>(residual_in->data_ptr())
+                                      : nullptr;
+    auto* residual_out_ptr = ADD_RESIDUAL
+                                 ? reinterpret_cast<opus::bf16_t*>(residual_out->data_ptr())
+                                 : nullptr;
+    mimo_rmsnorm_fp8_group_quant_6144_kernel<opus::bf16_t, ADD_RESIDUAL>
+        <<<dim3(m), dim3(256), 0, stream>>>(
+            reinterpret_cast<opus::fp8_t*>(quantized.data_ptr()),
+            reinterpret_cast<opus::bf16_t*>(normalized.data_ptr()),
+            reinterpret_cast<float*>(scale.data_ptr()),
+            reinterpret_cast<const opus::bf16_t*>(input.data_ptr()),
+            residual_in_ptr,
+            residual_out_ptr,
+            reinterpret_cast<const opus::bf16_t*>(weight.data_ptr()),
+            epsilon,
+            m,
+            6144);
+}
+
+void mimo_add_rmsnorm_fp8_group_quant(torch::Tensor& quantized,
+                                      torch::Tensor& normalized,
+                                      torch::Tensor& scale,
+                                      torch::Tensor& input,
+                                      torch::Tensor& residual_in,
+                                      torch::Tensor& residual_out,
+                                      torch::Tensor& weight,
+                                      double epsilon)
+{
+    launch_mimo_rmsnorm_fp8_group_quant_6144<true>(quantized,
+                                                   normalized,
+                                                   scale,
+                                                   input,
+                                                   &residual_in,
+                                                   &residual_out,
+                                                   weight,
+                                                   epsilon);
+}
+
+void mimo_rmsnorm_fp8_group_quant(torch::Tensor& quantized,
+                                  torch::Tensor& normalized,
+                                  torch::Tensor& scale,
+                                  torch::Tensor& input,
+                                  torch::Tensor& weight,
+                                  double epsilon)
+{
+    launch_mimo_rmsnorm_fp8_group_quant_6144<false>(
+        quantized, normalized, scale, input, nullptr, nullptr, weight, epsilon);
+}
 
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave) \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                    \
