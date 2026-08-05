@@ -795,7 +795,7 @@ def nextPow2(n):
     return 1 << (n - 1).bit_length()
 
 
-_PADDED_M_TIERS = [32768, 131072]
+_PADDED_M_TIERS = [32768, 65536, 131072]
 
 
 def get_padded_M(M):
@@ -1352,7 +1352,7 @@ def get_2stage_cfgs(
                 device=a2.device,
             )            
             moe_gemm_8wave_down([1, num_e_blocks], [8*64],
-                            moe_out.element_size() * moe_out.numel() > (1<<32),
+                            stage2_out.element_size() * stage2_out.numel() > (1<<32),
                             "fp8", wg_M, 64,
                             expert, model_dim, inter_dim, 
                             False, w2_is_shuffled, topk,
