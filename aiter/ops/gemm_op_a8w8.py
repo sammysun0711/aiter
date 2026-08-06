@@ -795,10 +795,46 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
+    # PyHIP entries currently live in the standard blockscale table, but the
+    # kernel itself consumes the same preshuffled B and column-major A-scale
+    # layouts accepted by this API.  Reuse an exact PyHIP entry here so
+    # preshuffle callers (including SGLang on gfx950) can select it without
+    # reshuffling weights or scales at runtime.
+    pyhip_config = get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+    )
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    if (
+        pyhip_config is not None
+        and pyhip_config["libtype"] == "pyhip"
+        and str(pyhip_config.get("kernelName", ""))
+        == "gemm_8wave_fp8bf16fp16"
+    ):
+        wg_M, wg_N = 256, 256
+        num_block_M = pyhip.div_up(m, wg_M)
+        num_block_N = pyhip.div_up(n, wg_N)
+        gemm_8wave_fp8bf16fp16(
+            [num_block_N * num_block_M],
+            [64 * 8],
+            "fp8",
+            True,
+            True,
+            wg_M,
+            wg_N,
+            n,
+            k,
+            XQ.data_ptr(),
+            WQ.data_ptr(),
+            Y.data_ptr(),
+            x_scale.data_ptr(),
+            w_scale.data_ptr(),
+            m,
+        )
+        return Y
+
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if config is not None:
         libtype = config["libtype"]
         kernelName = str(config.get("kernelName", ""))
