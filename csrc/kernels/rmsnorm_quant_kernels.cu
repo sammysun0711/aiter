@@ -474,7 +474,15 @@ __global__ void mimo_rmsnorm_fp8_group_quant_6144_kernel(
             // Narrow only the active 8-value segment.  Keeping all 24 BF16
             // values live alongside the FP32 RMSNorm registers increases
             // VGPR pressure without changing either output.
-            thread_quant_data[j] = static_cast<DTYPE_I>(
+            //
+            // Must use opus::cast, not static_cast: store_vector narrows the
+            // `normalized` output with opus::cast<DTYPE_I>, and on gfx942 that
+            // is FP32->BF16 truncate (OPUS_FP32_to_BF16_DEFAULT == 2) while
+            // static_cast is round-to-nearest.  gfx950 takes the hardware
+            // conversion for both, so the two agree there and the mismatch only
+            // appears on gfx94*, where it makes the group amax up to one BF16
+            // ULP larger than the value actually stored in `normalized`.
+            thread_quant_data[j] = opus::cast<DTYPE_I>(
                 thread_data_float[segment * quant_values_per_thread + j]);
         }
 
@@ -518,10 +526,17 @@ static void check_mimo_rmsnorm_fp8_group_quant_6144_inputs(
     const torch::Tensor& input,
     const torch::Tensor& weight)
 {
-    TORCH_CHECK(get_gpu_arch() == "gfx950",
-                __func__,
-                " is specialized for gfx950, got ",
-                get_gpu_arch());
+    // The 48-group remap is arch-independent within GFX9: it needs WARP_SIZE==64
+    // and 16-byte vector loads, which gfx942 and gfx950 both provide.  The FP8
+    // format differs (gfx942 e4m3fnuz max=240, gfx950 OCP e4m3 max=448) but the
+    // kernel takes that from finfo<fp8_t>::max(), which is already arch-gated.
+    {
+        const std::string arch = get_gpu_arch();
+        TORCH_CHECK(arch == "gfx950" || arch == "gfx942",
+                    __func__,
+                    " is specialized for gfx950/gfx942, got ",
+                    arch);
+    }
     TORCH_CHECK(input.is_cuda(), __func__, " input must be on a HIP device");
     TORCH_CHECK(input.dim() == 2 && input.size(1) == 6144,
                 __func__,
