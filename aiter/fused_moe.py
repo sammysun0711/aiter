@@ -1887,9 +1887,18 @@ def fused_moe_2stages(
             and stage1_uses_transposed_scale
             and not a1_scale_is_transposed
         ):
-            scale_t = torch.empty_like(a1_scale)
-            aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
-            a1_scale = scale_t
+            if num_local_tokens is None:
+                scale_shape = a1_scale.shape
+                a1_scale = (
+                    a1_scale.view(-1, scale_shape[-1])
+                    .transpose(0, 1)
+                    .contiguous()
+                    .view(scale_shape)
+                )
+            else:
+                scale_t = torch.empty_like(a1_scale)
+                aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
+                a1_scale = scale_t
         elif (
             quant_type == QuantType.per_1x128
             and a1_scale_is_transposed
