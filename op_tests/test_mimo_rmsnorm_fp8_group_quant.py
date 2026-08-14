@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import aiter
+import aiter.fused_moe as fused_moe_mod
 from aiter import QuantType, dtypes, get_gfx, get_hip_quant
 from aiter.ops.rmsnorm import (
     mimo_add_rmsnorm_fp8_group_quant,
@@ -102,3 +103,122 @@ def test_mimo_rmsnorm_fp8_group_quant_matches_production_path(m, add_residual):
             assert actual_tensor is None
         else:
             assert torch.equal(actual_tensor, reference_tensor)
+
+
+@pytest.mark.parametrize("use_num_local_tokens", [False, True])
+def test_prequantized_fused_moe_2stage_transposes_per_1x128_scales(
+    monkeypatch, use_num_local_tokens
+):
+    calls = {"partial_transpose": 0, "quant_transpose_scale": []}
+
+    def fake_partial_transpose(dst, src, num_rows=None):
+        assert num_rows is not None
+        calls["partial_transpose"] += 1
+        dst.copy_(src + 1.0)
+
+    def fake_quant(x, *, scale=None, quant_dtype=None, num_rows=None, **kwargs):
+        calls["quant_transpose_scale"].append(kwargs.get("transpose_scale", False))
+        out = torch.empty_like(x, dtype=quant_dtype)
+        out_scale = torch.empty((x.shape[0], x.shape[1] // 128), device=x.device)
+        return out, out_scale
+
+    stage1_inputs = {}
+    stage2_inputs = {}
+
+    def fake_stage1(
+        a1,
+        w1,
+        w2,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        a2,
+        topk,
+        *,
+        a1_scale=None,
+        **kwargs,
+    ):
+        stage1_inputs["a1_scale"] = a1_scale
+        return torch.empty((a1.shape[0], topk, w2.shape[-1]), dtype=torch.bfloat16)
+
+    def fake_stage2(
+        a2,
+        w1,
+        w2,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_out,
+        topk,
+        *,
+        a2_scale=None,
+        **kwargs,
+    ):
+        stage2_inputs["a2_scale"] = a2_scale
+        return moe_out
+
+    fake_stage1.func = None
+    fake_stage1.transpose_quant = True
+    fake_stage2.func = None
+    fake_stage2.transpose_quant = True
+
+    monkeypatch.setattr(fused_moe_mod.aiter, "partial_transpose", fake_partial_transpose)
+    monkeypatch.setattr(fused_moe_mod, "get_quant", lambda quant_type: fake_quant)
+    monkeypatch.setattr(
+        fused_moe_mod,
+        "get_2stage_cfgs",
+        lambda *args, **kwargs: fused_moe_mod.MOEMetadata(
+            fake_stage1,
+            fake_stage2,
+            block_m=256,
+            ksplit=0,
+        ),
+    )
+
+    token_num = 2
+    model_dim = 256
+    inter_dim = 128
+    hidden_states = torch.empty((token_num, model_dim), dtype=dtypes.fp8)
+    a1_scale = torch.arange(
+        token_num * (model_dim // 128), dtype=torch.float32
+    ).reshape(token_num, model_dim // 128)
+    w1 = torch.empty((1, inter_dim * 2, model_dim), dtype=dtypes.fp8)
+    w2 = torch.empty((1, model_dim, inter_dim), dtype=dtypes.fp8)
+    sorted_ids = torch.zeros((token_num,), dtype=torch.int32)
+    sorted_weights = torch.ones((token_num,), dtype=torch.float32)
+    sorted_expert_ids = torch.zeros((1,), dtype=torch.int32)
+    num_valid_ids = torch.tensor([token_num], dtype=torch.int32)
+    moe_out = torch.empty((token_num, model_dim), dtype=torch.bfloat16)
+    num_local_tokens = (
+        torch.tensor([token_num], dtype=torch.int32) if use_num_local_tokens else None
+    )
+
+    fused_moe_mod.fused_moe_2stages(
+        hidden_states,
+        w1,
+        w2,
+        topk=1,
+        sorted_ids=sorted_ids,
+        sorted_weights=sorted_weights,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        moe_out=moe_out,
+        isG1U1=True,
+        block_size_M=256,
+        quant_type=QuantType.per_1x128,
+        q_dtype_a=dtypes.fp8,
+        q_dtype_w=dtypes.fp8,
+        a1_scale=a1_scale,
+        a1_scale_is_transposed=False,
+        num_local_tokens=num_local_tokens,
+    )
+
+    expected_a1_scale = (
+        a1_scale + 1.0
+        if use_num_local_tokens
+        else a1_scale.transpose(0, 1).contiguous().view_as(a1_scale)
+    )
+    assert calls["partial_transpose"] == int(use_num_local_tokens)
+    assert torch.equal(stage1_inputs["a1_scale"], expected_a1_scale)
+    assert calls["quant_transpose_scale"] == [True]
+    assert stage2_inputs["a2_scale"] is not None

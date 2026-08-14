@@ -1799,6 +1799,13 @@ def fused_moe_2stages(
         gate_mode,
         is_ep=expert_mask is not None,
     )
+    stage1_uses_transposed_scale = quant_type == QuantType.per_1x128 and (
+        metadata.stage1.func is asm_stage1
+        or getattr(metadata.stage1, "transpose_quant", False)
+    )
+    if stage1_uses_transposed_scale:
+        quant_func = functools.partial(quant_func, transpose_scale=True)
+
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1864,8 +1871,6 @@ def fused_moe_2stages(
                 num_rows=num_local_tokens,
             )
     elif hidden_states.dtype != q_dtype_a:
-        if quant_type == QuantType.per_1x128 and (metadata.stage1.func is asm_stage1 or getattr(metadata.stage1, "transpose_quant", False)):
-            quant_func = functools.partial(quant_func, transpose_scale=True)
         a1, a1_scale = quant_func(
             hidden_states,
             scale=a1_scale,
@@ -1879,8 +1884,25 @@ def fused_moe_2stages(
         a1 = hidden_states
         if (
             quant_type == QuantType.per_1x128
+            and stage1_uses_transposed_scale
+            and not a1_scale_is_transposed
+        ):
+            if num_local_tokens is None:
+                scale_shape = a1_scale.shape
+                a1_scale = (
+                    a1_scale.view(-1, scale_shape[-1])
+                    .transpose(0, 1)
+                    .contiguous()
+                    .view(scale_shape)
+                )
+            else:
+                scale_t = torch.empty_like(a1_scale)
+                aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
+                a1_scale = scale_t
+        elif (
+            quant_type == QuantType.per_1x128
             and a1_scale_is_transposed
-            and metadata.stage1.func is not asm_stage1
+            and not stage1_uses_transposed_scale
         ):
             # FP8 blockscale ASM consumes scales in column-major storage, but
             # CK two-stage kernels consume the ordinary [M, K/128] row-major
