@@ -257,6 +257,51 @@ class QuickAllReduce:
         )
         return out
 
+    def should_quick_allreduce_mimo_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        hidden_dim: int,
+    ) -> bool:
+        if self.qr_quant_level is not QuickReduceRegime.FP:
+            return False
+        if hidden_dim != 6144 or not self.should_quick_allreduce(inp):
+            return False
+        if not inp.is_contiguous():
+            return False
+        if inp.dtype != residual_inp.dtype or inp.dtype != weight.dtype:
+            return False
+        if inp.shape[-1] != hidden_dim or residual_inp.shape != inp.shape:
+            return False
+        if weight.numel() != hidden_dim:
+            return False
+        return residual_inp.is_contiguous() and weight.is_contiguous()
+
+    def quick_all_reduce_mimo_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run FP Quick Reduce with MiMo residual-add RMSNorm."""
+        out = torch.empty_like(inp)
+        residual_out = torch.empty_like(residual_inp)
+        ops.qr_all_reduce_mimo_rmsnorm(
+            self._ptr,
+            inp,
+            residual_inp,
+            residual_out,
+            out,
+            weight,
+            eps,
+            inp.shape[-1],
+            self.qr_quant_level.value,
+            self.use_fp16_kernels,
+        )
+        return out, residual_out
+
     def close(self):
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:

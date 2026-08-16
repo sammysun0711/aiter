@@ -281,6 +281,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if self._ar_1stage_override is not None
             else (total_bytes <= 128 * 1024)
         )
+        qr_comm = self.qr_comm
+        if (
+            not use_1stage
+            and not use_general_path
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and qr_comm is not None
+            and not qr_comm.disabled
+            and qr_comm.should_quick_allreduce_mimo_rmsnorm(
+                input_, res_inp_, weight_, n
+            )
+        ):
+            return qr_comm.quick_all_reduce_mimo_rmsnorm(
+                input_, res_inp_, weight_, eps
+            )
+
         if (
             not use_general_path
             and can_use_custom_ar
