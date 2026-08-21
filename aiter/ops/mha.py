@@ -3003,8 +3003,12 @@ def mha_batch_prefill_func(
     else:
         if k.size(-1) != head_size_q_og:
             raise ValueError("K linear layout does not match Q head size")
-        if k.size(1) != v.size(1) or k.size(2) != v.size(2):
-            raise ValueError("K/V linear layout must match page size and head count")
+        if k.dim() == 4:
+            same_token_head_shape = k.shape[:3] == v.shape[:3]
+        else:
+            same_token_head_shape = k.shape[:2] == v.shape[:2]
+        if not same_token_head_shape:
+            raise ValueError("K/V linear layout must match token/page and head axes")
     if k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("Batch prefill requires K/V with contiguous last dimension")
     out_padded, softmax_lse, S_dmask, rng_state = _mha_batch_prefill(
