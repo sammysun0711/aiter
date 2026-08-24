@@ -1,4 +1,5 @@
 cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,us1,kernelName1,err1,us2,kernelName2,err2,us,run_1stage,xbf16,flat,tflops,bw,_tag
+256,8192,6144,256,384,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,256,0,308.9925,pyhip_stage1,0.0%,530.9002,pyhip_stage2,0.0%,839.8927,0,1,1,736.37,2337.13,
 256,16384,6144,256,384,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,256,0,479.6011,pyhip_stage1,0.0%,817.7075,pyhip_stage2,0.0%,1297.3086,0,1,1,953.47,1629.47,
 256,32768,6144,256,384,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,256,0,642.4924,pyhip_stage1,0.0%,1732.3375,pyhip_stage2,0.0%,2374.8299,0,1,1,1041.72,1017.3,
 256,65536,6144,256,384,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,256,0,1215.0959,pyhip_stage1,0.0%,3551.2503,pyhip_stage2,0.0%,4766.3462,0,1,1,1038.07,633.59,
