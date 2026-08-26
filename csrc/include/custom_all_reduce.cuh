@@ -699,6 +699,7 @@ __global__ void __launch_bounds__(512, 1) allgather_naive(
         int write_idx     = warp_id * size + idx;
         result[write_idx] = ptrs[warp_id][idx];
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int ngpus>
@@ -726,6 +727,7 @@ __global__ void __launch_bounds__(512, 1) allgather_vec(
         int write_idx                                   = warp_id * size + idx;
         *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int ngpus>
@@ -762,6 +764,7 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
         int write_idx                                   = (ngpus * y + warp_id) * last_dim_size + x;
         *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 /*
@@ -797,6 +800,7 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_first_dim(
         *(reinterpret_cast<P*>(result) + store_index) =
             packed_reduce<P, ngpus, A>(ptrs, load_index);
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // fp8 quant all-reduce code start
@@ -1841,6 +1845,11 @@ __global__ void __launch_bounds__(1024, 1)
         OP zero_pack{};
         *reinterpret_cast<OP*>(output + out_idx) = zero_pack;
     }
+    // Pair start_sync with a final barrier before any rank can reuse the
+    // registered input buffer or this block's signal slot for the next fused
+    // collective. Without it, a faster rank may advance while a peer is still
+    // reading the previous invocation, causing silent cross-request corruption.
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // Per-group quant variant of the 1-stage fused allreduce+rmsnorm kernel.
@@ -1919,6 +1928,7 @@ __global__ void __launch_bounds__(1024, 1)
     ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size>(
         acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
         group_size, output, scale_out, active, bf16_output);
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, typename OutT, int NGPUS>
@@ -2013,6 +2023,7 @@ __global__ void __launch_bounds__(1024, 1)
     ar_fusion_epilogue_mxfp4<P, A, T, pack_size>(
         acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
         output, scale_out, active, bf16_output);
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int NGPUS>
