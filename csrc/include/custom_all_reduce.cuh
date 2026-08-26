@@ -1845,6 +1845,11 @@ __global__ void __launch_bounds__(1024, 1)
         OP zero_pack{};
         *reinterpret_cast<OP*>(output + out_idx) = zero_pack;
     }
+    // Pair start_sync with a final barrier before any rank can reuse the
+    // registered input buffer or this block's signal slot for the next fused
+    // collective. Without it, a faster rank may advance while a peer is still
+    // reading the previous invocation, causing silent cross-request corruption.
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // Per-group quant variant of the 1-stage fused allreduce+rmsnorm kernel.
@@ -1923,6 +1928,7 @@ __global__ void __launch_bounds__(1024, 1)
     ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size>(
         acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
         group_size, output, scale_out, active, bf16_output);
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, typename OutT, int NGPUS>
@@ -2017,6 +2023,7 @@ __global__ void __launch_bounds__(1024, 1)
     ar_fusion_epilogue_mxfp4<P, A, T, pack_size>(
         acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
         output, scale_out, active, bf16_output);
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int NGPUS>
