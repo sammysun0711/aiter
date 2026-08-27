@@ -2147,8 +2147,9 @@ def _flydsl_moe_stage2_impl(
     else:
         _persist_m = -1 if m_blocks > 256 else 1
 
-    if a_dtype == "fp8":
-        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
+    if a_dtype == "fp8" and persist is not True:
+        # FP8 defaults to non-persistent scheduling, so cap grid.y via persist_m.
+        # Preserve an explicit persistent request selected by a tuned config.
         _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:

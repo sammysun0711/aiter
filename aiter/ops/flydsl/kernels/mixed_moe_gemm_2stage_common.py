@@ -2193,7 +2193,11 @@ def compile_mixed_moe_gemm1_common(
                         result = situ_mul_vec4(gate_v4, up_v4)
                     else:
                         result = silu_mul_vec4(gate_v4, up_v4)
-                    if const_expr(shared_b and need_fp8):
+                    # Match the non-fused BF16-output path before converting the
+                    # activated intermediate to FP8.  Without this round-trip,
+                    # routed experts quantize directly from FP32 while the
+                    # separate path quantizes from BF16.
+                    if const_expr(need_fp8):
                         result = arith.extf(
                             vec4_f32, arith.trunc_f(T.vec(4, T.bf16), result)
                         )
@@ -2229,7 +2233,7 @@ def compile_mixed_moe_gemm1_common(
                         g = _clamp_gate(g)
                         u = _clamp_lin(u)
                         result = silu_elem(g) * u
-                    if const_expr(shared_b and need_fp8):
+                    if const_expr(need_fp8):
                         result = arith.extf(f32, arith.trunc_f(T.bf16, result))
                     return result
 

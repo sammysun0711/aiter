@@ -503,6 +503,7 @@ def fused_moe(
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
     stage2_scatter: Stage2ScatterContext | None = None,
+    ep_has_fake_route: bool = True,
 ):
     if (
         any(
@@ -585,6 +586,7 @@ def fused_moe(
         ),
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_source_token_map=scatter_source_map,
+        ep_has_fake_route=ep_has_fake_route,
     )
 
 
@@ -622,6 +624,7 @@ def fused_moe_fake(
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
+    ep_has_fake_route: bool = True,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -666,6 +669,7 @@ def fused_moe_(
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
+    ep_has_fake_route: bool = True,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -704,6 +708,7 @@ def fused_moe_(
         linear_beta=linear_beta,
         gate_mode=gate_mode,
         stage2_scatter=stage2_scatter,
+        ep_has_fake_route=ep_has_fake_route,
     )
 
 
@@ -734,6 +739,7 @@ def _fused_moe_impl(
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
+    ep_has_fake_route: bool = True,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -775,6 +781,17 @@ def _fused_moe_impl(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    is_silu_interleave_a8w4 = (
+        quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and activation == ActivationType.Silu
+        and gate_mode == GateMode.INTERLEAVE
+        and get_gfx() == "gfx950"
+        and isShuffled
+        and isG1U1
+        and not doweight_stage1
+        and is_flydsl_available()
+    )
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
     # use FP8 as activation dtype to skip redundant re-quantization
     if (
@@ -806,6 +823,11 @@ def _fused_moe_impl(
                 q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
+        elif is_silu_interleave_a8w4:
+            # The gfx950 BF16/FP4 CK fallback has no plain-SiLU interleaved
+            # kernel for decode-sized batches. Use the supported A8W4 path at
+            # every token tier instead of requiring a global threshold override.
+            q_dtype_a = dtypes.fp8
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
@@ -915,6 +937,7 @@ def _fused_moe_impl(
         isShuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        ep_has_fake_route=ep_has_fake_route,
         has_stage2_bias=bias2 is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
@@ -1071,6 +1094,7 @@ def _fused_moe_impl(
             linear_beta=linear_beta,
             gate_mode=gate_mode,
             expert_mask=expert_mask,
+            ep_has_fake_route=ep_has_fake_route,
             m_indices=sort_m_indices,
             reverse_sorted=sort_reverse_sorted,
             _metadata_transform=_metadata_transform,
@@ -2157,6 +2181,7 @@ def get_2stage_cfgs(
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
+    ep_has_fake_route=True,
     has_stage2_bias=False,
     opus_weights_shuffled=None,
     config_file=None,
@@ -2264,10 +2289,9 @@ def get_2stage_cfgs(
             cfg_2stages_by_file[tune_file] = active_cfg_2stages
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
+    # Legacy EP callers append one always-masked fake route. Newer callers can
+    # explicitly report that their top-k tensor contains routed entries only.
+    topk -= int(is_ep and ep_has_fake_route)
     keys = (
         gfx,
         cu_num,
@@ -2759,21 +2783,38 @@ def get_2stage_cfgs(
         and not doweight_stage1
         and is_flydsl_available()
     )
-    use_mxfp4_flydsl = _is_a16w4_situv2 or (
+    _is_silu_interleave_a8w4 = (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
-        and (
-            activation in (ActivationType.Swiglu, ActivationType.Situv2)
-            or _flydsl_force
-        )
-        and (
-            q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
-            and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
-        )
+        and activation == ActivationType.Silu
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp4x2
+        and gate_mode == GateMode.INTERLEAVE
+        and get_gfx() == "gfx950"
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
         and is_flydsl_available()
+    )
+    use_mxfp4_flydsl = (
+        _is_a16w4_situv2
+        or _is_silu_interleave_a8w4
+        or (
+            dtype in [dtypes.bf16, dtypes.fp16]
+            and q_type == QuantType.per_1x32
+            and (
+                activation in (ActivationType.Swiglu, ActivationType.Situv2)
+                or _flydsl_force
+            )
+            and (
+                q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
+                and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
+            )
+            and is_shuffled
+            and use_g1u1
+            and not doweight_stage1
+            and is_flydsl_available()
+        )
     )
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
@@ -3066,6 +3107,7 @@ def fused_moe_2stages(
     linear_beta=None,
     gate_mode=GateMode.SEPARATED.value,
     expert_mask=None,
+    ep_has_fake_route=True,
     m_indices=None,
     reverse_sorted=None,
     _metadata_transform: Callable | None = None,
@@ -3101,6 +3143,7 @@ def fused_moe_2stages(
         is_shuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        ep_has_fake_route=ep_has_fake_route,
         has_stage2_bias=bias2 is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),

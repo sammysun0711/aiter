@@ -150,6 +150,7 @@ def _generate_a8w4_gui_data(
     return {
         "inter_pad": inter_pad,
         "topk": topk,
+        "inp": inp,
         "a_q": a_q,
         "a_scale_sort": a_scale_sort,
         "w1_shuf": w1_shuf,
@@ -207,8 +208,9 @@ def test_pick_flydsl_stage2_tile_k():
         pytest.param(640, 0, id="i640_dsv4"),
     ],
 )
+@pytest.mark.parametrize("persist", [False, True], ids=["nonpersistent", "persistent"])
 @_SKIP_GFX950_FLYDSL
-def test_flydsl_stage2_a8w4_gui(inter_dim, seed):
+def test_flydsl_stage2_a8w4_gui(inter_dim, seed, persist):
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
 
     token, model_dim, E, topk, block_m = 16, 512, 8, 2, 32
@@ -232,11 +234,64 @@ def test_flydsl_stage2_a8w4_gui(inter_dim, seed):
         w2_scale=data["w2_scale_shuf"],
         a2_scale=data["a2_scale_sort"],
         sorted_weights=data["sorted_weights"],
+        persist=persist,
         inter_dim_pad=data["inter_pad"],
         model_dim_pad=0,
     )
     torch.cuda.synchronize()
     _check_close(data["ref_stage2"], out, f"stage2_a8w4_gui_i{inter_dim}")
+
+
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage2_a8w4_persistent_graph_replay():
+    """Persistent stage 2 must support graph replay with a reused output."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
+
+    token, model_dim, inter_dim, E, topk, block_m = 64, 512, 256, 8, 2, 32
+    data = _generate_a8w4_gui_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=29
+    )
+    out = torch.zeros(token, model_dim, dtype=torch.bfloat16, device="cuda")
+    kwargs = {
+        "inter_states": data["a2_q"],
+        "w2": data["w2_shuf"],
+        "sorted_token_ids": data["sorted_ids"],
+        "sorted_expert_ids": data["sorted_expert_ids"],
+        "num_valid_ids": data["num_valid_ids"],
+        "out": out,
+        "topk": topk,
+        "tile_m": block_m,
+        "tile_n": 128,
+        "tile_k": 256,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "out_dtype": "bf16",
+        "mode": "atomic",
+        "w2_scale": data["w2_scale_shuf"],
+        "a2_scale": data["a2_scale_sort"],
+        "sorted_weights": data["sorted_weights"],
+        "persist": True,
+    }
+
+    out.zero_()
+    flydsl_moe_stage2(**kwargs)
+    torch.cuda.synchronize()
+    expected = out.clone()
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        out.zero_()
+        flydsl_moe_stage2(**kwargs)
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out.zero_()
+        flydsl_moe_stage2(**kwargs)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, expected, atol=1.0, rtol=0.05)
 
 
 @pytest.mark.parametrize("block_m", [16, 32, 64, 128])
@@ -417,6 +472,93 @@ def test_flydsl_e2e_a8w4_gui(inter_dim):
     )
     torch.cuda.synchronize()
     _check_close(data["ref_stage2"], out, f"e2e_a8w4_gui_i{inter_dim}")
+
+
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_fused_fp8_stage1_preserves_bf16_boundary():
+    """Fused stage-1 FP8 output must match BF16 output followed by quantization."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+
+    token, model_dim, inter_dim, E, topk, block_m = 64, 512, 256, 8, 2, 32
+    data = _generate_a8w4_gui_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=91
+    )
+
+    # Fused-output A8W4 kernels use unit input scales. Keep this input contract
+    # identical between the fused and non-fused stage-1 calls.
+    a_q = data["inp"].to(dtypes.fp8)
+    a_scale = torch.full(
+        (token, model_dim // 32), 127, dtype=torch.uint8, device="cuda"
+    )
+    a_scale_sort = mxfp4_moe_sort_fwd(
+        a_scale,
+        sorted_ids=data["sorted_ids"],
+        num_valid_ids=data["num_valid_ids"],
+        token_num=token,
+        cols=model_dim,
+    )
+    stage1_kwargs = {
+        "a": a_q,
+        "w1": data["w1_shuf"],
+        "sorted_token_ids": data["sorted_ids"],
+        "sorted_expert_ids": data["sorted_expert_ids"],
+        "num_valid_ids": data["num_valid_ids"],
+        "topk": topk,
+        "tile_m": block_m,
+        "tile_n": 256,
+        "tile_k": 256,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "act": "silu",
+        "gate_mode": "interleave",
+        "w1_scale": data["w1_scale_shuf"],
+        "a1_scale": a_scale_sort,
+        "a_scale_one": True,
+    }
+
+    inter_bf16 = flydsl_moe_stage1(out_dtype="bf16", **stage1_kwargs)
+    inter_q, inter_scale = per_1x32_f8_scale_f8_quant(
+        inter_bf16, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    inter_q = inter_q.view(token, topk, inter_dim)
+    inter_scale = mxfp4_moe_sort_fwd(
+        inter_scale,
+        sorted_ids=data["sorted_ids"],
+        num_valid_ids=data["num_valid_ids"],
+        token_num=token,
+        cols=inter_dim,
+    )
+    fused_q, fused_scale = flydsl_moe_stage1(out_dtype="fp8", **stage1_kwargs)
+
+    stage2_kwargs = {
+        "w2": data["w2_shuf"],
+        "sorted_token_ids": data["sorted_ids"],
+        "sorted_expert_ids": data["sorted_expert_ids"],
+        "num_valid_ids": data["num_valid_ids"],
+        "topk": topk,
+        "tile_m": block_m,
+        "tile_n": 256,
+        "tile_k": 256,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "out_dtype": "bf16",
+        "mode": "atomic",
+        "w2_scale": data["w2_scale_shuf"],
+        "sorted_weights": data["sorted_weights"],
+    }
+    expected = flydsl_moe_stage2(
+        inter_states=inter_q, a2_scale=inter_scale, **stage2_kwargs
+    )
+    actual = flydsl_moe_stage2(
+        inter_states=fused_q, a2_scale=fused_scale, **stage2_kwargs
+    )
+    torch.cuda.synchronize()
+    _check_close(
+        expected.float(),
+        actual.float(),
+        "fused_fp8_stage1_bf16_boundary",
+        max_err_ratio=0.001,
+    )
 
 
 # ---------------------------------------------------------------------------
