@@ -281,6 +281,21 @@ def get_flydsl_stage1_kernels(
                                             "xcd_swizzle": xcd,
                                             "k_wave": kw,
                                         }
+                                        if (
+                                            a_dtype == "fp8"
+                                            and is_fp4_b
+                                            and tm == 128
+                                            and tn == 256
+                                            and kw == 1
+                                            and wpe == 1
+                                            and bnt == 0
+                                            and xcd == 4
+                                            and out_dtype == "bf16"
+                                        ):
+                                            kernels[name + "_ph8"] = {
+                                                **kernels[name],
+                                                "pipeline_phases": 8,
+                                            }
     return kernels
 
 
@@ -629,6 +644,7 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    pipeline_phases: int = 4,
     v2_output_layout: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
@@ -689,6 +705,7 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
+            pipeline_phases=pipeline_phases,
             v2_output_layout=v2_output_layout,
         )
     else:
@@ -1456,6 +1473,7 @@ def _flydsl_moe_stage1_impl(
     xcd_swizzle: int = 0,
     swiglu_limit: float | None = None,
     k_wave: int = 1,
+    pipeline_phases: int = 4,
     v2_output_layout: bool = False,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
@@ -1733,6 +1751,7 @@ def _flydsl_moe_stage1_impl(
         "a_scale_one": a_scale_one,
         "xcd_swizzle": xcd_swizzle,
         "k_wave": k_wave,
+        "pipeline_phases": pipeline_phases,
     }
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
@@ -1917,6 +1936,7 @@ def flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     swiglu_limit: float | None = None,
     k_wave: int = 1,
+    pipeline_phases: int = 4,
     v2_output_layout: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
@@ -1974,6 +1994,7 @@ def flydsl_moe_stage1(
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
+        pipeline_phases=pipeline_phases,
         v2_output_layout=v2_output_layout,
     )
 

@@ -152,7 +152,8 @@ def _stage2_a8w4_traits_type(inst) -> str:
         f"{inst.cachectl_b}, "
         f"{inst.cachectl_wscale}, "
         f"{inst.pair_slots}, "
-        f"{inst.steady_pair_slots}"
+        f"{inst.steady_pair_slots}, "
+        f"{inst.swizzle_w}"
         ">"
     )
 

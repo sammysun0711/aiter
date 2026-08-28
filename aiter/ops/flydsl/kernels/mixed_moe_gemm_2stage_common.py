@@ -151,6 +151,7 @@ def compile_mixed_moe_gemm1_common(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    pipeline_phases: int = 4,
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
 ):
@@ -275,6 +276,7 @@ def compile_mixed_moe_gemm1_common(
     async_tag = "_async" if use_async_copy else ""
     sk_tag = f"_sk{k_batch}" if is_splitk else ""
     kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
+    phase_tag = f"_ph{pipeline_phases}" if pipeline_phases != 4 else ""
     go_tag = "_go" if mock_gate_only else ""
     gui_tag = "_gui" if gate_up_interleave else ""
     as1_tag = "_as1" if a_scale_one else ""
@@ -290,7 +292,7 @@ def compile_mixed_moe_gemm1_common(
     kernel_version = 34 if heterogeneous_b else 33
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{phase_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -399,7 +401,9 @@ def compile_mixed_moe_gemm1_common(
                     ni_idx = ni_packed * pack_N + inxdl
                     pipe_all_mfma.append((k_idx, ni_idx, ikxdl, inxdl, ku128))
 
-    pipe_mfma_per_phase = max(1, len(pipe_all_mfma) // 4)
+    if pipeline_phases not in (4, 8):
+        raise ValueError(f"pipeline_phases must be 4 or 8, got {pipeline_phases}")
+    pipe_mfma_per_phase = max(1, len(pipe_all_mfma) // pipeline_phases)
     pipe_n_phases = len(pipe_all_mfma) // pipe_mfma_per_phase
 
     a_groups_per_phase = (len(pipe_a_groups) + pipe_n_phases - 1) // pipe_n_phases
@@ -3194,6 +3198,7 @@ def compile_mixed_moe_gemm1_common(
         gate_mode,
         a_scale_one,
         xcd_swizzle,
+        pipeline_phases,
         v2_output_layout,
     )
     if heterogeneous_b:

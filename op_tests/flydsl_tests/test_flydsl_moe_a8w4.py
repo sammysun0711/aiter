@@ -475,11 +475,18 @@ def test_flydsl_e2e_a8w4_gui(inter_dim):
 
 
 @_SKIP_GFX950_FLYDSL
-def test_flydsl_fused_fp8_stage1_preserves_bf16_boundary():
+@pytest.mark.parametrize(
+    ("token", "model_dim", "block_m"),
+    [(64, 512, 32), (128, 6144, 128)],
+    ids=["bm32", "bm128-k6144"],
+)
+def test_flydsl_fused_fp8_stage1_preserves_bf16_boundary(
+    token: int, model_dim: int, block_m: int
+):
     """Fused stage-1 FP8 output must match BF16 output followed by quantization."""
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
-    token, model_dim, inter_dim, E, topk, block_m = 64, 512, 256, 8, 2, 32
+    inter_dim, E, topk = 256, 8, 2
     data = _generate_a8w4_gui_data(
         token, model_dim, inter_dim, E, topk, block_m, seed=91
     )
@@ -514,6 +521,7 @@ def test_flydsl_fused_fp8_stage1_preserves_bf16_boundary():
         "w1_scale": data["w1_scale_shuf"],
         "a1_scale": a_scale_sort,
         "a_scale_one": True,
+        "pipeline_phases": 8 if block_m == 128 else 4,
     }
 
     inter_bf16 = flydsl_moe_stage1(out_dtype="bf16", **stage1_kwargs)
@@ -556,7 +564,7 @@ def test_flydsl_fused_fp8_stage1_preserves_bf16_boundary():
     _check_close(
         expected.float(),
         actual.float(),
-        "fused_fp8_stage1_bf16_boundary",
+        f"fused_fp8_stage1_bf16_boundary_bm{block_m}",
         max_err_ratio=0.001,
     )
 

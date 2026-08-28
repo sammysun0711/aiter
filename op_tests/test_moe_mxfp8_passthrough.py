@@ -33,10 +33,25 @@ import pytest
 import torch
 
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import fused_moe, fused_topk, get_2stage_cfgs
+from aiter.fused_moe import (
+    fused_moe,
+    fused_topk,
+    get_2stage_cfgs,
+    moe_sorting,
+    torch_moe_stage2,
+)
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.quant import per_1x32_f4_quant, per_1x32_mx_quant_hip
+from aiter.ops.opus.moe_stage2_a8w4 import (
+    opus_moe_stage2_a8w4_fwd,
+    stage2_launch_config,
+)
+from aiter.ops.quant import (
+    mxfp4_moe_sort_fwd,
+    per_1x32_f4_quant,
+    per_1x32_f8_scale_f8_quant,
+    per_1x32_mx_quant_hip,
+)
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
 pytestmark = [
@@ -198,3 +213,184 @@ def test_routed_only_ep_topk_reaches_fused_moe():
     )
 
     torch.testing.assert_close(routed_only, reference, atol=1.0, rtol=0.05)
+
+
+def _mimo_opus_metadata(tokens, output_dtype):
+    return get_2stage_cfgs(
+        tokens,
+        6144,
+        256,
+        384,
+        8,
+        torch.bfloat16,
+        dtypes.fp8,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        ActivationType.Silu,
+        False,
+        0,
+        0,
+        True,
+        GateMode.INTERLEAVE.value,
+        opus_stage2_output_dtype=output_dtype,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "sort_block_m", "stage1_schedule"),
+    [
+        (8192, 64, "t64x256x256_w4_bnt0_gui_xcd4_fp8"),
+        (16384, 128, "t128x256x256_bnt0_gui_xcd4_ph8_fp8"),
+        (32768, 64, "t64x256x256_w2_bnt0_gui_xcd4_fp8"),
+        (65536, 64, "t64x256x256_w2_bnt0_gui_xcd4_fp8"),
+    ],
+)
+def test_mimo_opus_stage2_output_dtype_selects_matching_kernel(
+    tokens, sort_block_m, stage1_schedule
+):
+    """The public config switch must cover every MiMo production token tier."""
+
+    get_2stage_cfgs.cache_clear()
+    auto = _mimo_opus_metadata(tokens, "auto")
+    fp8 = _mimo_opus_metadata(tokens, "fp8")
+    bf16 = _mimo_opus_metadata(tokens, "bf16")
+
+    auto_name = auto.stage2.keywords["kernelName"]
+    fp8_name = fp8.stage2.keywords["kernelName"]
+    bf16_name = bf16.stage2.keywords["kernelName"]
+
+    assert (
+        auto.stage1.keywords["kernelName"]
+        == f"flydsl_moe1_afp8_wfp4_bf16_{stage1_schedule}"
+    )
+    suffix = f"t64x256x256_sbm{sort_block_m}_rbn6144_xw8"
+    assert auto_name == fp8_name
+    assert auto_name == f"opus_moe2_layout_afp8_wfp4_fp8_{suffix}"
+    assert bf16_name == f"opus_moe2_layout_afp8_wfp4_bf16_{suffix}"
+
+
+def test_opus_stage2_output_dtype_does_not_reject_non_opus_decode_config():
+    """The global route-output preference must not disturb decode kernels."""
+
+    get_2stage_cfgs.cache_clear()
+    metadata = get_2stage_cfgs(
+        128,
+        6144,
+        2048,
+        24,
+        8,
+        torch.bfloat16,
+        dtypes.fp8,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        ActivationType.Silu,
+        False,
+        0,
+        0,
+        True,
+        GateMode.INTERLEAVE.value,
+        opus_stage2_output_dtype="bf16",
+    )
+
+    assert metadata.stage2.keywords["kernelName"].startswith("flydsl_moe2_")
+
+
+def test_opus_stage2_output_dtype_rejects_unknown_value():
+    get_2stage_cfgs.cache_clear()
+    with pytest.raises(ValueError, match="opus_stage2_output_dtype"):
+        _mimo_opus_metadata(8192, "int8")
+
+
+def test_opus_stage2_route_output_formats_match_torch():
+    """Both registered W=8 route formats must preserve stage-2 accuracy."""
+
+    torch.manual_seed(11)
+    torch.cuda.manual_seed(11)
+    tokens, model_dim, inter_dim, experts, topk, block_m = 128, 6144, 256, 1, 1, 64
+
+    inter = (
+        torch.randn((tokens, topk, inter_dim), dtype=torch.bfloat16, device="cuda") / 8
+    )
+    w2 = (
+        torch.randn(
+            (experts, model_dim, inter_dim), dtype=torch.bfloat16, device="cuda"
+        )
+        / 8
+    )
+    topk_ids = torch.zeros((tokens, topk), dtype=torch.int32, device="cuda")
+    topk_weights = torch.ones((tokens, topk), dtype=torch.float32, device="cuda")
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        topk_ids,
+        topk_weights,
+        experts,
+        model_dim,
+        torch.bfloat16,
+        block_m,
+    )
+
+    inter_q, inter_scale = per_1x32_f8_scale_f8_quant(
+        inter, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
+    w2_q = w2_q.view(experts, model_dim, inter_dim // 2)
+    w1_q = torch.empty(
+        (experts, inter_dim * 2, model_dim // 2),
+        dtype=dtypes.fp4x2,
+        device="cuda",
+    )
+    reference = torch_moe_stage2(
+        inter_q,
+        w1_q,
+        w2_q,
+        topk_weights,
+        topk_ids,
+        dtype=torch.bfloat16,
+        quant_type=QuantType.per_1x32,
+        w2_scale=w2_scale,
+        a2_scale=inter_scale,
+        doweight=True,
+    )
+
+    inter_scale_sorted = mxfp4_moe_sort_fwd(
+        inter_scale,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=tokens,
+        cols=inter_dim,
+    )
+    w2_shuffled = shuffle_weight_a16w4(w2_q, 16, False)
+    w2_scale_shuffled = shuffle_scale_a16w4(w2_scale, experts, False)
+
+    outputs = {}
+    kernel_names = {
+        "fp8": "opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn6144_xw8",
+        "bf16": "opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64_rbn6144_xw8",
+    }
+    from csrc.opus_moe.opus_moe_common import opus_a8w4_stage2_instance_from_name
+
+    for output_dtype, kernel_name in kernel_names.items():
+        instance = opus_a8w4_stage2_instance_from_name(kernel_name)
+        assert instance is not None
+        outputs[output_dtype] = opus_moe_stage2_a8w4_fwd(
+            inter_q,
+            w2_shuffled,
+            inter_scale_sorted,
+            w2_scale_shuffled,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            launch=stage2_launch_config(instance.kid),
+            inter_dim_pad=0,
+            token_num=tokens,
+            topk=topk,
+        )
+        torch.testing.assert_close(
+            outputs[output_dtype], reference, atol=1.0, rtol=0.05
+        )
+
+    fp8_error = (outputs["fp8"].float() - reference.float()).abs().mean()
+    bf16_error = (outputs["bf16"].float() - reference.float()).abs().mean()
+    assert bf16_error <= fp8_error

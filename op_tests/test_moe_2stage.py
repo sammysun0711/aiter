@@ -99,6 +99,7 @@ def test_fmoe(
     kernel_bench=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
+    opus_stage2_output_dtype="auto",
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -474,6 +475,7 @@ def test_fmoe(
         "beta": beta,
         "linear_beta": linear_beta,
         "gate_mode": gateMode,
+        "opus_stage2_output_dtype": opus_stage2_output_dtype,
     }
 
     if kernel_bench:
@@ -722,6 +724,13 @@ parser.add_argument(
     "(e.g. --csv-filter abf16_wbf16 to validate just bf16-dense flydsl rows).",
 )
 parser.add_argument(
+    "--csv-token",
+    type=int,
+    nargs="*",
+    default=None,
+    help="Only run tuned-CSV rows with one of these token counts.",
+)
+parser.add_argument(
     "--no-legacy",
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
@@ -758,6 +767,15 @@ parser.add_argument(
     alone, excluding input prep) and report them as us_stage1 / us_stage2.
     Only the 2-stage path exposes per-kernel launches; the 1-stage path reports
     n/a.""",
+)
+parser.add_argument(
+    "--opus-stage2-output-dtype",
+    choices=["auto", "fp8", "bf16"],
+    default="auto",
+    help=(
+        "Select the OPUS A8W4 stage-2 route-output representation. "
+        "With --kernel, us_stage2 includes GEMM2 plus its matching reducer."
+    ),
 )
 parser.add_argument(
     "--ref-dtype",
@@ -834,6 +852,7 @@ def _row_to_kwargs(row):
         "swiglu_limit": _effective_swiglu_limit(
             q_type, aq_dtype, wq_dtype, args.swiglu_limit
         ),
+        "opus_stage2_output_dtype": args.opus_stage2_output_dtype,
     }
 
 
@@ -844,6 +863,8 @@ def _iter_csv_cases():
     df_csv = pd.read_csv(merged_csv)
     rows = df_csv[df_csv["cu_num"] == cu]
     for _, row in rows.iterrows():
+        if args.csv_token is not None and int(row["token"]) not in args.csv_token:
+            continue
         tag = row.get("_tag", "")
         if pd.notna(tag) and str(tag).strip():
             continue
@@ -917,9 +938,22 @@ def _iter_csv_cases():
             args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
         )
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
+        selected_kernel_name2 = kernel_name2
+        if args.opus_stage2_output_dtype != "auto" and kernel_name2.startswith(
+            "opus_moe2_"
+        ):
+            selected_kernel_name2 = kernel_name2.replace(
+                "_wfp4_fp8_",
+                f"_wfp4_{args.opus_stage2_output_dtype}_",
+                1,
+            ).replace(
+                "_wfp4_bf16_",
+                f"_wfp4_{args.opus_stage2_output_dtype}_",
+                1,
+            )
         yield kwargs, {
             "kernelName1": kernel_name1,
-            "kernelName2": kernel_name2,
+            "kernelName2": selected_kernel_name2,
         }
 
 
@@ -1103,6 +1137,7 @@ def _iter_legacy_cases():
             swiglu_limit=_effective_swiglu_limit(
                 quant_type, aq_dtype, wq_dtype, args.swiglu_limit
             ),
+            opus_stage2_output_dtype=args.opus_stage2_output_dtype,
             **over,
         )
 
