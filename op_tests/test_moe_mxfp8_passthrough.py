@@ -47,6 +47,7 @@ from aiter.ops.opus.moe_stage2_a8w4 import (
     stage2_launch_config,
 )
 from aiter.ops.quant import (
+    dynamic_per_group_scaled_quant,
     mxfp4_moe_sort_fwd,
     per_1x32_f4_quant,
     per_1x32_f8_scale_f8_quant,
@@ -288,6 +289,99 @@ def test_routed_only_ep_topk_reaches_fused_moe():
     )
 
     torch.testing.assert_close(routed_only, reference, atol=1.0, rtol=0.05)
+
+
+def test_ep_a8w4_quantizes_only_num_local_tokens(monkeypatch):
+    """The padded graph capacity must not drive stage-1 input quantization."""
+    import importlib
+
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    original_quant = fused_moe_module.fused_dynamic_mxfp8_quant_moe_sort
+    captured_num_rows = []
+
+    def capture_num_rows(*args, **kwargs):
+        captured_num_rows.append(kwargs.get("num_rows"))
+        return original_quant(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_dynamic_mxfp8_quant_moe_sort",
+        capture_num_rows,
+    )
+
+    tokens, valid_tokens = 16, 8
+    x, w1, w2, kwargs = _build(tokens)
+    kwargs["activation"] = ActivationType.Silu
+    num_local_tokens = torch.tensor([valid_tokens], dtype=torch.int32, device=x.device)
+    expert_mask = torch.ones(EXPERTS, dtype=torch.int32, device=x.device)
+
+    padded = fused_moe(
+        x,
+        w1,
+        w2,
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
+        ep_has_fake_route=False,
+        **kwargs,
+    )
+
+    assert captured_num_rows == [num_local_tokens, num_local_tokens]
+    assert torch.isfinite(padded[:valid_tokens]).all()
+
+    def force_full_quant(*args, **kwargs):
+        kwargs["num_rows"] = None
+        return original_quant(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_dynamic_mxfp8_quant_moe_sort",
+        force_full_quant,
+    )
+    full_quant = fused_moe(
+        x,
+        w1,
+        w2,
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
+        ep_has_fake_route=False,
+        **kwargs,
+    )
+    torch.testing.assert_close(
+        padded[:valid_tokens], full_quant[:valid_tokens], atol=0, rtol=0
+    )
+
+
+def test_device_row_limited_mxfp8_quant_graph_replay():
+    """Persistent row-limited quantization must track the replay-time row count."""
+    torch.manual_seed(13)
+    capacity, cols = 8192, 512
+    x = torch.randn((capacity, cols), dtype=torch.bfloat16, device="cuda") / 8
+    full_out = torch.empty((capacity, cols), dtype=dtypes.fp8, device="cuda")
+    full_scale = torch.empty(
+        (capacity, cols // 32), dtype=dtypes.fp8_e8m0, device="cuda"
+    )
+    dynamic_per_group_scaled_quant(full_out, x, full_scale, 32, False)
+
+    out = torch.empty_like(full_out)
+    scale = torch.empty_like(full_scale)
+    num_rows = torch.tensor([257], dtype=torch.int32, device="cuda")
+    dynamic_per_group_scaled_quant(
+        out, x, scale, 32, False, num_rows=num_rows, num_rows_factor=1
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dynamic_per_group_scaled_quant(
+            out, x, scale, 32, False, num_rows=num_rows, num_rows_factor=1
+        )
+
+    for live_rows in (257, 1025):
+        num_rows.fill_(live_rows)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out[:live_rows], full_out[:live_rows])
+        assert torch.equal(scale[:live_rows], full_scale[:live_rows])
 
 
 def _mimo_opus_metadata(tokens, output_dtype):
