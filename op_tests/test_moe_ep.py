@@ -447,6 +447,7 @@ def test_fmoe_ep_mxfp4(
     tail is dead padding (fused_moe uses `num_local_tokens` to skip it).
     expert_mask filters non-local experts so fused_moe only computes on this rank's
     experts."""
+    torch.manual_seed(7)
     _gfx = get_gfx()
     if _gfx not in ["gfx950", "gfx1250"]:
         print(f"skip {quant_label}: mxfp4 requires gfx950/gfx1250, got {_gfx}")
@@ -736,11 +737,16 @@ def test_fmoe_ep_mxfp4(
     )
     gemm1_us = None
     gemm2_us = None
-    if _ep_kernel_bench and _gfx == "gfx1250":
-        from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
+    if _ep_kernel_bench:
+        if _gfx == "gfx1250":
+            from aiter.ops.flydsl import grouped_moe_gfx1250 as _bench_module
+        else:
+            import importlib
+
+            _bench_module = importlib.import_module("aiter.fused_moe")
 
         _cap: list = []
-        _grouped.kernel_bench_callable = _cap
+        _bench_module.kernel_bench_callable = _cap
         try:
             out = fused_moe(
                 input_,
@@ -757,21 +763,39 @@ def test_fmoe_ep_mxfp4(
                 num_local_tokens=num_local_tokens,
             )
         finally:
-            _grouped.kernel_bench_callable = None
+            _bench_module.kernel_bench_callable = None
         _ku = {}
         for _name, _callable in _cap:
             _, _u = run_perftest(
                 _callable, num_warmup=50, num_iters=101, testGraph=False
             )
             _ku[_name] = _u
-        gemm1_us = _ku.get("gemm1")
-        gemm2_us = _ku.get("gemm2")
+        gemm1_us = _ku.get("gemm1", _ku.get("stage1"))
+        gemm2_us = _ku.get("gemm2", _ku.get("stage2"))
         us = (gemm1_us or 0.0) + (gemm2_us or 0.0)
         _g1s = "n/a" if gemm1_us is None else f"{gemm1_us:.2f}"
         _g2s = "n/a" if gemm2_us is None else f"{gemm2_us:.2f}"
         print(
             f"[ep-kernel-bench] {quant_label} token={token}(local={total_recv}) "
             f"gemm1 us = {_g1s} gemm2 us = {_g2s}"
+        )
+        # The atomic stage-2 callable accumulates into the captured output on
+        # every timing iteration. Re-run the complete operator once so the
+        # correctness check below sees one invocation rather than the sum of
+        # all benchmark iterations.
+        out = fused_moe(
+            input_,
+            w1_a,
+            w2_a,
+            topk_weights,
+            topk_ids,
+            expert_mask=expert_mask,
+            activation=act,
+            gate_mode=gate_mode,
+            quant_type=QuantType.per_1x32,
+            w1_scale=w1_s,
+            w2_scale=w2_s,
+            num_local_tokens=num_local_tokens,
         )
     else:
         out, us = run_perftest(

@@ -191,9 +191,84 @@ def test_ep_config_key_supports_legacy_and_routed_only_topk():
         routed_only.stage2.keywords["kernelName"],
     )
     assert legacy_names == routed_only_names
+    assert legacy_names[0] == (
+        "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_gui_persist_fp8"
+    )
     assert legacy_names[1] == (
         "flydsl_moe2_afp8_wfp4_bf16_t64x128x256_atomic_bnt2_persist"
     )
+
+
+@pytest.mark.parametrize("local_experts", [24, 48])
+def test_mimo_production_capacity_selects_persistent_stage1(local_experts):
+    """Both target EP topologies must select the M131072 persistent pair."""
+
+    get_2stage_cfgs.cache_clear()
+    metadata = get_2stage_cfgs(
+        131072,
+        6144,
+        2048,
+        local_experts,
+        8,
+        torch.bfloat16,
+        dtypes.fp8,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        ActivationType.Silu,
+        False,
+        0,
+        0,
+        True,
+        GateMode.INTERLEAVE.value,
+        is_ep=True,
+        ep_has_fake_route=False,
+    )
+
+    assert metadata.block_m == 128
+    assert metadata.stage1.keywords["kernelName"] == (
+        "flydsl_moe1_afp8_wfp4_bf16_t128x256x256_bnt0_gui_persist_split_ph8_fp8"
+    )
+    assert metadata.stage2.keywords["kernelName"] == (
+        "flydsl_moe2_afp8_wfp4_bf16_t64x256x256_atomic_persist_async_sbm128"
+    )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "local_experts", "persistent"),
+    [
+        pytest.param(4096, 24, False, id="ep16-m4k-normal"),
+        pytest.param(8192, 24, True, id="ep16-m8k-persistent"),
+        pytest.param(16384, 24, True, id="ep16-m16k-persistent"),
+        pytest.param(8192, 48, False, id="ep8-m8k-normal"),
+        pytest.param(16384, 48, False, id="ep8-m16k-normal"),
+    ],
+)
+def test_mimo_sparse_stage1_persistence_policy(tokens, local_experts, persistent):
+    get_2stage_cfgs.cache_clear()
+    metadata = get_2stage_cfgs(
+        tokens,
+        6144,
+        2048,
+        local_experts,
+        8,
+        torch.bfloat16,
+        dtypes.fp8,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        ActivationType.Silu,
+        False,
+        0,
+        0,
+        True,
+        GateMode.INTERLEAVE.value,
+        is_ep=True,
+        ep_has_fake_route=False,
+    )
+
+    kernel_name = metadata.stage1.keywords["kernelName"]
+    assert ("_persist" in kernel_name) is persistent
 
 
 def test_routed_only_ep_topk_reaches_fused_moe():

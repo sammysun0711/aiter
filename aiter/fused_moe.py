@@ -1567,6 +1567,7 @@ def _flydsl_stage1_wrapper(
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
+        persist_m=parsed.get("persist_m", 0),
         use_async_copy=True,
         k_batch=parsed.get("k_batch", 1),
         waves_per_eu=parsed.get("waves_per_eu", 3),

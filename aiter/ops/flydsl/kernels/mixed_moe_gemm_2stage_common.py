@@ -265,6 +265,20 @@ def compile_mixed_moe_gemm1_common(
 
     _use_cshuffle_epilog = True
 
+    # Negative persist_m values are internal scheduler modes:
+    #   -1: one balanced device-driven loop over all valid M tiles;
+    #   -2: one spill-free primary tile per worker;
+    #   -3: balanced overflow for tiles beyond the primary CU-sized prefix.
+    persistent = persist_m < 0
+    split_primary = persist_m == -2
+    split_overflow = persist_m == -3
+    if const_expr(persistent):
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        cu_num = get_cu_num()
+    else:
+        cu_num = 0
+
     need_fp4 = out_dtype == "fp4"
     need_fp8 = out_dtype == "fp8"
     need_quant = need_fp4 or need_fp8
@@ -274,6 +288,16 @@ def compile_mixed_moe_gemm1_common(
     fp8q_tag = "_fp8q" if need_fp8 else ""
     sort_tag = "_sort" if need_sort else ""
     async_tag = "_async" if use_async_copy else ""
+    persistent_primary_tiles = cu_num
+    persistent_workers = 16 if split_overflow else cu_num
+    if split_primary:
+        pm_tag = f"_persist1_cu{persistent_workers}"
+    elif split_overflow:
+        pm_tag = f"_persist_overflow_w{persistent_workers}"
+    elif persistent:
+        pm_tag = f"_persist_cu{cu_num}"
+    else:
+        pm_tag = f"_pm{persist_m}"
     sk_tag = f"_sk{k_batch}" if is_splitk else ""
     kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
     phase_tag = f"_ph{pipeline_phases}" if pipeline_phases != 4 else ""
@@ -292,7 +316,7 @@ def compile_mixed_moe_gemm1_common(
     kernel_version = 34 if heterogeneous_b else 33
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{phase_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{pm_tag}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{phase_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -555,8 +579,11 @@ def compile_mixed_moe_gemm1_common(
                         // tile_n_idx
                         // two
                     )
-                persist_m_idx = arith.constant(persist_m, index=True)
-                grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
+                if const_expr(persistent):
+                    grid_y = arith.constant(persistent_workers, index=True)
+                else:
+                    persist_m_idx = arith.constant(persist_m, index=True)
+                    grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
                 linear_id = bx_persist * grid_x + by
                 num_workgroups = grid_x * grid_y
                 num_xcds_idx = arith.constant(num_xcds, index=True)
@@ -716,15 +743,53 @@ def compile_mixed_moe_gemm1_common(
                     arg_out_scale_sorted, sort_scale_nbytes
                 )
 
-            PERSIST_M = persist_m
-            c0_p = arith.constant(0, index=True)
-            c1_p = arith.constant(1, index=True)
-            c_pm = arith.constant(PERSIST_M, index=True)
-            for_persist = scf.ForOp(c0_p, c_pm, c1_p)
-            for_ip = ir.InsertionPoint(for_persist.body)
-            for_ip.__enter__()
-            mi_p = for_persist.induction_variable
-            bx = bx_persist * c_pm + mi_p
+            if const_expr(split_primary):
+                bx = bx_persist
+                for_ip = None
+            elif const_expr(persistent):
+                c0_p = arith.constant(0, index=True)
+                c1_p = arith.constant(1, index=True)
+                c_workers = arith.constant(persistent_workers, index=True)
+                c_sbm_p = arith.constant(sort_block_m, index=True)
+                num_valid_idx = arith.index_cast(ir.IndexType.get(), num_valid_i32)
+                total_m_tiles = (num_valid_idx + c_sbm_p - c1_p) // c_sbm_p
+                if const_expr(split_overflow):
+                    c_primary_tiles = arith.constant(
+                        persistent_primary_tiles, index=True
+                    )
+                    has_overflow = arith.cmpi(
+                        CmpIPredicate.ugt, total_m_tiles, c_primary_tiles
+                    )
+                    total_m_tiles = arith.select(
+                        has_overflow,
+                        total_m_tiles - c_primary_tiles,
+                        c0_p,
+                    )
+                tiles_per_block_base = total_m_tiles // c_workers
+                tiles_remainder = total_m_tiles - (tiles_per_block_base * c_workers)
+                has_extra_tile = arith.cmpi(
+                    CmpIPredicate.ult, bx_persist, tiles_remainder
+                )
+                extra_tile = arith.select(has_extra_tile, c1_p, c0_p)
+                tiles_per_block = tiles_per_block_base + extra_tile
+                start_tail = arith.select(has_extra_tile, bx_persist, tiles_remainder)
+                persist_start_tile = bx_persist * tiles_per_block_base + start_tail
+                if const_expr(split_overflow):
+                    persist_start_tile = persist_start_tile + c_primary_tiles
+                for_persist = scf.ForOp(c0_p, tiles_per_block, c1_p)
+            else:
+                c0_p = arith.constant(0, index=True)
+                c1_p = arith.constant(1, index=True)
+                c_pm = arith.constant(persist_m, index=True)
+                for_persist = scf.ForOp(c0_p, c_pm, c1_p)
+            if const_expr(not split_primary):
+                for_ip = ir.InsertionPoint(for_persist.body)
+                for_ip.__enter__()
+                mi_p = for_persist.induction_variable
+                if const_expr(persistent):
+                    bx = persist_start_tile + mi_p
+                else:
+                    bx = bx_persist * c_pm + mi_p
             bx_m = bx * arith.constant(sort_block_m, index=True)
 
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
@@ -1761,7 +1826,8 @@ def compile_mixed_moe_gemm1_common(
                             )
                         rocdl.sched_barrier(0)
 
-                        rocdl.s_setprio(1)
+                        if const_expr(not split_primary):
+                            rocdl.s_setprio(1)
                         for m_j in range_constexpr(len(pp_mfma[_p])):
                             k_idx, ni_idx, ikxdl, inxdl, ku128 = pp_mfma[_p][m_j]
                             ni_packed_idx = ni_idx // pack_N
@@ -1797,7 +1863,8 @@ def compile_mixed_moe_gemm1_common(
                                 ikxdl,
                                 inxdl,
                             )
-                        rocdl.s_setprio(0)
+                        if const_expr(not split_primary):
+                            rocdl.s_setprio(0)
                         rocdl.sched_barrier(0)
 
                     cur_a_tile = []
@@ -3071,9 +3138,10 @@ def compile_mixed_moe_gemm1_common(
                     scf.YieldOp([])
                 scf.YieldOp([])
 
-            gpu.barrier()
-            scf.YieldOp([])
-            for_ip.__exit__(None, None, None)
+            if const_expr(not split_primary):
+                gpu.barrier()
+                scf.YieldOp([])
+                for_ip.__exit__(None, None, None)
 
     if heterogeneous_b:
 
@@ -3200,6 +3268,7 @@ def compile_mixed_moe_gemm1_common(
         xcd_swizzle,
         pipeline_phases,
         v2_output_layout,
+        persistent_workers if persistent else 0,
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)
@@ -3258,12 +3327,15 @@ def compile_mixed_moe_gemm1_common(
                 // arith.constant(2, index=True)
             )
 
-        c_pm_l = arith.constant(persist_m, index=True)
-        gy = (
-            arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
-            + c_pm_l
-            - arith.constant(1, index=True)
-        ) // c_pm_l
+        if const_expr(persistent):
+            gy = arith.constant(persistent_workers, index=True)
+        else:
+            c_pm_l = arith.constant(persist_m, index=True)
+            gy = (
+                arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
+                + c_pm_l
+                - arith.constant(1, index=True)
+            ) // c_pm_l
 
         if const_expr(heterogeneous_b):
             launcher = moe_gemm1(
@@ -3465,7 +3537,6 @@ def compile_mixed_moe_gemm2_common(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
         )
-    del b_nt
     _sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
     if const_expr(_sort_block_m != tile_m and _sort_block_m % tile_m != 0):
         raise ValueError(
@@ -4271,6 +4342,7 @@ def compile_mixed_moe_gemm2_common(
                             vec_elems=vec_elems,
                             elem_bytes=b_elem_bytes,
                             offset_in_bytes=(b_elem_bytes == 1),
+                            cache_modifier=b_nt,
                         )
                         b_i64x2 = vector.bitcast(vec2_i64, b16)
                         return (

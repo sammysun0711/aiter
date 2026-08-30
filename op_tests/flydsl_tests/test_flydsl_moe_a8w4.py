@@ -200,6 +200,199 @@ def test_pick_flydsl_stage2_tile_k():
     assert resolve_flydsl_stage2_tile_k(512, 128) == 128
 
 
+def test_mimo_persistent_stage1_kernel_registration():
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    params = get_flydsl_kernel_params(
+        "flydsl_moe1_afp8_wfp4_bf16_t128x256x256_bnt0_gui_persist_fp8"
+    )
+    assert params is not None
+    assert params["tile_m"] == 128
+    assert params["tile_n"] == 256
+    assert params["tile_k"] == 256
+    assert params["persist_m"] == -1
+    assert params["out_dtype"] == "fp8"
+
+    split_params = get_flydsl_kernel_params(
+        "flydsl_moe1_afp8_wfp4_bf16_t128x256x256_bnt0_gui_persist_split_ph8_fp8"
+    )
+    assert split_params is not None
+    assert split_params["persist_m"] == -2
+    assert split_params["pipeline_phases"] == 8
+
+
+@_SKIP_GFX950_FLYDSL
+@pytest.mark.parametrize(
+    ("token", "block_m", "tile_n"),
+    [
+        pytest.param(128, 32, 128, id="bm32-bn128"),
+        pytest.param(128, 128, 256, id="bm128-bn256"),
+        pytest.param(32768, 128, 256, id="bm128-bn256-multi-tile"),
+    ],
+)
+def test_flydsl_stage1_a8w4_persistent_matches_nonpersistent(token, block_m, tile_n):
+    """Persistent stage 1 must cover exactly the device-reported valid routes."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+
+    model_dim, inter_dim, E, topk = 512, 256, 8, 2
+    data = _generate_a8w4_gui_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=37
+    )
+    kwargs = {
+        "a": data["a_q"],
+        "w1": data["w1_shuf"],
+        "sorted_token_ids": data["sorted_ids"],
+        "sorted_expert_ids": data["sorted_expert_ids"],
+        "num_valid_ids": data["num_valid_ids"],
+        "topk": topk,
+        "tile_m": block_m,
+        "tile_n": tile_n,
+        "tile_k": 256,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "out_dtype": "fp8",
+        "act": "silu",
+        "w1_scale": data["w1_scale_shuf"],
+        "a1_scale": data["a_scale_sort"],
+        "gate_mode": "interleave",
+        "use_async_copy": True,
+    }
+
+    normal, normal_scale = flydsl_moe_stage1(persist_m=1, **kwargs)
+    persistent, persistent_scale = flydsl_moe_stage1(persist_m=-1, **kwargs)
+    split_persistent, split_persistent_scale = flydsl_moe_stage1(
+        persist_m=-2, pipeline_phases=8, **kwargs
+    )
+    torch.cuda.synchronize()
+
+    num_sorted = int(data["num_valid_ids"][0].item())
+    sorted_ids = data["sorted_ids"][:num_sorted].to(torch.int64)
+    token_ids = sorted_ids & 0xFFFFFF
+    slot_ids = sorted_ids >> 24
+    valid = (
+        (token_ids < token)
+        & (slot_ids < topk)
+        & (data["sorted_weights"][:num_sorted] != 0)
+    )
+    route_ids = token_ids[valid] * topk + slot_ids[valid]
+
+    normal_routes = normal.view(-1, inter_dim)[route_ids]
+    persistent_routes = persistent.view(-1, inter_dim)[route_ids]
+    split_persistent_routes = split_persistent.view(-1, inter_dim)[route_ids]
+    torch.testing.assert_close(persistent_routes, normal_routes, atol=0, rtol=0)
+    torch.testing.assert_close(split_persistent_routes, normal_routes, atol=0, rtol=0)
+
+    stage2_kwargs = {
+        "w2": data["w2_shuf"],
+        "sorted_token_ids": data["sorted_ids"],
+        "sorted_expert_ids": data["sorted_expert_ids"],
+        "num_valid_ids": data["num_valid_ids"],
+        "topk": topk,
+        "tile_m": block_m,
+        "tile_n": 128,
+        "tile_k": 256,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "out_dtype": "bf16",
+        "mode": "atomic",
+        "w2_scale": data["w2_scale_shuf"],
+        "sorted_weights": data["sorted_weights"],
+    }
+    normal_out = flydsl_moe_stage2(
+        inter_states=normal, a2_scale=normal_scale, **stage2_kwargs
+    )
+    persistent_out = flydsl_moe_stage2(
+        inter_states=persistent, a2_scale=persistent_scale, **stage2_kwargs
+    )
+    split_persistent_out = flydsl_moe_stage2(
+        inter_states=split_persistent,
+        a2_scale=split_persistent_scale,
+        **stage2_kwargs,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(persistent_out, normal_out, atol=1.0, rtol=0.05)
+    torch.testing.assert_close(split_persistent_out, normal_out, atol=1.0, rtol=0.05)
+
+
+def test_mimo_persistent_async_stage2_kernel_registration():
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    params = get_flydsl_kernel_params(
+        "flydsl_moe2_afp8_wfp4_bf16_t64x256x256_atomic_persist_async_sbm128"
+    )
+    assert params is not None
+    assert params["tile_m"] == 64
+    assert params["tile_n"] == 256
+    assert params["tile_k"] == 256
+    assert params["sort_block_m"] == 128
+    assert params["b_nt"] == 0
+    assert params["persist"] is True
+    assert params["use_async_copy"] is True
+
+
+def _stage2_nt_load_count(dump_root):
+    """Count stage-2 weight loads carrying the non-temporal modifier."""
+    isa = [
+        path
+        for path in dump_root.rglob("21_final_isa.s")
+        if path.parent.name.startswith("mfma_moe2_")
+    ]
+    assert len(isa) == 1, f"expected one stage2 ISA dump under {dump_root}, got {isa}"
+    return sum(
+        1
+        for line in isa[0].read_text().splitlines()
+        if line.strip().startswith("buffer_load") and line.split()[-1] == "nt"
+    )
+
+
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage2_a8w4_b_nt_reaches_w2_load(tmp_path, monkeypatch):
+    """The registry's b_nt suffix must reach the emitted W2 load."""
+    from aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage import (
+        compile_mixed_moe_gemm2,
+    )
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
+
+    token, model_dim, inter_dim, E, topk, block_m = 16, 512, 256, 8, 2, 32
+    data = _generate_a8w4_gui_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=103
+    )
+
+    monkeypatch.setenv("FLYDSL_DUMP_IR", "1")
+    counts = {}
+    for b_nt in (0, 2):
+        monkeypatch.setenv("FLYDSL_DUMP_DIR", str(tmp_path / f"bnt{b_nt}"))
+        compile_mixed_moe_gemm2.cache_clear()
+        out = flydsl_moe_stage2(
+            inter_states=data["a2_q"],
+            w2=data["w2_shuf"],
+            sorted_token_ids=data["sorted_ids"],
+            sorted_expert_ids=data["sorted_expert_ids"],
+            num_valid_ids=data["num_valid_ids"],
+            topk=topk,
+            tile_m=32,
+            tile_n=256,
+            tile_k=256,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="bf16",
+            mode="atomic",
+            w2_scale=data["w2_scale_shuf"],
+            a2_scale=data["a2_scale_sort"],
+            sorted_weights=data["sorted_weights"],
+            inter_dim_pad=data["inter_pad"],
+            model_dim_pad=0,
+            b_nt=b_nt,
+        )
+        torch.cuda.synchronize()
+        _check_close(data["ref_stage2"], out, f"stage2_a8w4_b_nt{b_nt}")
+        counts[b_nt] = _stage2_nt_load_count(tmp_path / f"bnt{b_nt}")
+    compile_mixed_moe_gemm2.cache_clear()
+
+    assert counts[0] == 0, f"b_nt=0 emitted {counts[0]} non-temporal loads"
+    assert counts[2] > 0, "b_nt=2 was accepted but no emitted load carries nt"
+
+
 @pytest.mark.parametrize(
     "inter_dim,seed",
     [
@@ -243,7 +436,40 @@ def test_flydsl_stage2_a8w4_gui(inter_dim, seed, persist):
 
 
 @_SKIP_GFX950_FLYDSL
-def test_flydsl_stage2_a8w4_persistent_graph_replay():
+def test_flydsl_stage2_a8w4_persistent_async_matches_reference():
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
+
+    token, model_dim, inter_dim, E, topk, block_m = 128, 512, 256, 8, 2, 64
+    data = _generate_a8w4_gui_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=103
+    )
+    out = flydsl_moe_stage2(
+        inter_states=data["a2_q"],
+        w2=data["w2_shuf"],
+        sorted_token_ids=data["sorted_ids"],
+        sorted_expert_ids=data["sorted_expert_ids"],
+        num_valid_ids=data["num_valid_ids"],
+        topk=topk,
+        tile_m=64,
+        tile_n=256,
+        tile_k=256,
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        mode="atomic",
+        w2_scale=data["w2_scale_shuf"],
+        a2_scale=data["a2_scale_sort"],
+        sorted_weights=data["sorted_weights"],
+        persist=True,
+        use_async_copy=True,
+    )
+    torch.cuda.synchronize()
+    _check_close(data["ref_stage2"], out, "stage2_a8w4_persistent_async")
+
+
+@pytest.mark.parametrize("use_async_copy", [False, True], ids=["sync", "async"])
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage2_a8w4_persistent_graph_replay(use_async_copy):
     """Persistent stage 2 must support graph replay with a reused output."""
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
 
@@ -271,6 +497,7 @@ def test_flydsl_stage2_a8w4_persistent_graph_replay():
         "a2_scale": data["a2_scale_sort"],
         "sorted_weights": data["sorted_weights"],
         "persist": True,
+        "use_async_copy": use_async_copy,
     }
 
     out.zero_()
