@@ -200,13 +200,14 @@ def test_ep_config_key_supports_legacy_and_routed_only_topk():
     )
 
 
+@pytest.mark.parametrize("token", [32768, 131072])
 @pytest.mark.parametrize("local_experts", [24, 48])
-def test_mimo_production_capacity_selects_persistent_stage1(local_experts):
-    """Both target EP topologies must select the M131072 persistent pair."""
+def test_mimo_production_capacity_selects_persistent_pair(token, local_experts):
+    """Both target EP topologies and production tiers use the persistent pair."""
 
     get_2stage_cfgs.cache_clear()
     metadata = get_2stage_cfgs(
-        131072,
+        token,
         6144,
         2048,
         local_experts,
@@ -241,8 +242,10 @@ def test_mimo_production_capacity_selects_persistent_stage1(local_experts):
         pytest.param(4096, 24, False, id="ep16-m4k-normal"),
         pytest.param(8192, 24, True, id="ep16-m8k-persistent"),
         pytest.param(16384, 24, True, id="ep16-m16k-persistent"),
+        pytest.param(32768, 24, True, id="ep16-m32k-persistent"),
         pytest.param(8192, 48, False, id="ep8-m8k-normal"),
         pytest.param(16384, 48, False, id="ep8-m16k-normal"),
+        pytest.param(32768, 48, True, id="ep8-m32k-persistent"),
     ],
 )
 def test_mimo_sparse_stage1_persistence_policy(tokens, local_experts, persistent):
@@ -270,6 +273,56 @@ def test_mimo_sparse_stage1_persistence_policy(tokens, local_experts, persistent
 
     kernel_name = metadata.stage1.keywords["kernelName"]
     assert ("_persist" in kernel_name) is persistent
+
+
+def test_routed_only_ep_passes_safe_atomic_capacity(monkeypatch):
+    import importlib
+
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    captured = {}
+
+    def fake_stage2(**kwargs):
+        captured.update(kwargs)
+        return kwargs["out"]
+
+    monkeypatch.setattr(
+        fused_moe_module.aiter.ops.flydsl, "flydsl_moe_stage2", fake_stage2
+    )
+    token_num, topk, model_dim = 64, 8, 128
+    out = torch.empty((token_num, model_dim))
+    fused_moe_module._flydsl_stage2_wrapper(
+        inter_states=torch.empty((token_num, topk, 32)),
+        w1=torch.empty(0),
+        w2=torch.empty(0),
+        sorted_token_ids=torch.empty(0, dtype=torch.int32),
+        sorted_expert_ids=torch.empty(0, dtype=torch.int32),
+        num_valid_ids=torch.empty(0, dtype=torch.int32),
+        out=out,
+        topk=topk,
+        kernelName="flydsl_moe2_afp8_wfp4_bf16_t64x256x256_atomic",
+        expert_mask=torch.empty(384, dtype=torch.int32),
+        topk_ids=torch.empty((token_num, topk), dtype=torch.int32),
+        ep_has_fake_route=False,
+    )
+
+    assert captured["atomic_token_capacity"] == token_num // topk
+
+    captured.clear()
+    fused_moe_module._flydsl_stage2_wrapper(
+        inter_states=torch.empty((token_num, topk, 32)),
+        w1=torch.empty(0),
+        w2=torch.empty(0),
+        sorted_token_ids=torch.empty(0, dtype=torch.int32),
+        sorted_expert_ids=torch.empty(0, dtype=torch.int32),
+        num_valid_ids=torch.empty(0, dtype=torch.int32),
+        out=out,
+        topk=topk,
+        kernelName="flydsl_moe2_afp8_wfp4_bf16_t64x256x256_atomic",
+        expert_mask=torch.empty(384, dtype=torch.int32),
+        topk_ids=torch.empty((token_num, topk), dtype=torch.int32),
+        ep_has_fake_route=True,
+    )
+    assert captured["atomic_token_capacity"] is None
 
 
 def test_routed_only_ep_topk_reaches_fused_moe():

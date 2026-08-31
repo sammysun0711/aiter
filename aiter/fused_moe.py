@@ -1604,6 +1604,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    ep_has_fake_route=True,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1622,6 +1623,17 @@ def _flydsl_stage2_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    atomic_token_capacity = None
+    if (
+        expert_mask is not None
+        and not ep_has_fake_route
+        and topk > 0
+        and out.shape[0] % topk == 0
+    ):
+        # MORI's routed-only EP input is padded to global_tokens * topk rows,
+        # but each source token is received at most once per destination rank.
+        # Atomic GEMM2 therefore only addresses the first global_tokens rows.
+        atomic_token_capacity = max(1, out.shape[0] // topk)
     return aiter.ops.flydsl.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
@@ -1652,6 +1664,7 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        atomic_token_capacity=atomic_token_capacity,
     )
 
 
@@ -3381,8 +3394,8 @@ def fused_moe_2stages(
         extra_stage1_args["situ_linear_beta"] = (
             25.0 if linear_beta is None else float(linear_beta)
         )
-    # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
-    # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
+    # EP: forward routing metadata so FlyDSL stage2 can use the routed-only
+    # atomic address bound or, in explicit reduce mode, fuse the validity gather.
     if (
         stage2_func
         in (
@@ -3393,6 +3406,7 @@ def fused_moe_2stages(
     ):
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
+        extra_stage2_args["ep_has_fake_route"] = ep_has_fake_route
     if (
         stage2_func is _flydsl_v2_stage2_wrapper
         and not doweight_stage1

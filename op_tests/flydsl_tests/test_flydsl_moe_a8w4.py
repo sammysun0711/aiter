@@ -23,6 +23,8 @@ from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, torch_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_kernels import (
     pick_flydsl_stage2_tile_k,
+    requires_flydsl_stage2_reduce,
+    resolve_flydsl_stage2_mode,
     resolve_flydsl_stage2_tile_k,
 )
 from aiter.ops.flydsl.utils import is_flydsl_available
@@ -198,6 +200,90 @@ def test_pick_flydsl_stage2_tile_k():
     assert resolve_flydsl_stage2_tile_k(640, 256) == 128
     assert resolve_flydsl_stage2_tile_k(256, 256) == 256
     assert resolve_flydsl_stage2_tile_k(512, 128) == 128
+
+
+def test_stage2_reduce_uses_routed_ep_atomic_capacity():
+    token_num, model_dim, topk = 524288, 6144, 8
+
+    assert requires_flydsl_stage2_reduce(token_num, model_dim, 2)
+    assert not requires_flydsl_stage2_reduce(
+        token_num,
+        model_dim,
+        2,
+        atomic_token_capacity=token_num // topk,
+    )
+    with pytest.raises(ValueError, match="atomic_token_capacity"):
+        requires_flydsl_stage2_reduce(
+            token_num,
+            model_dim,
+            2,
+            atomic_token_capacity=token_num + 1,
+        )
+
+
+def test_explicit_bf16_reduce_is_preserved(monkeypatch):
+    monkeypatch.delenv("AITER_FLYDSL_FORCE_REDUCE", raising=False)
+    assert (
+        resolve_flydsl_stage2_mode(
+            "reduce",
+            524288,
+            6144,
+            2,
+            atomic_token_capacity=65536,
+        )
+        == "reduce"
+    )
+    assert (
+        resolve_flydsl_stage2_mode(
+            "atomic",
+            524288,
+            6144,
+            2,
+            atomic_token_capacity=65536,
+        )
+        == "atomic"
+    )
+    assert resolve_flydsl_stage2_mode("atomic", 524288, 6144, 2) == "reduce"
+
+
+def test_explicit_reduce_uses_bf16_route_buffer_by_default(monkeypatch):
+    from aiter.ops.flydsl import moe_kernels
+
+    monkeypatch.delenv("AITER_FLYDSL_STAGE2_FP8", raising=False)
+    captured = {}
+
+    monkeypatch.setattr(moe_kernels, "_run_compiled", lambda *args: None)
+
+    def capture_reduce(target, out, *args, is_fp8=False, **kwargs):
+        captured["target_dtype"] = target.dtype
+        captured["target_shape"] = tuple(target.shape)
+        captured["is_fp8"] = is_fp8
+
+    monkeypatch.setattr(moe_kernels, "_run_moe_reduction", capture_reduce)
+
+    token_num, topk, model_dim, inter_dim = 2, 4, 128, 256
+    out = torch.empty((token_num, model_dim), dtype=torch.bfloat16)
+    moe_kernels._flydsl_moe_stage2_impl(
+        inter_states=torch.empty((token_num, topk, inter_dim)),
+        w2=torch.empty((1, model_dim, inter_dim // 2), dtype=torch.uint8),
+        sorted_token_ids=torch.empty(0, dtype=torch.int32),
+        sorted_expert_ids=torch.empty(0, dtype=torch.int32),
+        num_valid_ids=torch.empty(0, dtype=torch.int32),
+        out=out,
+        topk=topk,
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        mode="reduce",
+        _compile_kernel=lambda **kwargs: object(),
+        _build_mx_args=lambda *args, **kwargs: (),
+    )
+
+    assert captured == {
+        "target_dtype": torch.bfloat16,
+        "target_shape": (token_num * topk * model_dim,),
+        "is_fp8": False,
+    }
 
 
 def test_mimo_persistent_stage1_kernel_registration():

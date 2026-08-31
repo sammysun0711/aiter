@@ -110,10 +110,47 @@ def resolve_flydsl_grid_y_persist_m(
 
 
 def requires_flydsl_stage2_reduce(
-    token_num: int, model_dim: int, element_size: int
+    token_num: int,
+    model_dim: int,
+    element_size: int,
+    atomic_token_capacity: int | None = None,
 ) -> bool:
     """Return whether stage2 atomic output exceeds 32-bit byte offsets."""
+    if atomic_token_capacity is not None:
+        atomic_token_capacity = int(atomic_token_capacity)
+        if atomic_token_capacity <= 0 or atomic_token_capacity > int(token_num):
+            raise ValueError(
+                "atomic_token_capacity must be in [1, token_num], got "
+                f"{atomic_token_capacity=} and {token_num=}"
+            )
+        token_num = atomic_token_capacity
     return int(token_num) * int(model_dim) * int(element_size) > 0xFFFFFFFF
+
+
+def resolve_flydsl_stage2_mode(
+    mode: str,
+    token_num: int,
+    model_dim: int,
+    element_size: int,
+    *,
+    return_per_slot: bool = False,
+    atomic_token_capacity: int | None = None,
+) -> str:
+    """Resolve the stage-2 epilogue without changing an explicit reduce request."""
+    if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
+        return "reduce"
+    if (
+        mode != "reduce"
+        and not return_per_slot
+        and requires_flydsl_stage2_reduce(
+            token_num,
+            model_dim,
+            element_size,
+            atomic_token_capacity=atomic_token_capacity,
+        )
+    ):
+        return "reduce"
+    return mode
 
 
 def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
@@ -2099,6 +2136,7 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    atomic_token_capacity: int | None = None,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
@@ -2168,17 +2206,17 @@ def _flydsl_moe_stage2_impl(
     model_dim = w2.shape[1]
     inter_dim = inter_states.shape[2]
 
-    # Debug: force stage2 to use the masked reduce epilogue instead of atomic
-    # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
-    if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
-        mode = "reduce"
-    elif (
-        mode != "reduce"
-        and not return_per_slot
-        and requires_flydsl_stage2_reduce(token_num, model_dim, 2)
-    ):
-        # Buffer atomics use 32-bit offsets; reduce outputs larger than 4 GiB.
-        mode = "reduce"
+    # Keep an explicitly requested reduce epilogue unchanged. For atomic mode,
+    # fall back only when the largest token index that may actually be written
+    # would exceed the 32-bit byte-offset range.
+    mode = resolve_flydsl_stage2_mode(
+        mode,
+        token_num,
+        model_dim,
+        2,
+        return_per_slot=return_per_slot,
+        atomic_token_capacity=atomic_token_capacity,
+    )
 
     accumulate = mode != "reduce" and not return_per_slot
 
@@ -2396,6 +2434,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    atomic_token_capacity: int | None = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2417,6 +2456,11 @@ def flydsl_moe_stage2(
         post-GEMM reduction fuses the EP validity gather
         ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
         slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
+
+    atomic_token_capacity: optional upper bound on token IDs written by atomic
+        mode. Real routed-only EP uses a top-k-expanded graph buffer while each
+        source token appears at most once per destination rank, so this bound
+        can be smaller than ``token_num`` without changing the BF16 output.
     """
     return _flydsl_moe_stage2_impl(
         inter_states=inter_states,
@@ -2449,6 +2493,7 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        atomic_token_capacity=atomic_token_capacity,
     )
 
 
