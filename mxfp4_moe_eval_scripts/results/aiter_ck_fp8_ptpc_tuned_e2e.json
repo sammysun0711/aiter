@@ -1,0 +1,21 @@
+{
+  "source": "AITER gemm_moe_tune.py --run_config",
+  "config": "tuning/qwen3_8_tp8_fp8_ptpc_tuned.csv",
+  "device": "AMD Instinct MI308X (gfx942)",
+  "quantization": "FP8 per-token activation, per-channel weight (PTPC)",
+  "results": [
+    {"m": 1, "kernel_us": 35.74, "e2e_us": 53.97, "status": "OK"},
+    {"m": 4, "kernel_us": 78.23, "e2e_us": 98.09, "status": "OK"},
+    {"m": 8, "kernel_us": 137.86, "e2e_us": 170.26, "status": "OK"},
+    {"m": 16, "kernel_us": 266.88, "e2e_us": 285.80, "status": "OK"},
+    {"m": 32, "kernel_us": 449.76, "e2e_us": 524.55, "status": "OK"},
+    {"m": 64, "kernel_us": 709.02, "e2e_us": 818.95, "status": "OK"},
+    {"m": 256, "kernel_us": 1037.45, "e2e_us": 1089.45, "status": "OK"},
+    {"m": 1024, "kernel_us": 1220.29, "e2e_us": 1268.99, "status": "OK"},
+    {"m": 2048, "kernel_us": 1944.10, "e2e_us": 1998.51, "status": "OK"},
+    {"m": 4096, "kernel_us": 2977.46, "e2e_us": 3119.77, "status": "OK"},
+    {"m": 8192, "kernel_us": 4972.28, "e2e_us": 5172.37, "status": "OK"},
+    {"m": 16384, "kernel_us": 8981.73, "e2e_us": 9353.70, "status": "OK"},
+    {"m": 32768, "kernel_us": 17245.82, "e2e_us": 17630.15, "status": "OK"}
+  ]
+}

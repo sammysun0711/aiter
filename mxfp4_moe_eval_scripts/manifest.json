@@ -1,0 +1,41 @@
+{
+  "name": "Qwen3.8 TP8 MoE evaluation bundle",
+  "model": "amd/Qwen3.8-2.4T-A95B-Quark-MXFP4",
+  "shape": {
+    "hidden": 8192,
+    "intermediate_global": 2048,
+    "intermediate_per_tp_rank": 256,
+    "experts": 512,
+    "topk": 10,
+    "m_values": [1, 4, 8, 16, 32, 64, 256, 1024, 2048, 4096, 8192, 16384, 32768]
+  },
+  "hardware": "AMD Instinct MI308X, gfx942, 80 CUs",
+  "software": {
+    "rocm": "7.2",
+    "pytorch": "2.11.0+rocm7.2",
+    "triton": "3.7.0+amd.rocm7.2.0.git89002410",
+    "measured_aiter_commit": "c16d44b93a528b2a4bfd6d8d3409116d465872a9",
+    "bundle_parent_aiter_commit": "c16d44b93a528b2a4bfd6d8d3409116d465872a9",
+    "aiter_local_patch": "csrc/cpp_itfs/torch_utils.py torch.Stream compatibility change"
+  },
+  "final_csv": "results/qwen3_8_tp8_tuned_moe_all_e2e.csv",
+  "source_results": {
+    "native_mxfp4_a16w4": "results/qwen3_8_tuned_native_wrapper_tp8.json",
+    "converted_int4_flydsl_wi4a16": "results/aiter_flydsl_wi4a16_tuned_e2e.json",
+    "bf16_cktile": "results/aiter_ck_bf16_tuned_e2e.json",
+    "fp8_ptpc": "results/aiter_ck_fp8_ptpc_tuned_e2e.json"
+  },
+  "final_configs": {
+    "native_mxfp4_a16w4": "tuning/a16w4_triton/qwen3_8_tp8_deployment_dispatch.json",
+    "converted_int4_flydsl_wi4a16": "tuning/qwen3_8_tp8_wi4a16_tuned.csv",
+    "bf16_cktile": "tuning/qwen3_8_tp8_bf16_tuned.csv",
+    "fp8_ptpc": "tuning/qwen3_8_tp8_fp8_ptpc_tuned.csv"
+  },
+  "aiter_entrypoints": {
+    "tuner_and_run_config": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "standard_moe_test": "op_tests/test_moe_2stage.py",
+    "standard_a16w4_test": "op_tests/triton_tests/moe/test_moe_gemm_a16w4.py",
+    "a16w4_launcher": "aiter/ops/triton/moe/moe_op_gemm_a16w4.py",
+    "a16w4_kernel": "aiter/ops/triton/_triton_kernels/moe/moe_op_gemm_a16w4.py"
+  }
+}

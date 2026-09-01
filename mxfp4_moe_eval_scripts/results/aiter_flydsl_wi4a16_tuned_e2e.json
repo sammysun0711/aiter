@@ -1,0 +1,20 @@
+{
+  "source": "AITER gemm_moe_tune.py --run_config",
+  "config": "tuning/qwen3_8_tp8_wi4a16_tuned.csv",
+  "device": "AMD Instinct MI308X (gfx942)",
+  "results": [
+    {"m": 1, "e2e_us": 102.07, "status": "OK"},
+    {"m": 4, "e2e_us": 260.22, "status": "OK"},
+    {"m": 8, "e2e_us": 463.17, "status": "OK"},
+    {"m": 16, "e2e_us": 768.00, "status": "OK"},
+    {"m": 32, "e2e_us": 1331.33, "status": "OK"},
+    {"m": 64, "e2e_us": 1861.13, "status": "OK"},
+    {"m": 256, "e2e_us": 2658.63, "status": "OK"},
+    {"m": 1024, "e2e_us": 3245.34, "status": "OK"},
+    {"m": 2048, "e2e_us": 5528.32, "status": "OK"},
+    {"m": 4096, "e2e_us": 9645.89, "status": "OK"},
+    {"m": 8192, "e2e_us": 17652.22, "status": "OK"},
+    {"m": 16384, "e2e_us": 33761.74, "status": "OK"},
+    {"m": 32768, "e2e_us": 65704.12, "status": "OK"}
+  ]
+}

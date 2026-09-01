@@ -1,0 +1,27 @@
+{
+  "source": "AITER gemm_moe_tune.py --run_config",
+  "config": "tuning/qwen3_8_tp8_bf16_tuned.csv",
+  "device": "AMD Instinct MI308X (gfx942)",
+  "dtype": "BF16 activation and BF16 weight (QuantType.No)",
+  "scope": "kernel_us is the tuned two-stage expert core; e2e_us is fused_moe including expert sorting but excluding router projection",
+  "candidate_sources": {
+    "cktile_task_groups": 216,
+    "asm_task_groups": 0,
+    "asm_note": "The installed AITER build has no gfx942 BF16 ASM kernel-list file for this path."
+  },
+  "results": [
+    {"m": 1, "kernel_us": 58.44, "e2e_us": 71.72, "status": "OK"},
+    {"m": 4, "kernel_us": 152.44, "e2e_us": 169.22, "status": "OK"},
+    {"m": 8, "kernel_us": 297.13, "e2e_us": 289.85, "status": "OK"},
+    {"m": 16, "kernel_us": 559.48, "e2e_us": 518.96, "status": "OK"},
+    {"m": 32, "kernel_us": 1000.26, "e2e_us": 1018.66, "status": "OK"},
+    {"m": 64, "kernel_us": 1480.87, "e2e_us": 1489.31, "status": "OK"},
+    {"m": 256, "kernel_us": 2135.70, "e2e_us": 2200.42, "status": "OK"},
+    {"m": 1024, "kernel_us": 2370.68, "e2e_us": 2631.05, "status": "OK"},
+    {"m": 2048, "kernel_us": 3250.42, "e2e_us": 3355.09, "status": "OK"},
+    {"m": 4096, "kernel_us": 5348.47, "e2e_us": 5404.49, "status": "OK"},
+    {"m": 8192, "kernel_us": 9387.67, "e2e_us": 9199.69, "status": "OK"},
+    {"m": 16384, "kernel_us": 17044.41, "e2e_us": 16882.45, "status": "OK"},
+    {"m": 32768, "kernel_us": 31915.32, "e2e_us": 29394.29, "status": "OK"}
+  ]
+}
