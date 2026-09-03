@@ -71,11 +71,19 @@ def streaming_topk(
         x = (x.to(x_ultype) << 16) | offs_x_n[None, :]
         acc = tl.maximum(acc, tl.topk(x, N_EXPTS_ACT_PAD, dim=1))
 
+    # The streaming maximum merge leaves a bitonic result rather than a value-
+    # sorted result. When top-k is not a power of two (Qwen3.8 uses 10, padded
+    # to 16), masking the first K lanes drops arbitrary entries. Sort by value
+    # first and retain the largest K lanes.
+    if N_EXPTS_ACT != N_EXPTS_ACT_PAD:
+        acc = tl.sort(acc, dim=1)
     # rotate expert index into upper 16 bits:
     # 0000vvvvvvvviiii --> iiii0000vvvvvvvv
     acc = (acc << (y_nbits - 16)) | (acc >> 16)
     if N_EXPTS_ACT != N_EXPTS_ACT_PAD:
-        mask_expts_act = tl.arange(0, N_EXPTS_ACT_PAD)[None, :] < N_EXPTS_ACT
+        mask_expts_act = tl.arange(0, N_EXPTS_ACT_PAD)[None, :] >= (
+            N_EXPTS_ACT_PAD - N_EXPTS_ACT
+        )
         acc = tl.where(mask_expts_act, acc, N_EXPTS_PAD << (y_nbits - 16))
     # sort in ascending order of expert (descending order of key)
     acc = tl.sort(acc, dim=1)
@@ -116,7 +124,6 @@ def _topk(
     N_EXPTS_ACT_PAD: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-
     pid = tl.program_id(0)
     if isinstance(n_rows, tl.tensor) and n_rows.dtype.is_ptr():
         n_rows = tl.load(n_rows)

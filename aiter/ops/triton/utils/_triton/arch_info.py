@@ -25,5 +25,15 @@ def is_fp4_avail():
     return get_arch() in ("gfx950", "gfx1250")
 
 
+def is_moe_a16w4_avail():
+    """Return whether the BF16-activation/MXFP4-weight MoE path is supported."""
+    return get_arch() in ("gfx942", "gfx950", "gfx1250")
+
+
 def is_fp8_avail():
     return get_arch() in ("gfx942", "gfx950", "gfx1250", "gfx1200", "gfx1201")
+
+
+def is_tdm_avail():
+    """Return whether Triton tensor-descriptor memory operations are supported."""
+    return get_arch() in ("gfx1250",)
