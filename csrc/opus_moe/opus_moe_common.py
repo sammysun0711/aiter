@@ -38,6 +38,10 @@ OPUS_A8W4_KID_ROUTE_FP8_BM64_BT128_SBM64_RBN3072 = 2015
 OPUS_A8W4_KID_ROUTE_FP8_BM64_BT128_SBM128_RBN3584 = 2016
 OPUS_A8W4_KID_ROUTE_FP8_BM64_BT128_SBM128_RBN3072 = 2017
 OPUS_A8W4_KID_ATOMIC_BM32_BN128_OCC1_B3_WS2_RING4 = 2018
+OPUS_A8W4_KID_ROUTE_FP8_BM64_SBM64_RBN6144_XW8 = 2019
+OPUS_A8W4_KID_ROUTE_FP8_BM64_SBM128_RBN6144_XW8 = 2020
+OPUS_A8W4_KID_ROUTE_BF16_BM64_SBM64_RBN6144_XW8 = 2021
+OPUS_A8W4_KID_ROUTE_BF16_BM64_SBM128_RBN6144_XW8 = 2022
 
 _OPUS_A8W4_STAGE2_PREFIX = "opus_moe2_"
 _OPUS_A8W4_STAGE2_LAYOUT_PREFIX = "opus_moe2_layout_"
@@ -78,6 +82,7 @@ class OpusA8W4Stage2Instance:
     steady_pair_slots: int = 1
     cachectl_b: int = 0
     cachectl_wscale: int = 0
+    swizzle_w: int = 2
     route_reduce: str | None = None
     min_tuner_token: int | None = None
     max_tuner_token: int | None = None
@@ -186,6 +191,11 @@ OPUS_A8W4_ROUTE_REDUCE_INSTANCES = (
         name="rbn3584",
         block_n=3584,
         threads=448,
+    ),
+    OpusA8W4RouteReduceInstance(
+        name="rbn6144",
+        block_n=6144,
+        threads=768,
     ),
 )
 
@@ -600,6 +610,7 @@ def _route_stage2_instance(
     pair_slots: int = 1,
     steady_pair_slots: int = 1,
     cachectl_b: int = 0,
+    swizzle_w: int = 2,
     min_tuner_token: int | None = None,
     max_tuner_token: int | None = None,
     mode_default: bool = False,
@@ -617,6 +628,7 @@ def _route_stage2_instance(
         pair_slots=pair_slots,
         steady_pair_slots=steady_pair_slots,
         cachectl_b=cachectl_b,
+        swizzle_w=swizzle_w,
         route_reduce=route_reduce,
         min_tuner_token=min_tuner_token,
         max_tuner_token=max_tuner_token,
@@ -871,6 +883,62 @@ OPUS_A8W4_DECODE_STAGE2_INSTANCES = (
         cachectl_wscale=2,
         min_tuner_token=1,
         max_tuner_token=2048,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_ROUTE_FP8_BM64_SBM64_RBN6144_XW8,
+        name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn6144_xw8",
+        out_mode=OPUS_A8W4_OUT_MODE_FP8,
+        block_m=64,
+        sort_block_m=64,
+        route_reduce="rbn6144",
+        block_threads=256,
+        min_blocks_per_cu=4,
+        pair_slots=2,
+        steady_pair_slots=1,
+        swizzle_w=8,
+        min_tuner_token=128,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_ROUTE_FP8_BM64_SBM128_RBN6144_XW8,
+        name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm128_rbn6144_xw8",
+        out_mode=OPUS_A8W4_OUT_MODE_FP8,
+        block_m=64,
+        sort_block_m=128,
+        route_reduce="rbn6144",
+        block_threads=256,
+        min_blocks_per_cu=4,
+        pair_slots=2,
+        steady_pair_slots=1,
+        swizzle_w=8,
+        min_tuner_token=128,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_ROUTE_BF16_BM64_SBM64_RBN6144_XW8,
+        name="opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64_rbn6144_xw8",
+        out_mode=OPUS_A8W4_OUT_MODE_BF16,
+        block_m=64,
+        sort_block_m=64,
+        route_reduce="rbn6144",
+        block_threads=256,
+        min_blocks_per_cu=4,
+        pair_slots=2,
+        steady_pair_slots=1,
+        swizzle_w=8,
+        min_tuner_token=128,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_ROUTE_BF16_BM64_SBM128_RBN6144_XW8,
+        name="opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm128_rbn6144_xw8",
+        out_mode=OPUS_A8W4_OUT_MODE_BF16,
+        block_m=64,
+        sort_block_m=128,
+        route_reduce="rbn6144",
+        block_threads=256,
+        min_blocks_per_cu=4,
+        pair_slots=2,
+        steady_pair_slots=1,
+        swizzle_w=8,
+        min_tuner_token=128,
     ),
 )
 

@@ -59,7 +59,17 @@ def _get_flydsl_moe_kernels():
     return moe_kernels
 
 
+def is_flydsl_available() -> bool:
+    """Return whether the lazily imported FlyDSL MoE implementation is usable."""
+    try:
+        _get_flydsl_moe_kernels()
+    except (ImportError, ModuleNotFoundError):
+        return False
+    return True
+
+
 BLOCK_SIZE_M = 32
+_OPUS_STAGE2_OUTPUT_DTYPES = ("auto", "fp8", "bf16")
 
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
@@ -102,6 +112,56 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 
 # Optional hook for collecting per-stage benchmark callables.
 kernel_bench_callable = None
+
+
+def _normalize_opus_stage2_output_dtype(value) -> str:
+    value = str(value).strip().lower()
+    if value not in _OPUS_STAGE2_OUTPUT_DTYPES:
+        raise ValueError(
+            "opus_stage2_output_dtype must be one of "
+            f"{_OPUS_STAGE2_OUTPUT_DTYPES}, got {value!r}"
+        )
+    return value
+
+
+def _select_opus_stage2_output_dtype(cfg, output_dtype: str):
+    """Return a config using the requested OPUS route-output representation.
+
+    Non-OPUS and direct-atomic stage-2 kernels already produce the final BF16
+    output, so the route-output choice does not apply to them.
+    """
+
+    output_dtype = _normalize_opus_stage2_output_dtype(output_dtype)
+    if cfg is None or output_dtype == "auto":
+        return cfg
+
+    kernel_name = str(cfg.get("kernelName2", "") or "").strip()
+    instance = _opus_a8w4.opus_a8w4_stage2_instance_from_name(kernel_name)
+    if instance is None or not instance.route_out:
+        return cfg
+
+    current_dtype = "fp8" if instance.route_out_fp8 else "bf16"
+    if output_dtype == current_dtype:
+        return cfg
+
+    selected_kernel_name = kernel_name.replace(
+        f"_wfp4_{current_dtype}_", f"_wfp4_{output_dtype}_", 1
+    )
+    if selected_kernel_name == kernel_name:
+        raise ValueError(
+            "Cannot derive the requested Opus A8W4 stage2 kernel from "
+            f"kernelName2={kernel_name!r}"
+        )
+    if _opus_a8w4.opus_a8w4_stage2_instance_from_name(selected_kernel_name) is None:
+        raise ValueError(
+            "No registered Opus A8W4 stage2 kernel for "
+            f"opus_stage2_output_dtype={output_dtype!r}: "
+            f"{selected_kernel_name!r}"
+        )
+
+    selected_cfg = dict(cfg)
+    selected_cfg["kernelName2"] = selected_kernel_name
+    return selected_cfg
 
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
@@ -748,7 +808,12 @@ def fused_moe(
     # copy. Must be contiguous, match shape/dtype/device and not overlap
     # hidden_states, or the call raises; when given it is what gets returned.
     output: torch.Tensor | None = None,
+    ep_has_fake_route: bool = True,
+    opus_stage2_output_dtype: str = "auto",
 ):
+    opus_stage2_output_dtype = _normalize_opus_stage2_output_dtype(
+        opus_stage2_output_dtype
+    )
     if (
         any(
             tensor is not None
@@ -756,6 +821,10 @@ def fused_moe(
         )
         or shared_expert_id != -1
     ):
+        if opus_stage2_output_dtype != "auto":
+            raise NotImplementedError(
+                "opus_stage2_output_dtype is not supported with shared experts"
+            )
         from aiter.fhmoe import _fhmoe
 
         return _fhmoe(
@@ -832,6 +901,8 @@ def fused_moe(
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_source_token_map=scatter_source_map,
         output=output,
+        ep_has_fake_route=ep_has_fake_route,
+        opus_stage2_output_dtype=opus_stage2_output_dtype,
     )
 
 
@@ -870,6 +941,8 @@ def fused_moe_fake(
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    ep_has_fake_route: bool = True,
+    opus_stage2_output_dtype: str = "auto",
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -927,6 +1000,8 @@ def fused_moe_(
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    ep_has_fake_route: bool = True,
+    opus_stage2_output_dtype: str = "auto",
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -966,6 +1041,8 @@ def fused_moe_(
         gate_mode=gate_mode,
         stage2_scatter=stage2_scatter,
         output=output,
+        ep_has_fake_route=ep_has_fake_route,
+        opus_stage2_output_dtype=opus_stage2_output_dtype,
     )
 
 
@@ -997,6 +1074,8 @@ def _fused_moe_impl(
     gate_mode: str = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
     output: torch.Tensor | None = None,
+    ep_has_fake_route: bool = True,
+    opus_stage2_output_dtype: str = "auto",
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1049,6 +1128,17 @@ def _fused_moe_impl(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    is_silu_interleave_a8w4 = (
+        quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and activation == ActivationType.Silu
+        and gate_mode == GateMode.INTERLEAVE
+        and get_gfx() == "gfx950"
+        and isShuffled
+        and isG1U1
+        and not doweight_stage1
+        and is_flydsl_available()
+    )
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
     # use FP8 as activation dtype to skip redundant re-quantization
     if (
@@ -1080,6 +1170,11 @@ def _fused_moe_impl(
                 q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
+        elif is_silu_interleave_a8w4:
+            # The gfx950 BF16/FP4 CK fallback has no plain-SiLU interleaved
+            # kernel for decode-sized batches. Use the supported A8W4 path at
+            # every token tier instead of requiring a global threshold override.
+            q_dtype_a = dtypes.fp8
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
@@ -1191,6 +1286,8 @@ def _fused_moe_impl(
             isShuffled,
             gate_mode,
             is_ep=expert_mask is not None,
+            ep_has_fake_route=ep_has_fake_route,
+            opus_stage2_output_dtype=opus_stage2_output_dtype,
             has_stage1_bias=bias1 is not None,
             has_stage2_bias=bias2 is not None,
             situ_beta=config_situ_beta,
@@ -1394,6 +1491,8 @@ def _fused_moe_impl(
             linear_beta=linear_beta,
             gate_mode=gate_mode,
             expert_mask=expert_mask,
+            ep_has_fake_route=ep_has_fake_route,
+            opus_stage2_output_dtype=opus_stage2_output_dtype,
             m_indices=sort_m_indices,
             reverse_sorted=sort_reverse_sorted,
             # Reuse the capability-validated row selected above. Re-looking it
@@ -1822,6 +1921,7 @@ def _flydsl_stage1_wrapper(
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
+        persist_m=parsed.get("persist_m", 0),
         use_async_copy=True,
         k_batch=parsed.get("k_batch", 1),
         # None, matching stage 2: the int4 registry emits no waves_per_eu key.
@@ -1836,6 +1936,7 @@ def _flydsl_stage1_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
+        pipeline_phases=parsed.get("pipeline_phases", 4),
         v2_output_layout=v2_output_layout,
     )
 
@@ -2656,6 +2757,8 @@ def get_2stage_cfgs(
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
     has_stage1_bias=False,
+    ep_has_fake_route=True,
+    opus_stage2_output_dtype="auto",
     has_stage2_bias=False,
     situ_beta=1.0,
     situ_linear_beta=1.0,
@@ -2665,6 +2768,9 @@ def get_2stage_cfgs(
     _disable_inline_sort=False,
 ):
     gate_mode = GateMode(gate_mode)
+    opus_stage2_output_dtype = _normalize_opus_stage2_output_dtype(
+        opus_stage2_output_dtype
+    )
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
     # (e.g. gfx950 vs gfx1250, both report 256 CU) don't collide. Legacy CSVs
     # without a `gfx` column are backfilled from cu_num at load time via
@@ -2771,10 +2877,9 @@ def get_2stage_cfgs(
             cfg_2stages_by_file[tune_file] = active_cfg_2stages
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
+    # Legacy EP callers append one always-masked fake route. Newer callers can
+    # explicitly report that their top-k tensor contains routed entries only.
+    topk -= int(is_ep and ep_has_fake_route)
     keys = (
         gfx,
         cu_num,
@@ -2870,6 +2975,7 @@ def get_2stage_cfgs(
         cfg = _lookup_cfg(cfg_2stages)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
+    cfg = _select_opus_stage2_output_dtype(cfg, opus_stage2_output_dtype)
     if cfg is not None:
         kn1 = str(cfg.get("kernelName1", "") or "").strip()
         kn2 = str(cfg.get("kernelName2", "") or "").strip()
@@ -3316,20 +3422,37 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
     )
-    use_mxfp4_flydsl = _is_a16w4_situv2 or (
+    _is_silu_interleave_a8w4 = (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
-        and (
-            activation in (ActivationType.Swiglu, ActivationType.Situv2)
-            or _flydsl_force
-        )
-        and (
-            q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
-            and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
-        )
+        and activation == ActivationType.Silu
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp4x2
+        and gate_mode == GateMode.INTERLEAVE
+        and get_gfx() == "gfx950"
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
+    )
+    use_mxfp4_flydsl = (
+        _is_a16w4_situv2
+        or _is_silu_interleave_a8w4
+        or (
+            dtype in [dtypes.bf16, dtypes.fp16]
+            and q_type == QuantType.per_1x32
+            and (
+                activation in (ActivationType.Swiglu, ActivationType.Situv2)
+                or _flydsl_force
+            )
+            and (
+                q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
+                and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
+            )
+            and is_shuffled
+            and use_g1u1
+            and not doweight_stage1
+            and is_flydsl_available()
+        )
     )
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
@@ -3622,6 +3745,8 @@ def fused_moe_2stages(
     linear_beta=None,
     gate_mode=GateMode.SEPARATED.value,
     expert_mask=None,
+    ep_has_fake_route=True,
+    opus_stage2_output_dtype="auto",
     m_indices=None,
     reverse_sorted=None,
     _metadata_transform: Callable | None = None,
@@ -3670,6 +3795,8 @@ def fused_moe_2stages(
         gate_mode,
         is_ep=expert_mask is not None,
         has_stage1_bias=bias1 is not None,
+        ep_has_fake_route=ep_has_fake_route,
+        opus_stage2_output_dtype=opus_stage2_output_dtype,
         has_stage2_bias=bias2 is not None,
         situ_beta=config_situ_beta,
         situ_linear_beta=config_situ_linear_beta,
