@@ -13,13 +13,17 @@ from flydsl.expr.typing import T
 from .kernels_common import LOG2E
 from .pa_decode_common import (
     copy_load as _copy_load,
+)
+from .pa_decode_common import (
     copy_store as _copy_store,
-    global_pointer_from_addr as _global_pointer_from_addr,
+)
+from .pa_decode_common import (
     exp2_f32_fast,
     rcp_f32,
     udiv_const,
     urem_const,
 )
+from .tensor_shim import ptr_buf_tensor
 
 WARP_SIZE = 64
 _FLAT_BUFFER_ELEMENTS = 1 << 30
@@ -100,10 +104,8 @@ def compile_pa_decode_sw_reduce(
             )
 
         def _divide_addr(addr, dtype):
-            pointer = _global_pointer_from_addr(addr, dtype, alignment=dtype.width // 8)
-            flat = fx.make_view(pointer, fx.make_layout(_FLAT_BUFFER_ELEMENTS, 1))
             return fx.logical_divide(
-                fx.rocdl.make_buffer_tensor(flat),
+                ptr_buf_tensor(addr, elem=dtype, n=_FLAT_BUFFER_ELEMENTS),
                 fx.make_layout(1, 1),
             )
 
@@ -148,7 +150,7 @@ def compile_pa_decode_sw_reduce(
         def _wave_reduce_max_full(val):
             red = val
             for sh in [32, 16, 8, 4, 2, 1]:
-                red = red.maximumf(red.shuffle_xor(fx.Int32(sh), c_w))
+                red = fx.max(red, red.shuffle_xor(fx.Int32(sh), c_w))
             return red
 
         def _wave_reduce_sum_full(val):
@@ -182,10 +184,10 @@ def compile_pa_decode_sw_reduce(
 
             if wave == 0:
                 in_range = lane < c_red_slots
-                lane_safe = arith.select(in_range, lane, 0)
+                lane_safe = in_range.select(lane, 0)
                 lane_safe_idx = fx.Int32(lane_safe)
                 red_val = fx.memref_load(red_scratch, lane_safe_idx)
-                red_val = arith.select(in_range, red_val, neutral)
+                red_val = in_range.select(red_val, neutral)
                 red_val = (
                     _wave_reduce_max_full(red_val)
                     if const_expr(mode == "max")
@@ -204,7 +206,7 @@ def compile_pa_decode_sw_reduce(
             def _wave_reduce_max(val):
                 red = val
                 for sh in reduce_shuffle_offsets:
-                    red = red.maximumf(red.shuffle_xor(fx.Int32(sh), c_w))
+                    red = fx.max(red, red.shuffle_xor(fx.Int32(sh), c_w))
                 return red
 
             def _wave_reduce_sum(val):
@@ -221,7 +223,7 @@ def compile_pa_decode_sw_reduce(
             part_sum = c_zero_f
             part_max = c_neg_inf
             if lane_in_reduce:
-                part_i32 = arith.select(lane_in_range, lane, 0)
+                part_i32 = lane_in_range.select(lane, 0)
                 es_off = (
                     batch_idx * stride_exp_sums_seq
                     + kv_head_idx * stride_exp_sums_head
@@ -230,34 +232,30 @@ def compile_pa_decode_sw_reduce(
                 )
                 part_sum_raw = _copy_load(exp_sums, es_off, copy_f32, f32_register)[0]
                 part_max_raw = _copy_load(max_logits, es_off, copy_f32, f32_register)[0]
-                part_sum = arith.select(lane_in_range, part_sum_raw, c_zero_f)
-                part_max = arith.select(lane_in_range, part_max_raw, c_neg_inf)
+                part_sum = lane_in_range.select(part_sum_raw, c_zero_f)
+                part_max = lane_in_range.select(part_max_raw, c_neg_inf)
 
             global_max = _wave_reduce_max(part_max)
-            part_scale = arith.select(
-                lane_in_range,
-                exp2_f32_fast((part_max - global_max) * c_log2e),
-                c_zero_f,
+            part_scale = lane_in_range.select(
+                exp2_f32_fast((part_max - global_max) * c_log2e), c_zero_f
             )
             scaled_sum = part_sum * part_scale
             global_exp_sum = _wave_reduce_sum(scaled_sum)
-            safe_global_exp_sum = arith.select(
-                global_exp_sum > c_zero_f,
-                global_exp_sum,
-                c_one_f,
+            safe_global_exp_sum = (global_exp_sum > c_zero_f).select(
+                global_exp_sum, c_one_f
             )
             inv_global_exp_sum = rcp_f32(safe_global_exp_sum)
             weight_local = scaled_sum * inv_global_exp_sum
-            weight_local_i32 = arith.bitcast(T.i32, arith.unwrap(weight_local))
+            weight_local_i32 = weight_local.bitcast(fx.Int32)
 
             acc = c_zero_f
             for part_idx in range_constexpr(max_context_partition_num):
                 part_i32 = fx.Int32(part_idx)
                 bcast_addr = part_i32 * 4
                 weight_i32 = rocdl.ds_bpermute(
-                    T.i32, arith.unwrap(bcast_addr), arith.unwrap(weight_local_i32)
+                    T.i32, bcast_addr.ir_value(), weight_local_i32.ir_value()
                 )
-                weight = arith.bitcast(T.f32, weight_i32)
+                weight = fx.Int32(weight_i32).bitcast(fx.Float32)
                 logits_off = (
                     batch_idx * stride_logits_seq
                     + kv_head_idx * stride_logits_head
@@ -271,14 +269,14 @@ def compile_pa_decode_sw_reduce(
                 part_logits = fx.Float32(part_logits_raw)
                 acc = acc + part_logits * weight
         else:
-            # Fallback for unusually large sliding-window partition counts.
+            # More than one wave is needed when NP exceeds 64.
             global_max = c_neg_inf
             for chunk_base in range(0, max_context_partition_num, block_threads):
                 chunk_size = min(block_threads, max_context_partition_num - chunk_base)
                 c_chunk_size = fx.Int32(chunk_size)
                 c_chunk_base = fx.Int32(chunk_base)
                 in_chunk = tid < c_chunk_size
-                part_i32 = arith.select(in_chunk, tid + c_chunk_base, 0)
+                part_i32 = in_chunk.select(tid + c_chunk_base, 0)
                 es_off = (
                     batch_idx * stride_exp_sums_seq
                     + kv_head_idx * stride_exp_sums_head
@@ -286,9 +284,9 @@ def compile_pa_decode_sw_reduce(
                     + eqgs_idx
                 )
                 part_max_raw = _copy_load(max_logits, es_off, copy_f32, f32_register)[0]
-                part_max = arith.select(in_chunk, part_max_raw, c_neg_inf)
+                part_max = in_chunk.select(part_max_raw, c_neg_inf)
                 chunk_max = _block_reduce(part_max, "max")
-                global_max = global_max.maximumf(chunk_max)
+                global_max = fx.max(global_max, chunk_max)
 
             global_exp_sum = c_zero_f
             for chunk_base in range(0, max_context_partition_num, block_threads):
@@ -296,7 +294,7 @@ def compile_pa_decode_sw_reduce(
                 c_chunk_size = fx.Int32(chunk_size)
                 c_chunk_base = fx.Int32(chunk_base)
                 in_chunk = tid < c_chunk_size
-                part_i32 = arith.select(in_chunk, tid + c_chunk_base, 0)
+                part_i32 = in_chunk.select(tid + c_chunk_base, 0)
                 es_off = (
                     batch_idx * stride_exp_sums_seq
                     + kv_head_idx * stride_exp_sums_head
@@ -305,20 +303,16 @@ def compile_pa_decode_sw_reduce(
                 )
                 part_sum_raw = _copy_load(exp_sums, es_off, copy_f32, f32_register)[0]
                 part_max_raw = _copy_load(max_logits, es_off, copy_f32, f32_register)[0]
-                part_sum = arith.select(in_chunk, part_sum_raw, c_zero_f)
-                part_max = arith.select(in_chunk, part_max_raw, c_neg_inf)
-                part_scale = arith.select(
-                    in_chunk,
-                    exp2_f32_fast((part_max - global_max) * c_log2e),
-                    c_zero_f,
+                part_sum = in_chunk.select(part_sum_raw, c_zero_f)
+                part_max = in_chunk.select(part_max_raw, c_neg_inf)
+                part_scale = in_chunk.select(
+                    exp2_f32_fast((part_max - global_max) * c_log2e), c_zero_f
                 )
                 chunk_sum = _block_reduce(part_sum * part_scale, "sum")
                 global_exp_sum = global_exp_sum + chunk_sum
 
-            safe_global_exp_sum = arith.select(
-                global_exp_sum > c_zero_f,
-                global_exp_sum,
-                c_one_f,
+            safe_global_exp_sum = (global_exp_sum > c_zero_f).select(
+                global_exp_sum, c_one_f
             )
             inv_global_exp_sum = rcp_f32(safe_global_exp_sum)
 
@@ -327,7 +321,7 @@ def compile_pa_decode_sw_reduce(
                 c_chunk_size = fx.Int32(chunk_size)
                 c_chunk_base = fx.Int32(chunk_base)
                 in_chunk = tid < c_chunk_size
-                part_i32 = arith.select(in_chunk, tid + c_chunk_base, 0)
+                part_i32 = in_chunk.select(tid + c_chunk_base, 0)
                 es_off = (
                     batch_idx * stride_exp_sums_seq
                     + kv_head_idx * stride_exp_sums_head
@@ -336,8 +330,8 @@ def compile_pa_decode_sw_reduce(
                 )
                 part_sum_raw = _copy_load(exp_sums, es_off, copy_f32, f32_register)[0]
                 part_max_raw = _copy_load(max_logits, es_off, copy_f32, f32_register)[0]
-                part_sum = arith.select(in_chunk, part_sum_raw, c_zero_f)
-                part_max = arith.select(in_chunk, part_max_raw, global_max)
+                part_sum = in_chunk.select(part_sum_raw, c_zero_f)
+                part_max = in_chunk.select(part_max_raw, global_max)
                 part_scale = exp2_f32_fast((part_max - global_max) * c_log2e)
                 weight = part_sum * part_scale * inv_global_exp_sum
                 if in_chunk:
@@ -401,7 +395,7 @@ def compile_pa_decode_sw_reduce(
         stride_logits_group,
         batch_size,
         num_kv_heads,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008 - FlyDSL ABI default.
     ):
         pa_decode_sw_reduce_kernel(
             output,

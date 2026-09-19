@@ -14,24 +14,29 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr.typing import ReductionOp, T
-from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.kernels_common import LOG2E, create_llvm_ptr
+
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 from aiter.ops.flydsl.kernels.pa_decode_common import (
+    async_load_lds_nt,
     cdiv,
     exp2_amdgcn_scalar,
     exp2_f32_fast,
+    load_lds_words,
+    make_flat_loader,
+    page_resource,
     rcp_f32,
+    reduce_lane_pair,
+    swap_lane_pair,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import buf_scalar_load
 
 BF16_CONTEXT_LIMIT = 512
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
     D = head_dim
     NP = num_partitions
@@ -80,102 +85,46 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
             qi = row // 16
             qh = kv_h * 16 + row % 16
 
-            def _lds_ptr(off):
-                ptr = fx.add_offset(lds_base, fx.make_int_tuple(off))
-                ty = fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 16)
-                return fx.recast_iter(ty, ptr)
+            q_load = make_flat_loader(query_ptr, fx.BFloat16, 8, fx.UniversalCopy128b())
 
-            def _lds_read(off):
-                return fx.Vector(
-                    fx.ptr_load(
-                        _lds_ptr(off), result_type=fx.Vector.make_type(4, fx.Int32)
-                    )
-                )
-
-            def _loader(ptr, dtype, width, atom_op):
-                atom = fx.make_copy_atom(atom_op, dtype)
-                reg = fx.make_rmem_tensor(fx.make_layout(width, 1), dtype)
-                flat = fx.Tensor(
-                    fx.make_view(fx.get_iter(ptr), fx.make_layout(1 << 30, 1))
-                )
-                div = fx.logical_divide(flat, fx.make_layout(1, 1))
-
-                def load(offset):
-                    fx.copy(atom, fx.slice(div, (None, offset)), reg)
-                    return fx.Vector(fx.memref_load_vec(reg))
-
-                return load
-
-            q_load = _loader(query_ptr, fx.BFloat16, 8, fx.UniversalCopy128b())
-
-            def _page_buffer(ptr, page_offset, page_bytes):
-                base = fx.add_offset(fx.get_iter(ptr), fx.make_int_tuple(page_offset))
-                view = fx.make_view(base, fx.make_layout(page_bytes, 1))
-                tensor = fx.rocdl.make_buffer_tensor(
-                    view, num_records_bytes=fx.Int64(page_bytes).ir_value()
-                )
-                return fx.rocdl.get_buffer_rsrc(fx.get_iter(tensor))
-
-            def _dma(src_rsrc, source_offset, lds_wave_offset):
-                lds_addr = fx.Int32(fx.ptrtoint(lds_base)) + lds_wave_offset
-                uniform_addr = fx.rocdl.readfirstlane(T.i32, lds_addr)
-                dst = create_llvm_ptr(fx.Int32(uniform_addr), 3)
-                fx.rocdl.raw_ptr_buffer_load_async_lds(
-                    src_rsrc,
-                    dst,
-                    fx.Int32(16).ir_value(),
-                    source_offset.ir_value(),
-                    fx.Int32(0).ir_value(),
-                    fx.Int32(0).ir_value(),
-                    aux=ir.IntegerAttr.get(T.i32, 2),
-                )
-
-            tables = buffer_ops.create_buffer_resource(
+            tables = fx.rocdl.make_buffer_tensor(
                 tables_ptr,
                 max_size=False,
-                num_records_bytes=fx.Index(gpu.grid_dim.x) * fx.Index(max_blocks) * 4,
+                num_records_bytes=fx.Int64(gpu.grid_dim.x) * fx.Int64(max_blocks) * 4,
             )
-            lengths = buffer_ops.create_buffer_resource(lengths_ptr, max_size=True)
-            ks = buffer_ops.create_buffer_resource(key_scale_ptr, max_size=True)
-            vs = buffer_ops.create_buffer_resource(value_scale_ptr, max_size=True)
-            context = fx.Int32(
-                buffer_ops.buffer_load(lengths, seq, vec_width=1, is_scalar=True)
-            )
-            key_scale = fx.Int32(
-                buffer_ops.buffer_load(ks, fx.Int32(0), vec_width=1, is_scalar=True)
-            ).bitcast(fx.Float32)
-            value_scale = fx.Int32(
-                buffer_ops.buffer_load(vs, fx.Int32(0), vec_width=1, is_scalar=True)
-            ).bitcast(fx.Float32)
+            lengths = fx.rocdl.make_buffer_tensor(lengths_ptr, max_size=True)
+            ks = fx.rocdl.make_buffer_tensor(key_scale_ptr, max_size=True)
+            vs = fx.rocdl.make_buffer_tensor(value_scale_ptr, max_size=True)
+            context = fx.Int32(buf_scalar_load(lengths, seq))
+            key_scale = fx.Int32(buf_scalar_load(ks, fx.Int32(0))).bitcast(fx.Float32)
+            value_scale = fx.Int32(buf_scalar_load(vs, fx.Int32(0))).bitcast(fx.Float32)
 
             def _page(tt):
                 return fx.Int64(
-                    fx.Int32(
-                        buffer_ops.buffer_load(
-                            tables, seq * max_blocks + tt, vec_width=1, is_scalar=True
-                        )
-                    )
+                    fx.Int32(buf_scalar_load(tables, seq * max_blocks + tt))
                 )
 
             def _stage_kv(tt, buf):
                 for pg in range_constexpr(2):
                     page = _page(fx.min(tt * 2 + pg, cdiv(context, 64) - 1))
-                    k_src = _page_buffer(
+                    k_src = page_resource(
                         key_ptr, (page * n_kv + kv_h) * (D * 64), D * 64
                     )
-                    v_src = _page_buffer(value_ptr, (page * n_kv + kv_h) * 8192, 8192)
+                    v_src = page_resource(value_ptr, (page * n_kv + kv_h) * 8192, 8192)
                     for u in range_constexpr(KG):
                         local = tid * 16 + u * 4096
-                        _dma(
+                        async_load_lds_nt(
                             k_src,
                             local,
+                            lds_base,
                             buf * KV_BYTES + pg * D * 64 + wave * 1024 + u * 4096,
                         )
                     for u in range_constexpr(2):
                         local = tid * 16 + u * 4096
-                        _dma(
+                        async_load_lds_nt(
                             v_src,
                             local,
+                            lds_base,
                             buf * KV_BYTES
                             + D * 128
                             + pg * 8192
@@ -192,7 +141,7 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                         + (nt // 2) * D * 64
                         + ((kg * 4 + half * 2 + u) * 64 + (nt % 2) * 32 + col) * 16
                     )
-                    words = _lds_read(off)
+                    words = load_lds_words(lds_base, off)
                     ops.extend([words[i] for i in range_constexpr(4)])
                 return fx.Vector.from_elements(ops, dtype=fx.Int32)
 
@@ -206,7 +155,7 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                         + step * 8192
                         + (token_group * 128 + vh * 32 + col) * 16
                     )
-                    chunk = _lds_read(off)
+                    chunk = load_lds_words(lds_base, off)
                     words.extend([chunk[i] for i in range_constexpr(4)])
                 return fx.Vector.from_elements(words, dtype=fx.Int32)
 
@@ -250,20 +199,6 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                     words.append(fx.Vector(word).bitcast(fx.Int32)[0])
                 return fx.Vector.from_elements(words, dtype=fx.Int32)
 
-            def _swap_pair(a, b):
-                pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-                pair = fx.rocdl.permlane32_swap(
-                    pair_ty, a.ir_value(), b.ir_value(), False, False
-                )
-                return fx.Int32(llvm.extractvalue(T.i32, pair, [0])), fx.Int32(
-                    llvm.extractvalue(T.i32, pair, [1])
-                )
-
-            def _reduce_pair(value):
-                bits = fx.Float32(value).bitcast(fx.Int32)
-                low, high = _swap_pair(bits, bits)
-                return low.bitcast(fx.Float32), high.bitcast(fx.Float32)
-
             def _mma(a, b, acc):
                 return fx.Vector(
                     fx.rocdl.mfma_scale_f32_32x32x64_f8f6f4(
@@ -292,7 +227,7 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                 amax = fx.maxnumf(
                     amax, fx.absf(q_units[u].to(fx.Float32)).reduce(ReductionOp.MAX)
                 )
-            amax_lo, amax_hi = _reduce_pair(amax)
+            amax_lo, amax_hi = reduce_lane_pair(amax)
             amax = fx.maxnumf(amax_lo, amax_hi)
             q_scale = fx.maxnumf(amax * fx.Float32(1.0 / 448.0), fx.Float32(1e-20))
             inv_q = fx.Float32(rcp_f32(q_scale))
@@ -351,10 +286,10 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                     local_max = fx.maxnumf(
                         local_max, scores[nt].reduce(ReductionOp.MAX)
                     )
-                max_lo, max_hi = _reduce_pair(local_max)
+                max_lo, max_hi = reduce_lane_pair(local_max)
                 tile_max = fx.maxnumf(max_lo, max_hi) * scale
                 new_max = fx.maxnumf(state[0], tile_max)
-                safe_max = arith.select(new_max > neg_inf, new_max, zero)
+                safe_max = (new_max > neg_inf).select(new_max, zero)
                 max_vec = fx.Vector.from_elements(
                     [safe_max], dtype=fx.Float32
                 ).broadcast_to(16)
@@ -375,7 +310,7 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                 )
                 for nt in range_constexpr(2, 4):
                     local_sum = local_sum + probs[nt].reduce(ReductionOp.ADD)
-                sum_lo, sum_hi = _reduce_pair(local_sum)
+                sum_lo, sum_hi = reduce_lane_pair(local_sum)
                 tile_sum = sum_lo + sum_hi
                 corr = fx.Float32(exp2_amdgcn_scalar(state[0] - safe_max))
                 new_sum = state[1] * corr + tile_sum
@@ -387,7 +322,7 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                 for step in range_constexpr(2):
                     packed = []
                     for g in range_constexpr(4):
-                        low, high = _swap_pair(
+                        low, high = swap_lane_pair(
                             p_words[2 * step][g], p_words[2 * step + 1][g]
                         )
                         packed.extend([low, high])
@@ -401,21 +336,12 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                     for step in range_constexpr(2):
                         out = _mma(_v_tile(buf, vh, step), p[step], out)
                     updated.append(out)
-                new_sum = fx.Float32(
-                    llvm.inline_asm(
-                        T.f32,
-                        [fx.Float32(new_sum).ir_value()],
-                        "",
-                        "=v,0",
-                        has_side_effects=True,
-                    )
-                )
                 fx.rocdl.wait_asyncmark(0)
                 gpu.barrier()
                 results = yield [new_max, new_sum, *updated]
 
             denom = results[1]
-            safe_denom = arith.select(denom > zero, denom, fx.Float32(1.0))
+            safe_denom = (denom > zero).select(denom, fx.Float32(1.0))
             out_scale = (
                 fx.Float32(rcp_f32(safe_denom)) * value_scale * fx.Float32(1.0 / 256.0)
             )
@@ -439,7 +365,7 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                         base = ((seq * n_kv + kv_h) * NP + part) * 128 + row
                         div = fx.logical_divide(pout_ptr, fx.make_layout(4, 1))
                         fx.slice(div, (None, base * 32 + sub)).store(norm)
-            if const_expr(NP > 1):
+            if const_expr(NP > 1):  # noqa: SIM102 - Static NP, dynamic lane mask.
                 if half == 0:
                     base = ((seq * n_kv + kv_h) * NP + part) * 128 + row
                     pmax_ptr[base] = results[0] * fx.Float32(1.0 / LOG2E)
@@ -459,98 +385,42 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
             qi = row // 16
             qh = kv_h * 16 + row % 16
 
-            def _lds_ptr(off):
-                ptr = fx.add_offset(lds_base, fx.make_int_tuple(off))
-                ty = fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 8)
-                return fx.recast_iter(ty, ptr)
+            q_load = make_flat_loader(query_ptr, fx.BFloat16, 8, fx.UniversalCopy128b())
 
-            def _lds_read(off):
-                return fx.Vector(
-                    fx.ptr_load(
-                        _lds_ptr(off), result_type=fx.Vector.make_type(2, fx.Int32)
-                    )
-                )
-
-            def _loader(ptr, dtype, width, atom_op):
-                atom = fx.make_copy_atom(atom_op, dtype)
-                reg = fx.make_rmem_tensor(fx.make_layout(width, 1), dtype)
-                flat = fx.Tensor(
-                    fx.make_view(fx.get_iter(ptr), fx.make_layout(1 << 30, 1))
-                )
-                div = fx.logical_divide(flat, fx.make_layout(1, 1))
-
-                def load(offset):
-                    fx.copy(atom, fx.slice(div, (None, offset)), reg)
-                    return fx.Vector(fx.memref_load_vec(reg))
-
-                return load
-
-            q_load = _loader(query_ptr, fx.BFloat16, 8, fx.UniversalCopy128b())
-
-            def _page_resource(ptr, page_offset, page_elems):
-                base = fx.add_offset(fx.get_iter(ptr), fx.make_int_tuple(page_offset))
-                view = fx.make_view(base, fx.make_layout(page_elems, 1))
-                tensor = fx.rocdl.make_buffer_tensor(
-                    view, num_records_bytes=fx.Int64(page_elems).ir_value()
-                )
-                return fx.rocdl.get_buffer_rsrc(fx.get_iter(tensor))
-
-            def _dma(src_rsrc, source_offset, lds_wave_offset):
-                # m0 is the wave base; the async instruction adds lane * 16 bytes.
-                lds_addr = fx.Int32(fx.ptrtoint(lds_base)) + lds_wave_offset
-                uniform_addr = fx.rocdl.readfirstlane(T.i32, lds_addr)
-                dst = create_llvm_ptr(fx.Int32(uniform_addr), 3)
-                # The copy atom has no cache-policy field. Keep NT at this boundary;
-                # unlike the atom's element offsets, raw DMA offsets are bytes.
-                fx.rocdl.raw_ptr_buffer_load_async_lds(
-                    src_rsrc,
-                    dst,
-                    fx.Int32(16).ir_value(),
-                    source_offset.ir_value(),
-                    fx.Int32(0).ir_value(),
-                    fx.Int32(0).ir_value(),
-                    aux=ir.IntegerAttr.get(T.i32, 2),  # CDNA4 non-temporal bit.
-                )
-
-            tables = buffer_ops.create_buffer_resource(
+            tables = fx.rocdl.make_buffer_tensor(
                 tables_ptr,
                 max_size=False,
-                num_records_bytes=fx.Index(gpu.grid_dim.x) * fx.Index(max_blocks) * 4,
+                num_records_bytes=fx.Int64(gpu.grid_dim.x) * fx.Int64(max_blocks) * 4,
             )
-            lengths = buffer_ops.create_buffer_resource(lengths_ptr, max_size=True)
-            context = fx.Int32(
-                buffer_ops.buffer_load(lengths, seq, vec_width=1, is_scalar=True)
-            )
-            ks = buffer_ops.create_buffer_resource(key_scale_ptr, max_size=True)
-            vs = buffer_ops.create_buffer_resource(value_scale_ptr, max_size=True)
-            key_scale = fx.Int32(
-                buffer_ops.buffer_load(ks, fx.Int32(0), vec_width=1, is_scalar=True)
-            ).bitcast(fx.Float32)
-            value_scale = fx.Int32(
-                buffer_ops.buffer_load(vs, fx.Int32(0), vec_width=1, is_scalar=True)
-            ).bitcast(fx.Float32)
+            lengths = fx.rocdl.make_buffer_tensor(lengths_ptr, max_size=True)
+            context = fx.Int32(buf_scalar_load(lengths, seq))
+            ks = fx.rocdl.make_buffer_tensor(key_scale_ptr, max_size=True)
+            vs = fx.rocdl.make_buffer_tensor(value_scale_ptr, max_size=True)
+            key_scale = fx.Int32(buf_scalar_load(ks, fx.Int32(0))).bitcast(fx.Float32)
+            value_scale = fx.Int32(buf_scalar_load(vs, fx.Int32(0))).bitcast(fx.Float32)
 
             def _page(tt):
                 return fx.Int64(
-                    fx.Int32(
-                        buffer_ops.buffer_load(
-                            tables, seq * max_blocks + tt, vec_width=1, is_scalar=True
-                        )
-                    )
+                    fx.Int32(buf_scalar_load(tables, seq * max_blocks + tt))
                 )
 
             def _stage_kv(tt, buf):
                 page = _page(tt)
                 # Rebase each bounded descriptor at a 64-bit physical-page address.
-                k_src = _page_resource(key_ptr, (page * n_kv + kv_h) * (D * 64), D * 64)
-                v_src = _page_resource(value_ptr, (page * n_kv + kv_h) * 8192, 8192)
+                k_src = page_resource(key_ptr, (page * n_kv + kv_h) * (D * 64), D * 64)
+                v_src = page_resource(value_ptr, (page * n_kv + kv_h) * 8192, 8192)
                 for u in range_constexpr(D // 64):
                     local = tid * 16 + u * 4096
-                    _dma(k_src, local, buf * BKV_BYTES + wave * 1024 + u * 4096)
+                    async_load_lds_nt(
+                        k_src, local, lds_base, buf * BKV_BYTES + wave * 1024 + u * 4096
+                    )
                 for u in range_constexpr(2):
                     local = tid * 16 + u * 4096
-                    _dma(
-                        v_src, local, buf * BKV_BYTES + D * 64 + wave * 1024 + u * 4096
+                    async_load_lds_nt(
+                        v_src,
+                        local,
+                        lds_base,
+                        buf * BKV_BYTES + D * 64 + wave * 1024 + u * 4096,
                     )
                 fx.rocdl.asyncmark()
 
@@ -571,7 +441,7 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
 
             def _k_ops(buf, nt, kg):
                 off = buf * BKV_BYTES + (kg * 64 + nt * 32 + col) * 16 + half * 8
-                return _decode(_lds_read(off))
+                return _decode(load_lds_words(lds_base, off, words=2))
 
             def _v_tile(buf, vh, step):
                 off = (
@@ -580,23 +450,7 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                     + (step * 128 + vh * 32 + col) * 16
                     + half * 8
                 )
-                return _decode(_lds_read(off))
-
-            def _swap_pair(a, b):
-                # Return [a.low, b.low] and [a.high, b.high] across the wave halves.
-                # The intrinsic returns an LLVM pair, unpacked only at this boundary.
-                pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-                pair = fx.rocdl.permlane32_swap(
-                    pair_ty, a.ir_value(), b.ir_value(), False, False
-                )
-                return fx.Int32(llvm.extractvalue(T.i32, pair, [0])), fx.Int32(
-                    llvm.extractvalue(T.i32, pair, [1])
-                )
-
-            def _reduce_pair(value):
-                bits = fx.Float32(value).bitcast(fx.Int32)
-                low, high = _swap_pair(bits, bits)
-                return low.bitcast(fx.Float32), high.bitcast(fx.Float32)
+                return _decode(load_lds_words(lds_base, off, words=2))
 
             def _mma(a, b, acc):
                 return fx.Vector(
@@ -657,10 +511,10 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                 local_max = fx.maxnumf(
                     scores[0].reduce(ReductionOp.MAX), scores[1].reduce(ReductionOp.MAX)
                 )
-                max_lo, max_hi = _reduce_pair(local_max)
+                max_lo, max_hi = reduce_lane_pair(local_max)
                 tile_max = fx.maxnumf(max_lo, max_hi) * scale
                 new_max = fx.maxnumf(state[0], tile_max)
-                safe_max = arith.select(new_max > neg_inf, new_max, zero)
+                safe_max = (new_max > neg_inf).select(new_max, zero)
                 max_vec = fx.Vector.from_elements(
                     [safe_max], dtype=fx.Float32
                 ).broadcast_to(16)
@@ -679,7 +533,7 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                 local_sum = probs[0].reduce(ReductionOp.ADD) + probs[1].reduce(
                     ReductionOp.ADD
                 )
-                sum_lo, sum_hi = _reduce_pair(local_sum)
+                sum_lo, sum_hi = reduce_lane_pair(local_sum)
                 tile_sum = sum_lo + sum_hi
                 # Keep the initial previous max at -inf, including for negative logits.
                 corr = fx.Float32(exp2_amdgcn_scalar(state[0] - safe_max))
@@ -697,7 +551,7 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                     for word in range_constexpr(2):
                         a = p_words[nt][group * 2 + word]
                         b = p_words[nt][(group + 1) * 2 + word]
-                        low_word, high_word = _swap_pair(a, b)
+                        low_word, high_word = swap_lane_pair(a, b)
                         low.append(low_word)
                         high.append(high_word)
                     p.append(
@@ -715,23 +569,13 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                         _mma(v_ops[vh], p[step], updated[vh])
                         for vh in range_constexpr(4)
                     ]
-                # Keep the per-row denominator in VGPRs across the loop boundary.
-                new_sum = fx.Float32(
-                    llvm.inline_asm(
-                        T.f32,
-                        [fx.Float32(new_sum).ir_value()],
-                        "",
-                        "=v,0",
-                        has_side_effects=True,
-                    )
-                )
-                # Finish next-tile DMA and all current-tile reads before reusing LDS.
+                    # Finish next-tile DMA and all current-tile reads before reusing LDS.
                 fx.rocdl.wait_asyncmark(0)
                 gpu.barrier()
                 results = yield [new_max, new_sum, *updated]
 
             denom = results[1]
-            safe_denom = arith.select(denom > zero, denom, fx.Float32(1.0))
+            safe_denom = (denom > zero).select(denom, fx.Float32(1.0))
             out_scale = fx.Float32(rcp_f32(safe_denom)) * value_scale
             for vh in range_constexpr(4):
                 for g in range_constexpr(4):
@@ -753,20 +597,15 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
                         base = ((seq * n_kv + kv_h) * NP + part) * 128 + row
                         div = fx.logical_divide(pout_ptr, fx.make_layout(4, 1))
                         fx.slice(div, (None, base * 32 + sub)).store(norm)
-            if const_expr(NP > 1):
+            if const_expr(NP > 1):  # noqa: SIM102 - Static NP, dynamic lane mask.
                 if half == 0:
                     base = ((seq * n_kv + kv_h) * NP + part) * 128 + row
                     pmax_ptr[base] = results[0] * fx.Float32(1.0 / LOG2E)
                     psum_ptr[base] = denom
 
-        lengths_resource = buffer_ops.create_buffer_resource(lengths_ptr, max_size=True)
+        lengths_resource = fx.rocdl.make_buffer_tensor(lengths_ptr, max_size=True)
         sequence_context = fx.Int32(
-            buffer_ops.buffer_load(
-                lengths_resource,
-                fx.Int32(gpu.block_id("x")),
-                vec_width=1,
-                is_scalar=True,
-            )
+            buf_scalar_load(lengths_resource, fx.Int32(gpu.block_id("x")))
         )
         # Short contexts amplify Q/P quantization error; keep KV storage FP8.
         if sequence_context <= fx.Int32(BF16_CONTEXT_LIMIT):
@@ -794,7 +633,7 @@ def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
         stride_ks_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008 - FlyDSL ABI default.
     ):
         with CompilationContext.compile_hints(
             {"fastmath": arith.FastMathFlags.contract}

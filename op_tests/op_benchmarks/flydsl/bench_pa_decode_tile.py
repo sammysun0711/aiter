@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """Reference-checked qlen-1/4/8 PA tile benchmark (requires AITER test helpers).
 
@@ -44,6 +43,12 @@ def parse_args():
     )
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument(
+        "--backend",
+        choices=("direct", "torch"),
+        default="direct",
+        help="Measure the direct FlyDSL wrapper or registered Torch custom op",
+    )
+    parser.add_argument(
         "--context",
         type=int,
         default=16384,
@@ -86,9 +91,9 @@ def parse_args():
 
 def benchmark_case(args, dtype, qlen, qk_dim, v_dim):
     import torch
-    from aiter.test_common import run_perftest
 
     from aiter.ops.flydsl import pa_decode as tile
+    from aiter.test_common import run_perftest
     from op_tests import test_flydsl_pa_decode as test_pa
 
     original = tile.pa_decode_tile
@@ -119,7 +124,28 @@ def benchmark_case(args, dtype, qlen, qk_dim, v_dim):
     assert len(calls) == 1, "expected one reference-checked direct launch"
     pos, kw = calls[0]
     expected = kw["output"].clone()
-    fn = functools.partial(original, *pos, **kw)
+    backend = getattr(args, "backend", "direct")
+    if backend == "torch":
+        fn = functools.partial(
+            torch.ops.aiter.pa_decode_flydsl,
+            output=kw["output"],
+            query=kw["query"],
+            key_cache=kw["key_cache"],
+            value_cache=kw["value_cache"],
+            context_lengths=kw["context_lengths"],
+            block_tables=kw["block_tables"],
+            softmax_scale=kw["softmax_scale"],
+            query_length=qlen,
+            max_context_partition_num=args.parts,
+            compute_type=kw["key_cache"].dtype,
+            key_scale=kw["key_scale"],
+            value_scale=kw["value_scale"],
+            exp_sums=kw["psum"],
+            max_logits=kw["pmax"],
+            temporary_output=kw["pout"],
+        )
+    else:
+        fn = functools.partial(original, *pos, **kw)
     averages = []
     for _ in range(args.rounds):
         _, us = run_perftest(
@@ -152,6 +178,7 @@ def benchmark_case(args, dtype, qlen, qk_dim, v_dim):
     avg_us = statistics.mean(averages)
 
     return {
+        "backend": backend,
         "kv_dtype": dtype,
         "qlen": qlen,
         "qk_dim": qk_dim,
@@ -184,10 +211,10 @@ def benchmark_case(args, dtype, qlen, qk_dim, v_dim):
 def main():
     args = parse_args()
     # Keep --help and argument validation independent of GPU/runtime imports.
-    import torch
-
     import flydsl
+    import torch
     from flydsl.runtime.device import get_rocm_arch
+
     from aiter.ops.flydsl import pa_decode as tile
 
     print(

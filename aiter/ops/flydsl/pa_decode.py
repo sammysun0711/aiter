@@ -27,11 +27,16 @@ if _base_version < Version("0.3.2"):
 
 from flydsl.runtime.device import get_rocm_arch
 
-from .kernels.pa_decode_common import cdiv
-from .kernels.pa_decode_tile import compile_pa_decode_tile
+from .kernels.pa_decode_kernel import compile_pa_decode_tile
+from .kernels.pa_decode_plan import (
+    KV_COMPUTE_BLOCK as KV_COMPUTE_BLOCK,  # noqa: PLC0414 - Compatibility export.
+)
+from .kernels.pa_decode_plan import (
+    get_recommended_splits as get_recommended_splits,  # noqa: PLC0414 - Compatibility export.
+)
+from .kernels.pa_decode_plan import make_pa_decode_plan
 from .kernels.tensor_shim import _run_compiled
 
-KV_COMPUTE_BLOCK = 256
 _PA_DECODE_PS_SMALL_BLOCK_SIZES = (16, 64)
 
 
@@ -100,36 +105,6 @@ def _get_output_dtype_str(output: torch.Tensor) -> str:
         f"Unsupported output dtype for pa_decode_ps_launch reduce: {output.dtype}. "
         "Expected bf16, f16, or f32."
     )
-
-
-def get_recommended_splits(
-    num_sequences: int,
-    num_kv_heads: int,
-    split_kv_blocks: int = 1,
-    *,
-    sliding_window: int = 0,
-    context_partition_size: int = KV_COMPUTE_BLOCK,
-    query_length: int = 1,
-) -> int:
-    """Recommend ``max_context_partition_num`` for PS partitioned paths.
-
-    For sliding-window PS, this includes the old
-    ``get_sw_ps_max_context_partition_num`` token-window calculation. For
-    non-sliding PS, this mirrors ``get_recommended_splits`` in
-    ``aiter/ops/triton/gluon/pa_decode_gluon.py`` so FlyDSL callers do not need
-    to depend on aiter for the host-side split count.
-    """
-    if sliding_window > 0:
-        window_token_count = sliding_window + query_length
-        return cdiv(window_token_count - 1, context_partition_size) + 1
-
-    props = torch.cuda.get_device_properties(torch.device("cuda"))
-    # Reference uses occupancy = 2 (see `get_occupancy()` in the Gluon module).
-    occupancy = 2
-    num_sm = props.multi_processor_count * occupancy
-    denom = max(1, num_sequences * num_kv_heads * split_kv_blocks)
-    n = cdiv(num_sm, denom) * split_kv_blocks
-    return max(4, min(n, 8))
 
 
 def _validate_metadata(query, block_tables, context_lengths):
@@ -373,13 +348,23 @@ def pa_decode_tile(
             value_scale_t.dtype == torch.float32 and value_scale_t.device == dev
         ), f"value_scale tensor must be float32 on {dev}, got {value_scale_t.dtype} on {value_scale_t.device}"
 
-    if not num_partitions:
-        blocks_per_partition = KV_COMPUTE_BLOCK // block_size
-        num_partitions = get_recommended_splits(
-            num_seqs,
-            num_kv_heads,
-            split_kv_blocks=blocks_per_partition,
-        )
+    plan = make_pa_decode_plan(
+        arch=arch,
+        num_seqs=num_seqs,
+        num_kv_heads=num_kv_heads,
+        query_group_size=query_group_size,
+        query_length=query_length,
+        head_dim=head_dim,
+        value_head_dim=value_head_dim,
+        block_size=block_size,
+        query_dtype=query_dtype,
+        kv_dtype=kv_dtype,
+        per_token_kv=per_token_kv,
+        trans_v=trans_v,
+        softmax_scale=softmax_scale,
+        num_partitions=num_partitions,
+    )
+    num_partitions = plan.num_partitions
 
     supplied = (pmax, psum, pout)
     if (
@@ -403,53 +388,18 @@ def pa_decode_tile(
                 f"pa_decode_tile: {name} must be non-empty, contiguous {dtype} on {dev}"
             )
 
-    # A full-query wave-local CTA saves KV reloads, but underfills small grids.
-    if (
-        arch == "gfx950"
-        and is_bf16_kv
-        and query_dtype == "bf16"
-        and query_length == 8
-        and query_group_size == 16
-        and block_size == 64
-        and head_dim in (128, 192)
-        and value_head_dim == 128
-        and num_seqs * num_kv_heads * num_partitions >= 256
-        and (softmax_scale is None or 0.0 < softmax_scale < float("inf"))
-    ):
-        from aiter.ops.flydsl.kernels.pa_decode_bf16_wave import (
-            compile_pa_decode_bf16_wave,
-        )
+    if plan.kernel == "bf16_wave":
+        from .kernels.pa_decode_bf16_wave import compile_pa_decode_bf16_wave
 
         compiled = compile_pa_decode_bf16_wave(head_dim, num_partitions, softmax_scale)
-    elif (
-        arch == "gfx950"
-        and kv_dtype == "fp8"
-        and query_dtype == "bf16"
-        and query_length == 8
-        and query_group_size == 16
-        and block_size == 64
-        and head_dim in (128, 192)
-        and value_head_dim == 128
-        and not per_token_kv
-        and trans_v
-        and (softmax_scale is None or 0.0 < softmax_scale < float("inf"))
-    ):
-        if num_seqs * num_kv_heads * num_partitions <= 64:
-            from aiter.ops.flydsl.kernels.pa_decode_fp8_small import (
-                compile_pa_decode_fp8_small,
-            )
+    elif plan.kernel == "fp8_small":
+        from .kernels.pa_decode_fp8_small import compile_pa_decode_fp8_small
 
-            compiled = compile_pa_decode_fp8_small(
-                head_dim, num_partitions, softmax_scale
-            )
-        else:
-            from aiter.ops.flydsl.kernels.pa_decode_fp8_wave import (
-                compile_pa_decode_fp8_wave,
-            )
+        compiled = compile_pa_decode_fp8_small(head_dim, num_partitions, softmax_scale)
+    elif plan.kernel == "fp8_wave":
+        from .kernels.pa_decode_fp8_wave import compile_pa_decode_fp8_wave
 
-            compiled = compile_pa_decode_fp8_wave(
-                head_dim, num_partitions, softmax_scale
-            )
+        compiled = compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale)
     else:
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
@@ -465,7 +415,7 @@ def pa_decode_tile(
             kv_dtype=kv_dtype,
         )
     if num_partitions == 1:
-        # NP==1 writes output directly; partials unused (caller buffers ignored).
+        # NP1 writes output directly; supplied buffers serve only as dummy arguments.
         if pmax is None:
             if is_graph_capturing:
                 raise ValueError(
@@ -478,8 +428,7 @@ def pa_decode_tile(
             psum = pmax if psum is None else psum
             pout = pmax if pout is None else pout
     else:
-        total_rows = query_length * query_group_size
-        expected_scalar_shape = (num_seqs, num_kv_heads, num_partitions, total_rows)
+        expected_scalar_shape = plan.scalar_shape
         if pmax is None or psum is None or pout is None:
             if is_graph_capturing:
                 raise ValueError(
@@ -501,13 +450,9 @@ def pa_decode_tile(
             assert (
                 psum.shape == expected_scalar_shape
             ), f"psum shape {tuple(psum.shape)} != {expected_scalar_shape}"
-            assert pout.shape == (
-                *expected_scalar_shape,
-                value_head_dim,
-            ), (
-                f"pout shape {tuple(pout.shape)} != "
-                f"{(*expected_scalar_shape, value_head_dim)}"
-            )
+            assert (
+                pout.shape == plan.output_shape
+            ), f"pout shape {tuple(pout.shape)} != {plan.output_shape}"
     s = stream or torch.cuda.current_stream()
     if stream is not None:
         for tensor in (
@@ -601,7 +546,7 @@ def pa_decode_ps_launch(
     value_scale: torch.Tensor = None,
     *,
     sliding_window: int = 0,
-    metadata: dict = None,
+    metadata: dict | None = None,
     block_tables: torch.Tensor = None,  # [num_seqs, max_blocks_per_seq] i32
     max_context_partition_num: int = 0,
     exp_sums: torch.Tensor = None,
@@ -614,7 +559,10 @@ def pa_decode_ps_launch(
     ``block_tables`` is authoritative; CSR indices/indptr and ``metadata`` are
     accepted for call-site compatibility but are not read or constructed.
     """
-    if sliding_window != 0 or key_cache.shape[-2] not in (16, 64):
+    if (
+        sliding_window != 0
+        or key_cache.shape[-2] not in _PA_DECODE_PS_SMALL_BLOCK_SIZES
+    ):
         raise ValueError(
             "BF16 KV and asymmetric value dimensions currently require "
             "block_size 16 or 64 with sliding_window=0; this API is full-attention only."
@@ -645,64 +593,50 @@ def pa_decode_ps_launch(
     if max_context_partition_num <= 0:
         raise ValueError("max_context_partition_num must be positive.")
 
-    # Small physical pages use the standalone tile kernel. Dispatch before the
-    # FP8 metadata/SW setup so BF16 KV stays unscaled and asymmetric V uses the
-    # tile wrapper's value-sized workspace allocation and validation.
-    if block_size in _PA_DECODE_PS_SMALL_BLOCK_SIZES and sliding_window == 0:
-        if block_tables is None:
-            raise ValueError(
-                f"pa_decode_ps_launch: block_size={block_size} requires `block_tables` "
-                "(per-sequence physical block index table)."
-            )
-
-        tile_key_scale = key_scale
-        tile_value_scale = value_scale
-        if key_cache.dtype != torch.bfloat16:
-            tile_key_scale = _prepare_scale_tensor(
-                "key_scale",
-                key_scale,
-                device=dev,
-                is_graph_capturing=is_graph_capturing,
-            )
-            tile_value_scale = _prepare_scale_tensor(
-                "value_scale",
-                value_scale,
-                device=dev,
-                is_graph_capturing=is_graph_capturing,
-            )
-            if tile_key_scale.ndim > 1:
-                num_blocks = key_cache.shape[0]
-                tile_key_scale = tile_key_scale.reshape(
-                    num_blocks, num_kv_heads, block_size
-                )
-                tile_value_scale = tile_value_scale.reshape(
-                    num_blocks, num_kv_heads, block_size
-                )
-
-        pa_decode_tile(
-            output,
-            query,
-            key_cache,
-            value_cache,
-            block_tables,
-            context_lengths,
-            tile_key_scale,
-            tile_value_scale,
-            softmax_scale=softmax_scale,
-            stream=s,
-            num_partitions=max_context_partition_num,
-            pmax=max_logits,
-            psum=exp_sums,
-            pout=temporary_output,
+    tile_key_scale = key_scale
+    tile_value_scale = value_scale
+    if key_cache.dtype != torch.bfloat16:
+        tile_key_scale = _prepare_scale_tensor(
+            "key_scale",
+            key_scale,
+            device=dev,
+            is_graph_capturing=is_graph_capturing,
         )
-        return "ps_small_block"
+        tile_value_scale = _prepare_scale_tensor(
+            "value_scale",
+            value_scale,
+            device=dev,
+            is_graph_capturing=is_graph_capturing,
+        )
+        if tile_key_scale.ndim > 1:
+            num_blocks = key_cache.shape[0]
+            tile_key_scale = tile_key_scale.reshape(
+                num_blocks, num_kv_heads, block_size
+            )
+            tile_value_scale = tile_value_scale.reshape(
+                num_blocks, num_kv_heads, block_size
+            )
 
-    raise ValueError(
-        "pa_decode_ps_launch requires full attention with page size 16 or 64"
+    pa_decode_tile(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        tile_key_scale,
+        tile_value_scale,
+        softmax_scale=softmax_scale,
+        stream=s,
+        num_partitions=max_context_partition_num,
+        pmax=max_logits,
+        psum=exp_sums,
+        pout=temporary_output,
     )
+    return "ps_small_block"
 
 
 flydsl_pa_decode_tile = pa_decode_tile
 flydsl_pa_decode_ps = pa_decode_ps_launch
 
-__all__ = ["flydsl_pa_decode_tile", "flydsl_pa_decode_ps"]
+__all__ = ["flydsl_pa_decode_ps", "flydsl_pa_decode_tile"]

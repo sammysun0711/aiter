@@ -24,6 +24,100 @@ from ..jit.utils.chip_info import get_cu_num, get_gfx
 
 MD_NAME = "module_attention"
 
+
+def pa_decode_flydsl(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    context_lengths: torch.Tensor,
+    block_tables: torch.Tensor,
+    softmax_scale: float,
+    query_length: int,
+    max_context_partition_num: int,
+    context_partition_size: int = 256,
+    compute_type: torch.dtype = torch.bfloat16,
+    query_scale: torch.Tensor | None = None,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
+    exp_sums: torch.Tensor | None = None,
+    max_logits: torch.Tensor | None = None,
+    temporary_output: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    ps: bool = True,
+    sinks: torch.Tensor | None = None,
+    sliding_window: int = 0,
+) -> None:
+    """Static FlyDSL PA decode, using the PR #4332 compatibility argument order.
+
+    BF16 KV is unscaled; FP8 KV requires float32 key/value scales.
+    `compute_type` names the KV dtype. Set the split count explicitly for
+    preallocated workspaces; zero retains automatic selection capped at eight.
+    `ps` is accepted for compatibility. Dynamic worklists, sinks, ALiBi and
+    sliding-window attention are not implemented by this entrypoint.
+    """
+    del ps
+    if context_partition_size != 256:
+        raise ValueError("pa_decode_flydsl requires context_partition_size=256")
+    if query_scale is not None:
+        raise ValueError("pa_decode_flydsl requires unscaled BF16/FP16 queries")
+    if alibi_slopes is not None or sinks is not None or sliding_window not in (-1, 0):
+        raise ValueError(
+            "pa_decode_flydsl supports full attention without ALiBi or sinks"
+        )
+    if query.device.type != "cuda":
+        raise ValueError("pa_decode_flydsl requires CUDA/HIP tensors")
+    if query.ndim != 3 or context_lengths.ndim != 1 or query_length < 1:
+        raise ValueError(
+            "pa_decode_flydsl requires 3D queries, 1D lengths and positive query_length"
+        )
+    if query.shape[0] != context_lengths.shape[0] * query_length:
+        raise ValueError("query_length does not match the packed query rows")
+    if compute_type != key_cache.dtype:
+        raise ValueError("compute_type must match the KV cache dtype")
+    if key_scale is not None and key_scale.ndim == 4:
+        if key_scale.shape[-1] != 1:
+            raise ValueError("key_scale must have a trailing singleton dimension")
+        key_scale = key_scale.squeeze(-1)
+    if value_scale is not None and value_scale.ndim == 4:
+        if value_scale.shape[-1] != 1:
+            raise ValueError("value_scale must have a trailing singleton dimension")
+        value_scale = value_scale.squeeze(-1)
+
+    # Load the decode backend when invoked, not during operator registration.
+    from aiter.ops.flydsl.pa_decode import pa_decode_tile
+
+    with torch.cuda.device(query.device):
+        pa_decode_tile(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            key_scale,
+            value_scale,
+            softmax_scale,
+            num_partitions=max_context_partition_num,
+            pmax=max_logits,
+            psum=exp_sums,
+            pout=temporary_output,
+        )
+
+
+def _pa_decode_flydsl_fake(*args, **kwargs) -> None:
+    # In-place outputs/workspaces are caller-owned; tracing requires no allocation.
+    return None
+
+
+direct_register_custom_op(
+    "pa_decode_flydsl",
+    pa_decode_flydsl,
+    ["output", "exp_sums", "max_logits", "temporary_output"],
+    fake_impl=_pa_decode_flydsl_fake,
+)
+
+
 direct_register_custom_op(
     "pa_decode_gluon",
     pa_decode_gluon,
