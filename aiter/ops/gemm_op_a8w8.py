@@ -4,12 +4,14 @@
 import functools
 
 import pandas as pd
+import pyhip
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch.library import Library
 
 from aiter import logger
+from pyhip.contrib.gemm_fp8 import gemm_8wave_fp8bf16fp16
 
 from ..jit.core import (
     AITER_CONFIGS,
@@ -836,7 +838,30 @@ def gemm_a8w8_blockscale(
             libtype = config["libtype"]
             splitK = int(config.get("splitK", 0))
             kernelName = str(config.get("kernelName", ""))
-            if libtype == "ck":
+            if libtype == "pyhip" and kernelName == "gemm_8wave_fp8bf16fp16":
+                wg_m, wg_n = 256, 256
+                num_block_m = pyhip.div_up(m, wg_m)
+                num_block_n = pyhip.div_up(n, wg_n)
+                x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+                gemm_8wave_fp8bf16fp16(
+                    [num_block_n * num_block_m],
+                    [64 * 8],
+                    "fp8",
+                    False,
+                    True,
+                    wg_m,
+                    wg_n,
+                    n,
+                    k,
+                    XQ.data_ptr(),
+                    WQ.data_ptr(),
+                    Y.data_ptr(),
+                    x_scale_t.data_ptr(),
+                    w_scale.data_ptr(),
+                    m,
+                )
+                return Y
+            elif libtype == "ck":
                 return gemm_a8w8_blockscale_ck(
                     XQ,
                     WQ,
@@ -930,6 +955,41 @@ def gemm_a8w8_blockscale_bpreshuffle(
         Y = out
     else:
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
+    # MiMo's tuned PyHIP rows use the same preshuffled B and column-major
+    # activation-scale layouts as this public API. Consult the standard table
+    # first so those exact shapes do not get hidden by the CK-only preshuffle
+    # table.
+    pyhip_config = get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+    )
+    if (
+        pyhip_config is not None
+        and pyhip_config["libtype"] == "pyhip"
+        and str(pyhip_config.get("kernelName", ""))
+        == "gemm_8wave_fp8bf16fp16"
+    ):
+        wg_m, wg_n = 256, 256
+        num_block_m = pyhip.div_up(m, wg_m)
+        num_block_n = pyhip.div_up(n, wg_n)
+        gemm_8wave_fp8bf16fp16(
+            [num_block_n * num_block_m],
+            [64 * 8],
+            "fp8",
+            True,
+            True,
+            wg_m,
+            wg_n,
+            n,
+            k,
+            XQ.data_ptr(),
+            WQ.data_ptr(),
+            Y.data_ptr(),
+            x_scale.data_ptr(),
+            w_scale.data_ptr(),
+            m,
+        )
+        return Y
 
     use_gfx1250_flydsl_or_triton_mxfp8_128 = (
         get_gfx() == "gfx1250"

@@ -50,6 +50,10 @@ from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
+from pyhip.contrib.moe_gemm_8wave import (
+    moe_gemm_8wave_down,
+    moe_gemm_8wave_g1u1,
+)
 
 
 @functools.lru_cache(maxsize=1)
@@ -782,6 +786,7 @@ def fused_moe(
     w1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, model_dim]
+    a1_scale_is_transposed: bool = False,
     a2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M=None,
@@ -804,12 +809,12 @@ def fused_moe(
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
     stage2_scatter: Stage2ScatterContext | None = None,
+    ep_has_fake_route: bool = True,
+    opus_stage2_output_dtype: str = "auto",
     # Optional [M, model_dim] destination for the result, to save the caller a
     # copy. Must be contiguous, match shape/dtype/device and not overlap
     # hidden_states, or the call raises; when given it is what gets returned.
     output: torch.Tensor | None = None,
-    ep_has_fake_route: bool = True,
-    opus_stage2_output_dtype: str = "auto",
 ):
     opus_stage2_output_dtype = _normalize_opus_stage2_output_dtype(
         opus_stage2_output_dtype
@@ -875,6 +880,7 @@ def fused_moe(
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
+        a1_scale_is_transposed=a1_scale_is_transposed,
         a2_scale=a2_scale,
         block_size_M=block_size_M,
         num_local_tokens=num_local_tokens,
@@ -920,6 +926,7 @@ def fused_moe_fake(
     w1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, model_dim]
+    a1_scale_is_transposed: bool = False,
     a2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M: int = -1,
@@ -940,9 +947,9 @@ def fused_moe_fake(
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
-    output: torch.Tensor | None = None,
     ep_has_fake_route: bool = True,
     opus_stage2_output_dtype: str = "auto",
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -979,6 +986,7 @@ def fused_moe_(
     w1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, model_dim]
+    a1_scale_is_transposed: bool = False,
     a2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M: int = -1,
@@ -999,9 +1007,9 @@ def fused_moe_(
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
-    output: torch.Tensor | None = None,
     ep_has_fake_route: bool = True,
     opus_stage2_output_dtype: str = "auto",
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1026,6 +1034,7 @@ def fused_moe_(
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
+        a1_scale_is_transposed=a1_scale_is_transposed,
         a2_scale=a2_scale,
         block_size_M=block_size_M,
         num_local_tokens=num_local_tokens,
@@ -1059,6 +1068,7 @@ def _fused_moe_impl(
     w1_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
     a1_scale: torch.Tensor | None = None,
+    a1_scale_is_transposed: bool = False,
     a2_scale: torch.Tensor | None = None,
     block_size_M: int = -1,
     num_local_tokens: torch.Tensor | None = None,
@@ -1073,9 +1083,9 @@ def _fused_moe_impl(
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
-    output: torch.Tensor | None = None,
     ep_has_fake_route: bool = True,
     opus_stage2_output_dtype: str = "auto",
+    output: torch.Tensor | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1446,6 +1456,7 @@ def _fused_moe_impl(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
+            a1_scale_is_transposed=a1_scale_is_transposed,
             a2_scale=a2_scale,
             num_local_tokens=num_local_tokens,
             M=M,
@@ -1476,6 +1487,7 @@ def _fused_moe_impl(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
+            a1_scale_is_transposed=a1_scale_is_transposed,
             a2_scale=a2_scale,
             num_local_tokens=num_local_tokens,
             # following for cktile support
@@ -1531,6 +1543,7 @@ def fused_moe_1stage(
     w1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
+    a1_scale_is_transposed=False,
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: torch.Tensor | None = None,
     M: int | None = None,
@@ -1584,7 +1597,7 @@ def fused_moe_1stage(
         else:
             quant_func = get_quant(quant_type)
             if hidden_states.dtype != q_dtype_a:
-                if quant_type == QuantType.per_1x128:
+                if quant_type == QuantType.per_1x128 and not a1_scale_is_transposed:
                     quant_func = functools.partial(quant_func, transpose_scale=True)
                 a1, a1_scale = quant_func(
                     hidden_states,
@@ -1598,11 +1611,20 @@ def fused_moe_1stage(
                 ), "a1_scale must be provided for quantized input for fused_moe"
                 a1 = hidden_states
                 if quant_type == QuantType.per_1x128:
-                    scale_t = torch.empty_like(a1_scale)
-                    aiter.partial_transpose(
-                        scale_t, a1_scale, num_rows=num_local_tokens
-                    )
-                    a1_scale = scale_t
+                    if num_local_tokens is None:
+                        scale_shape = a1_scale.shape
+                        a1_scale = (
+                            a1_scale.view(-1, scale_shape[-1])
+                            .transpose(0, 1)
+                            .contiguous()
+                            .view(scale_shape)
+                        )
+                    else:
+                        scale_t = torch.empty_like(a1_scale)
+                        aiter.partial_transpose(
+                            scale_t, a1_scale, num_rows=num_local_tokens
+                        )
+                        a1_scale = scale_t
 
         token_num = hidden_states.shape[0]
         E, model_dim, _inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -1781,7 +1803,7 @@ def nextPow2(n):
     return 1 << (n - 1).bit_length()
 
 
-_PADDED_M_TIERS = [32768, 131072]
+_PADDED_M_TIERS = [32768, 65536, 131072]
 
 
 def get_padded_M(M):
@@ -3238,6 +3260,120 @@ def get_2stage_cfgs(
             flat=cfg_flat,
             **route_bucket_metadata,
         )
+    if isinstance(kernelName1, str) and kernelName1.startswith("pyhip_"):
+        wg_m, wg_n = 256, 256
+        if int(block_m) != wg_m:
+            raise ValueError(
+                f"PyHIP MiMo MoE requires block_m={wg_m}, got {block_m}"
+            )
+
+        def stage1_func(
+            a1,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            a2,
+            topk,
+            block_m,
+            a1_scale,
+            w1_scale,
+            sorted_weights,
+            **_extra_stage1_args,
+        ):
+            token_num = a1.shape[0]
+            num_oc_blocks = inter_dim * 2 // wg_n
+            num_e_blocks = sorted_expert_ids.shape[0]
+            w1_is_shuffled = getattr(w1, "is_shuffled", False)
+            if not w1_is_shuffled:
+                raise ValueError("PyHIP MiMo MoE stage 1 requires shuffled W1")
+            moe_gemm_8wave_g1u1(
+                [num_oc_blocks * num_e_blocks],
+                [8 * 64],
+                a1.element_size() * a1.numel() > (1 << 32),
+                "fp8",
+                wg_m,
+                wg_n,
+                expert,
+                inter_dim * 2,
+                model_dim,
+                True,
+                w1_is_shuffled,
+                topk,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                w1,
+                w1_scale,
+                a1,
+                a1_scale,
+                a2,
+                token_num,
+                num_oc_blocks * num_e_blocks,
+            )
+            return a2
+
+        def stage2_func(
+            a2,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_out,
+            topk,
+            w2_scale,
+            a2_scale,
+            block_m,
+            sorted_weights,
+            **_extra_stage2_args,
+        ):
+            token_num = a2.shape[0]
+            num_e_blocks = sorted_expert_ids.shape[0]
+            w2_is_shuffled = getattr(w2, "is_shuffled", False)
+            if not w2_is_shuffled:
+                raise ValueError("PyHIP MiMo MoE stage 2 requires shuffled W2")
+            stage2_out = torch.empty(
+                (token_num, topk, model_dim),
+                dtype=torch.bfloat16,
+                device=a2.device,
+            )
+            moe_gemm_8wave_down(
+                [1, num_e_blocks],
+                [8 * 64],
+                stage2_out.element_size() * stage2_out.numel() > (1 << 32),
+                "fp8",
+                wg_m,
+                64,
+                expert,
+                model_dim,
+                inter_dim,
+                False,
+                w2_is_shuffled,
+                topk,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                w2,
+                w2_scale,
+                a2,
+                a2_scale,
+                stage2_out,
+                token_num,
+            )
+            torch.sum(stage2_out, dim=1, out=moe_out)
+            return moe_out
+
+        # Preserve the metadata attributes used by the generic two-stage path.
+        stage1_func.func = None
+        stage1_func.transpose_quant = True
+        stage2_func.func = None
+        stage2_func.transpose_quant = True
+        return MOEMetadata(stage1_func, stage2_func, int(block_m), int(ksplit))
+
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
     is_flydsl2 = isinstance(kernelName2, str) and kernelName2.startswith("flydsl_")
     is_flydsl2_layout = isinstance(kernelName2, str) and kernelName2.startswith(
@@ -3731,6 +3867,7 @@ def fused_moe_2stages(
     w1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
+    a1_scale_is_transposed=False,
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: torch.Tensor | None = None,
     # following for cktile support
@@ -3807,6 +3944,13 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
+    stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+    stage1_uses_transposed_scale = quant_type == QuantType.per_1x128 and (
+        stage1_func is asm_stage1
+        or getattr(metadata.stage1, "transpose_quant", False)
+    )
+    if stage1_uses_transposed_scale:
+        quant_func = functools.partial(quant_func, transpose_scale=True)
     if (
         getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
         and metadata.output_aux == AUX_SORT_OPUS
@@ -3908,8 +4052,6 @@ def fused_moe_2stages(
                 num_experts_upper_bound=routing_num_experts,
             )
     elif hidden_states.dtype != q_dtype_a:
-        if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
-            quant_func = functools.partial(quant_func, transpose_scale=True)
         a1, a1_scale = quant_func(
             hidden_states,
             scale=a1_scale,
@@ -3921,6 +4063,35 @@ def fused_moe_2stages(
             a1_scale is not None or quant_type == QuantType.No
         ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
+        if (
+            quant_type == QuantType.per_1x128
+            and stage1_uses_transposed_scale
+            and not a1_scale_is_transposed
+        ):
+            if num_local_tokens is None:
+                scale_shape = a1_scale.shape
+                a1_scale = (
+                    a1_scale.view(-1, scale_shape[-1])
+                    .transpose(0, 1)
+                    .contiguous()
+                    .view(scale_shape)
+                )
+            else:
+                scale_t = torch.empty_like(a1_scale)
+                aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
+                a1_scale = scale_t
+        elif (
+            quant_type == QuantType.per_1x128
+            and a1_scale_is_transposed
+            and not stage1_uses_transposed_scale
+        ):
+            scale_shape = a1_scale.shape
+            a1_scale = (
+                a1_scale.view(-1, token_num)
+                .transpose(0, 1)
+                .contiguous()
+                .view(scale_shape)
+            )
     # a16w4 (bf16 A x mxfp4 W) SiTUv2: stage1 allocates its own sorted
     # [sorted_size, inter_dim] bf16 intermediate and ignores this `out` buffer, so
     # skip the throwaway (token_num, topk, inter_dim) alloc (up to ~tens of MB at
@@ -3992,8 +4163,8 @@ def fused_moe_2stages(
         extra_stage1_args["situ_linear_beta"] = (
             25.0 if linear_beta is None else float(linear_beta)
         )
-    # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
-    # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
+    # EP: forward routing metadata so FlyDSL stage2 can use the routed-only
+    # atomic address bound or, in explicit reduce mode, fuse the validity gather.
     if (
         stage2_func
         in (
@@ -4014,7 +4185,9 @@ def fused_moe_2stages(
             )
         )
         if uses_flydsl_v2_stage2:
-            extra_stage2_args["topk_weights"] = topk_weights
+            extra_stage2_args["topk_weights"] = (
+                topk_weights.to(torch.float32).contiguous()
+            )
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
