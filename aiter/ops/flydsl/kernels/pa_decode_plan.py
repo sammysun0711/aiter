@@ -1,249 +1,124 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 FlyDSL Project Contributors
 
-"""GPU work planning for FlyDSL paged attention with mixed context lengths."""
+"""Static launch planning for FlyDSL PA decode.
 
+Unlike PR #4332's dynamic GPU worklists, this plan has no device metadata
+and does not read context lengths. It preserves the validated split policy,
+kernel selection and normalized-partial layout. Dynamic scheduling is deferred.
+"""
+
+import functools
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
-import triton
-import triton.language as tl
 
-from .pa_decode_reduce import MAX_CONTEXT_PARTITIONS
+KV_COMPUTE_BLOCK = 256
 
 
-def _work_granularity_partitions(context_length: int, query_length: int) -> int:
-    """Choose an MTP partition floor targeting about 256 tile-query pairs."""
-    if query_length == 1:
-        return 1
-    tiles = (context_length + 255) // 256
-    count = max(1, (tiles * query_length + 255) // 256)
-    return min(MAX_CONTEXT_PARTITIONS, 1 << (count - 1).bit_length())
-
-
-@triton.jit
-def _plan_pa_decode(
-    lengths,
-    work,
-    reduce_info,
-    B: tl.constexpr,
-    CAPACITY: tl.constexpr,
-    MAX_PARTS: tl.constexpr,
-    SLIDING_WINDOW: tl.constexpr,
-    QUERY_LENGTH: tl.constexpr,
-    BLOCK_B: tl.constexpr,
-    BLOCK_P: tl.constexpr,
-):
-    seq = tl.program_id(0)
-    b = tl.arange(0, BLOCK_B)
-    ctx = tl.maximum(tl.load(lengths + b, b < B, other=0), 0).to(tl.int64)
-    first_tile = tl.full((BLOCK_B,), 0, tl.int64)
-    if SLIDING_WINDOW > 0:
-        # Fused MTP queries have different left edges. Schedule their union,
-        # rounding down to an absolute tile so page/scaling offsets stay valid.
-        first_tile = tl.maximum(ctx - (QUERY_LENGTH - 1) - SLIDING_WINDOW, 0) // 256
-    tiles = tl.where(b < B, (ctx + 255) // 256 - first_tile, 0)
-    nonempty = (tiles > 0).to(tl.int32)
-    total = tl.maximum(tl.sum(tiles, 0), 1)
-    remaining = CAPACITY - tl.sum(nonempty, 0)
-    cumulative = tl.cumsum(tiles, 0)
-    # Integer prefix apportionment telescopes to the budget, even when the
-    # lengths differ by orders of magnitude. Each nonempty request gets one
-    # task first; clamp extras to useful tiles and the reducer's per-row limit.
-    upper = cumulative * remaining // total
-    lower = (cumulative - tiles) * remaining // total
-    counts = tl.minimum(tl.minimum(nonempty + upper - lower, tiles), MAX_PARTS)
-    count = tl.sum(tl.where(b == seq, counts, 0), 0).to(tl.int32)
-    start = tl.sum(tl.where(b < seq, counts, 0), 0).to(tl.int32)
-    seq_ctx = tl.load(lengths + seq)
-    seq_length = tl.maximum(seq_ctx, 0).to(tl.int64)
-    seq_first_tile = tl.full((), 0, tl.int64)
-    if SLIDING_WINDOW > 0:
-        seq_first_tile = (
-            tl.maximum(seq_length - (QUERY_LENGTH - 1) - SLIDING_WINDOW, 0) // 256
-        )
-    seq_tiles = (seq_length + 255) // 256 - seq_first_tile
-    total_tasks = tl.sum(counts, 0).to(tl.int32)
-    tl.store(reduce_info + seq * 2, start)
-    tl.store(reduce_info + seq * 2 + 1, count)
-
-    part = tl.arange(0, BLOCK_P)
-    active = part < count
-    begin = seq_first_tile + part.to(tl.int64) * seq_tiles // tl.maximum(count, 1)
-    end = seq_first_tile + (part.to(tl.int64) + 1) * seq_tiles // tl.maximum(count, 1)
-    slot = start + part
-    tl.store(work + slot * 4, seq, active)
-    tl.store(work + slot * 4 + 1, begin, active)
-    tl.store(work + slot * 4 + 2, end, active)
-    tl.store(work + slot * 4 + 3, seq_ctx, active)
-
-    # The launch capacity is static for graph capture. Clear every padded work
-    # record so the attention kernel can skip it without touching stale scratch.
-    # These stores and the active stores are disjoint, including when every
-    # context is empty.
-    pad = seq * BLOCK_P + part
-    padding = (pad >= total_tasks) & (pad < CAPACITY)
-    for field in tl.static_range(4):
-        tl.store(work + pad * 4 + field, 0, padding)
+def get_recommended_splits(
+    num_sequences: int,
+    num_kv_heads: int,
+    split_kv_blocks: int = 1,
+    *,
+    sliding_window: int = 0,
+    context_partition_size: int = KV_COMPUTE_BLOCK,
+    query_length: int = 1,
+) -> int:
+    """Preserve the existing Gluon split heuristic and upper clamp of eight."""
+    if sliding_window > 0:
+        window_token_count = sliding_window + query_length
+        return -(-(window_token_count - 1) // context_partition_size) + 1
+    properties = torch.cuda.get_device_properties(torch.device("cuda"))
+    capacity = properties.multi_processor_count * 2
+    denominator = max(1, num_sequences * num_kv_heads * split_kv_blocks)
+    partitions = -(-capacity // denominator) * split_kv_blocks
+    return max(4, min(partitions, 8))
 
 
 @dataclass(frozen=True)
 class PADecodePlan:
-    """Reusable GPU metadata; refresh it whenever context lengths change.
+    """Host-only static launch selection; no GPU worklist or packed scratch."""
 
-    ``work_info`` is [capacity, 4]: sequence, first/last absolute 256-token tile,
-    original context length. Sliding windows cover the union of MTP queries.
-    ``reduce_info`` is [batch, 2]: first packed task, actual task count.
-    Scratch uses [KV heads, capacity, query rows (, head dim)].
-    """
-
-    work_info: torch.Tensor
-    reduce_info: torch.Tensor
-    num_kv_heads: int
-    max_partitions: int
-    sliding_window: int = 0
-    query_length: int = 1
-
-    @property
-    def capacity(self) -> int:
-        return self.work_info.shape[0]
-
-    @property
-    def num_partitions(self) -> torch.Tensor:
-        """GPU view of per-request counts, updated in place by plan refresh."""
-        return self.reduce_info[:, 1]
-
-    def validate(self, batch_size: int, num_kv_heads: int, device: torch.device):
-        if self.num_kv_heads != num_kv_heads:
-            raise ValueError("plan KV head count does not match the cache")
-        if not 1 <= self.max_partitions <= MAX_CONTEXT_PARTITIONS:
-            raise ValueError("invalid plan max_partitions")
-        if self.sliding_window < 0 or self.query_length < 1:
-            raise ValueError("invalid plan sliding_window or query_length")
-        if self.reduce_info.shape != (batch_size, 2):
-            raise ValueError("reduce_info must have shape [batch_size, 2]")
-        if self.work_info.ndim != 2 or self.work_info.shape[1] != 4:
-            raise ValueError("work_info must have shape [capacity, 4]")
-        if not batch_size <= self.capacity <= batch_size * self.max_partitions:
-            raise ValueError("plan capacity must be in [batch, batch * max_partitions]")
-        for tensor in (self.work_info, self.reduce_info):
-            if tensor.device != device or tensor.dtype != torch.int32:
-                raise ValueError("plan metadata must be int32 on the query device")
-            if not tensor.is_contiguous():
-                raise ValueError("plan metadata must be contiguous")
+    kernel: Literal["tile", "bf16_wave", "fp8_wave", "fp8_small"]
+    num_partitions: int
+    scalar_shape: tuple[int, int, int, int]
+    output_shape: tuple[int, int, int, int, int]
 
 
-def plan_pa_decode(
-    context_lengths: torch.Tensor,
-    num_kv_heads: int,
+@functools.lru_cache(maxsize=256)
+def _static_plan(
+    arch,
+    num_seqs,
+    num_kv_heads,
+    query_group_size,
+    query_length,
+    head_dim,
+    value_head_dim,
+    block_size,
+    query_dtype,
+    kv_dtype,
+    per_token_kv,
+    trans_v,
+    positive_scale,
+    num_partitions,
+):
+    wave_geometry = (
+        arch == "gfx950"
+        and query_dtype == "bf16"
+        and query_length == 8
+        and query_group_size == 16
+        and block_size == 64
+        and head_dim in (128, 192)
+        and value_head_dim == 128
+        and positive_scale
+    )
+    grid_size = num_seqs * num_kv_heads * num_partitions
+    kernel = "tile"
+    if wave_geometry and kv_dtype == "bf16" and grid_size >= 256:
+        kernel = "bf16_wave"
+    elif wave_geometry and kv_dtype == "fp8" and not per_token_kv and trans_v:
+        kernel = "fp8_small" if grid_size <= 64 else "fp8_wave"
+    shape = (num_seqs, num_kv_heads, num_partitions, query_length * query_group_size)
+    return PADecodePlan(kernel, num_partitions, shape, (*shape, value_head_dim))
+
+
+def make_pa_decode_plan(
     *,
-    max_partitions: int | None = None,
-    workgroup_budget: int | None = None,
-    sliding_window: int = 0,
-    total_context_length: int | None = None,
-    query_length: int = 1,
-    plan: PADecodePlan | None = None,
+    arch: str,
+    num_seqs: int,
+    num_kv_heads: int,
+    query_group_size: int,
+    query_length: int,
+    head_dim: int,
+    value_head_dim: int,
+    block_size: int,
+    query_dtype: str,
+    kv_dtype: str,
+    per_token_kv: bool,
+    trans_v: bool,
+    softmax_scale: float | None,
+    num_partitions: int | None,
 ) -> PADecodePlan:
-    """Build/update a plan on the current stream without GPU-to-CPU readback.
-
-    Allocate once outside graph capture, then pass ``plan=...`` to refresh the
-    same metadata in place. A refresh inherits the existing plan's partition
-    limit when ``max_partitions`` is omitted; new plans default to 256.
-    Include this refresh in end-to-end measurements.
-    The budget counts task slots over all KV heads before query splitting;
-    splitting queries can launch multiple CTAs per slot without extra scratch.
-    This is opt-in: uniform or short-context workloads may favor static splits.
-
-    A positive ``sliding_window`` counts visible tokens including the query's
-    own position; 0 and -1 disable it. Context lengths include the MTP tokens,
-    so the planned range is the union of ``query_length`` causal windows.
-    Pass the same window and (when enabled) query length to ``pa_decode`` and
-    when refreshing the plan. Dense plans remain independent of query length.
-    """
-    if not isinstance(sliding_window, int):
-        raise TypeError("sliding_window must be an int")
-    if sliding_window < -1:
-        raise ValueError("sliding_window must be -1, 0, or positive")
-    sliding_window = max(sliding_window, 0)
-    if not isinstance(query_length, int):
-        raise TypeError("query_length must be an int")
-    if query_length < 1:
-        raise ValueError("query_length must be positive")
-    if total_context_length is not None and total_context_length < 0:
-        raise ValueError("total_context_length must be non-negative")
-    if context_lengths.device.type != "cuda" or context_lengths.dtype != torch.int32:
-        raise ValueError("context_lengths must be a CUDA int32 tensor")
-    if context_lengths.ndim != 1 or not context_lengths.is_contiguous():
-        raise ValueError("context_lengths must be a contiguous vector")
-    batch = context_lengths.numel()
-    if batch < 1 or batch > 4096:
-        raise ValueError("plan supports batches in [1, 4096]")
-    if num_kv_heads < 1:
-        raise ValueError("num_kv_heads must be positive")
-    if plan is not None and not isinstance(plan, PADecodePlan):
-        raise TypeError("plan must be a PADecodePlan")
-    if max_partitions is None:
-        max_partitions = MAX_CONTEXT_PARTITIONS if plan is None else plan.max_partitions
-    if not 1 <= max_partitions <= MAX_CONTEXT_PARTITIONS:
-        raise ValueError(f"max_partitions must be in [1, {MAX_CONTEXT_PARTITIONS}]")
-    dev = context_lengths.device
-    if plan is None:
-        if workgroup_budget is None:
-            workgroup_budget = (
-                2 * torch.cuda.get_device_properties(dev).multi_processor_count
-            )
-            if total_context_length is not None:
-                average_context = (total_context_length + batch - 1) // batch
-                if sliding_window > 0:
-                    average_context = min(
-                        average_context, sliding_window + query_length - 1 + 255
-                    )
-                work_floor = _work_granularity_partitions(
-                    average_context, query_length
-                )
-                workgroup_budget = max(
-                    workgroup_budget, batch * num_kv_heads * work_floor
-                )
-        if workgroup_budget < 1:
-            raise ValueError("workgroup_budget must be positive")
-        capacity = min(
-            batch * max_partitions,
-            max(batch, (workgroup_budget + num_kv_heads - 1) // num_kv_heads),
+    """Plan validated host geometry without allocation, readback or GPU work."""
+    if not num_partitions:
+        num_partitions = get_recommended_splits(
+            num_seqs, num_kv_heads, split_kv_blocks=KV_COMPUTE_BLOCK // block_size
         )
-        plan = PADecodePlan(
-            torch.empty((capacity, 4), dtype=torch.int32, device=dev),
-            torch.empty((batch, 2), dtype=torch.int32, device=dev),
-            num_kv_heads,
-            max_partitions,
-            sliding_window,
-            query_length,
-        )
-    else:
-        if workgroup_budget is not None:
-            raise ValueError("workgroup_budget is fixed when reusing a plan")
-        if total_context_length is not None:
-            raise ValueError("total_context_length is only used when creating a plan")
-        if max_partitions != plan.max_partitions:
-            raise ValueError("max_partitions must match the reused plan")
-        if sliding_window != plan.sliding_window:
-            raise ValueError("sliding_window must match the reused plan")
-        if sliding_window > 0 and query_length != plan.query_length:
-            raise ValueError("query_length must match the reused plan")
-    plan.validate(batch, num_kv_heads, dev)
-    with torch.cuda.device(dev):
-        _plan_pa_decode[(batch,)](
-            context_lengths,
-            plan.work_info,
-            plan.reduce_info,
-            batch,
-            plan.capacity,
-            plan.max_partitions,
-            # Larger windows cover every int32 context. Dense planning is
-            # query-length independent, including its compilation cache key.
-            min(sliding_window, 2**31 - 1),
-            query_length if sliding_window > 0 else 1,
-            triton.next_power_of_2(batch),
-            triton.next_power_of_2(plan.max_partitions),
-            num_warps=4,
-        )
-    return plan
+    return _static_plan(
+        arch,
+        num_seqs,
+        num_kv_heads,
+        query_group_size,
+        query_length,
+        head_dim,
+        value_head_dim,
+        block_size,
+        query_dtype,
+        kv_dtype,
+        per_token_kv,
+        trans_v,
+        softmax_scale is None or 0.0 < softmax_scale < float("inf"),
+        num_partitions,
+    )

@@ -25,6 +25,8 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "flydsl_pa_decode_tile": (".pa_decode", "flydsl_pa_decode_tile"),
+    "flydsl_pa_decode_ps": (".pa_decode", "flydsl_pa_decode_ps"),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".kernels.mqa_logits.fp8_mqa_logits",
         "DEFAULT_VARIANT",
@@ -90,10 +92,11 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
     ),
-    "pa_decode": (".pa_decode", "pa_decode"),
 }
 
 __all__ = [
+    "flydsl_pa_decode_tile",
+    "flydsl_pa_decode_ps",
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
     "GateMode",
@@ -115,7 +118,6 @@ __all__ = [
     "flydsl_qk_norm_rope_quant",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_supported",
-    "pa_decode",
 ]
 
 

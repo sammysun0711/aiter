@@ -1,128 +1,46 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""One parametrized correctness/contract test and a CLI performance sweep.
+"""Full-reference coverage for AITER's opt-in FlyDSL PA decode API."""
 
-    python -m pytest -q op_tests/test_flydsl_pa_decode.py
-    python op_tests/test_flydsl_pa_decode.py -d bf16 -b 200 -q 4 \
-        -s 16,1,128,200000 --block-size 16 128 --trans-v 0 1 \
-        --per-token 1 --num-partitions 3 5
+import random
+import sys
+from types import SimpleNamespace
 
-Both entry points share input generation, the FP32 reference and kernel launch.
-Context lengths include the MTP query tokens. Explicit partition counts override
-automatic recommendations; the CLI times attention plus the native reducer.
-Positive sliding windows require a work plan: planned cases check numerics and
-graph replays, while static cases check rejection by the core and wrapper APIs.
-Disabled windows retain both static and planned numerical coverage.
-"""
-
-import argparse
-import importlib
-import itertools
-from dataclasses import dataclass
-from functools import partial
-
-import pandas as pd
 import pytest
 import torch
+import triton
 
-import aiter
-from aiter import dtypes, per_tensor_quant, pertoken_quant
-from aiter.jit.utils.chip_info import get_gfx_runtime
+pytest.importorskip("flydsl")
+from aiter import dtypes, per_tensor_quant
 from aiter.ops.attention import pa_decode_flydsl
-from aiter.test_common import benchmark, run_perftest
-
-try:
-    from aiter.ops.flydsl.pa_decode import (
-        MAX_CONTEXT_PARTITIONS,
-        get_recommended_splits,
-        pa_decode,
-        plan_pa_decode,
-    )
-except (ImportError, AttributeError, RuntimeError, OSError):
-    MAX_CONTEXT_PARTITIONS = 256
-    get_recommended_splits = pa_decode = plan_pa_decode = None
-
-SUPPORTED_GFX = ("gfx942", "gfx950")
-KV_COMPUTE_BLOCK = 256
-ACCURACY_TOLERANCE = 5e-3
-DEFAULT_BATCH_SIZES = [3, 81, 128]
-DEFAULT_SHAPES = [
-    (8, 1, 128, 257),
-    (4, 1, 128, 1027),
-    (8, 1, 128, 1027),
-    (8, 1, 256, 1027),
-    (16, 1, 128, 8192),
-]
-BOUNDARY_LENGTHS = (
-    0,
-    1,
-    2,
-    3,
-    4,
-    255,
-    256,
-    257,
-    258,
-    259,
-    511,
-    512,
-    513,
-    514,
-    515,
-    2303,
-    2304,
-    2305,
-    2306,
-    2307,
-    4099,
-)
+from aiter.ops.flydsl import flydsl_pa_decode_ps, flydsl_pa_decode_tile
+from aiter.ops.flydsl import pa_decode as tile
+from aiter.ops.flydsl.pa_decode import pa_decode_ps_launch as flydsl_ps_launch
 
 
-@dataclass(frozen=True)
-class DecodeCase:
-    lengths: tuple[int, ...] = BOUNDARY_LENGTHS
-    query_length: int = 4
-    num_kv_heads: int = 1
-    query_group_size: int = 16
-    head_dim: int = 128
-    block_size: int = 128
-    trans_v: bool = True
-    dtype: torch.dtype = torch.bfloat16
-    num_partitions: int | None = 7
-    per_token: bool = True
-    sliding_window: int = 0
-    sink_dtype: torch.dtype | None = None
-    max_partitions: int | None = None
-    workgroup_budget: int | None = None
-    sparse: bool = True
-    masked_scale: bool = False
-    query_splits: int | None = None
-    wide_kv_addressing: bool | None = None
+def _custom_op_kwargs(args):
+    return {
+        "output": args["output"],
+        "query": args["query"],
+        "key_cache": args["key_cache"],
+        "value_cache": args["value_cache"],
+        "context_lengths": args["context_lengths"],
+        "block_tables": args["block_tables"],
+        "softmax_scale": args.get("softmax_scale", args["query"].shape[-1] ** -0.5),
+        "query_length": args["query"].shape[0] // args["context_lengths"].shape[0],
+        "max_context_partition_num": args.get("num_partitions") or 0,
+        "compute_type": args["key_cache"].dtype,
+        "key_scale": args["key_scale"],
+        "value_scale": args["value_scale"],
+        "max_logits": args.get("pmax"),
+        "exp_sums": args.get("psum"),
+        "temporary_output": args.get("pout"),
+    }
 
 
-def _require_gpu():
-    if not torch.cuda.is_available():
-        pytest.skip("ROCm is not available")
-    if pa_decode is None:
-        pytest.skip("FlyDSL is not available")
-    if get_gfx_runtime() not in SUPPORTED_GFX:
-        pytest.skip(f"pa_decode is unsupported on {get_gfx_runtime()}")
-
-
-@pytest.fixture(autouse=True)
-def _default_cuda_device():
-    # Do not leak the default device into other files in the shared CI shard.
-    _require_gpu()
-    previous = torch.get_default_device()
-    torch.set_default_device("cuda")
-    try:
-        yield
-    finally:
-        torch.set_default_device(previous)
-
-
-def run_torch(
+def _registered_tile(
+    output,
     query,
     key_cache,
     value_cache,
@@ -130,1209 +48,2204 @@ def run_torch(
     context_lengths,
     key_scale,
     value_scale,
-    query_length=1,
-    sliding_window=0,
-    sinks=None,
+    softmax_scale=None,
+    *,
+    num_partitions=None,
+    pmax=None,
+    psum=None,
+    pout=None,
 ):
-    """Dequantized FP32 GQA reference, including empty rows and infinite sinks."""
-    batch = context_lengths.numel()
-    heads, dim = query.shape[1:]
-    kv_heads, page_size = key_cache.shape[1:3]
-    group = heads // kv_heads
-    queries = query.float().reshape(batch, query_length, kv_heads, group, dim)
-    output = torch.zeros_like(queries)
-    positions = torch.arange(query_length, device=query.device)
-
-    for seq, length in enumerate(context_lengths.cpu().tolist()):
-        if length <= 0:
-            continue
-        tokens = torch.arange(length, device=query.device)
-        pages = block_tables[seq, tokens // page_size].long()
-        offsets = tokens % page_size
-        keys = key_cache[pages, :, offsets, :].float()
-        values = value_cache[pages, :, :, offsets].float()
-        if key_scale.numel() == 1:
-            keys *= key_scale
-            values *= value_scale
-        else:
-            keys *= key_scale[pages, :, offsets, 0, None]
-            values *= value_scale[pages, :, offsets, 0, None]
-        scores = torch.einsum("qhgd,khd->qhgk", queries[seq], keys) * dim**-0.5
-        visible = length - query_length + 1 + positions
-        masked = tokens[None, :] >= visible[:, None]
-        if sliding_window > 0:
-            masked |= tokens[None, :] < (visible - sliding_window)[:, None]
-        scores.masked_fill_(masked[:, None, None, :], float("-inf"))
-        log_denominator = torch.logsumexp(scores, dim=-1, keepdim=True)
-        if sinks is not None:
-            log_denominator = torch.logaddexp(
-                log_denominator, sinks.float().reshape(1, kv_heads, group, 1)
-            )
-        # A +inf sink suppresses all finite KV logits. Fully masked rows need
-        # an explicit zero because -inf - -inf is undefined without a sink.
-        probs = torch.exp(scores - log_denominator)
-        probs.masked_fill_(visible[:, None, None, None] <= 0, 0)
-        output[seq] = torch.einsum("qhgk,khd->qhgd", probs, values)
-    return output.reshape_as(query)
-
-
-def _make_inputs(case, planned=False):
-    """Build one sparse/dense paged cache, launch arguments and reference call."""
-    torch.manual_seed(37 if case.sparse else 0)
-    batch, page, dim = len(case.lengths), case.block_size, case.head_dim
-    kv_heads, ql = case.num_kv_heads, case.query_length
-    heads = kv_heads * case.query_group_size
-    counts = [max(1, (length + page - 1) // page) for length in case.lengths]
-    num_pages = sum(counts)
-    quant_dtype = (
-        torch.float8_e4m3fn if get_gfx_runtime() == "gfx950" else torch.float8_e4m3fnuz
+    torch.ops.aiter.pa_decode_flydsl(
+        **_custom_op_kwargs(
+            {
+                "output": output,
+                "query": query,
+                "key_cache": key_cache,
+                "value_cache": value_cache,
+                "block_tables": block_tables,
+                "context_lengths": context_lengths,
+                "key_scale": key_scale,
+                "value_scale": value_scale,
+                "softmax_scale": (
+                    query.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+                ),
+                "num_partitions": num_partitions,
+                "pmax": pmax,
+                "psum": psum,
+                "pout": pout,
+            }
+        )
     )
-    query = torch.empty((batch * ql, heads, dim), dtype=case.dtype).uniform_(-0.5, 0.5)
-    if case.masked_scale:
-        query.zero_()  # Also exercise online Q quantization with zero Q scale.
-    key = torch.empty((num_pages, kv_heads, page, dim), dtype=case.dtype).uniform_(
-        -0.5, 0.5
-    )
-    value = torch.empty_like(key).uniform_(-0.5, 0.5)
-    quantize = pertoken_quant if case.per_token else per_tensor_quant
-    key_quant, key_scale = quantize(key, quant_dtype=quant_dtype)
-    value_quant, value_scale = quantize(value, quant_dtype=quant_dtype)
-    del key, value
 
-    if case.per_token and case.sparse:
-        token = torch.arange(num_pages * page).reshape(num_pages, 1, page, 1)
-        head = torch.arange(kv_heads).reshape(1, kv_heads, 1, 1)
-        key_scale *= torch.exp2(((2 * token + head) % 4 - 2).float())
-        factors = torch.exp2(((token + 2 * head) % 5 - 3).float())
-        # Exact binary ratios isolate W=1 masking from existing FP8 P rounding.
-        value_scale = (
-            factors * 2**-10 if case.sliding_window == 1 else value_scale * factors
+
+HAS_FLYDSL_PS = True
+UNIFORM_RANGE = (-1, 1)
+STR_DTYPE_TO_TORCH_DTYPE = {
+    "half": torch.half,
+    "bfloat16": torch.bfloat16,
+    "float": torch.float,
+    "fp8": torch.uint8,
+}
+_ARCH = (
+    torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    if torch.cuda.is_available()
+    else ""
+)
+_requires_tile_pa = pytest.mark.skipif(
+    _ARCH not in ("gfx942", "gfx950"),
+    reason="PA decode requires gfx942 or gfx950",
+)
+
+
+def setup_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+def get_kv_cache_torch_dtype(
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
+) -> torch.dtype:
+    if isinstance(cache_dtype, str):
+        if cache_dtype == "auto":
+            if isinstance(model_dtype, str):
+                return STR_DTYPE_TO_TORCH_DTYPE[model_dtype]
+            if isinstance(model_dtype, torch.dtype):
+                return model_dtype
+            raise ValueError(f"Invalid model dtype: {model_dtype}")
+        if cache_dtype in ["half", "bfloat16", "float"]:
+            return STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+        if cache_dtype == "fp8":
+            return torch.uint8
+        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+    if isinstance(cache_dtype, torch.dtype):
+        return cache_dtype
+    raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+
+
+def create_kv_cache(
+    num_blocks: int,
+    block_size: int,
+    num_layers: int,
+    num_heads: int,
+    head_size: int,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
+    seed: int = 0,
+    device: str | None = "cuda",
+    itemsize: int = 1,
+    value_head_size: int | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    if cache_dtype == "fp8" and head_size % 16:
+        raise ValueError(f"Does not support fp8 key cache with head_size={head_size}")
+    torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
+    elements_per_vector = 16 // itemsize
+    value_head_size = head_size if value_head_size is None else value_head_size
+    key_cache_shape = (
+        num_blocks,
+        num_heads,
+        head_size // elements_per_vector,
+        block_size,
+        elements_per_vector,
+    )
+    value_cache_shape = (num_blocks, num_heads, value_head_size, block_size)
+    key_caches: list[torch.Tensor] = []
+    value_caches: list[torch.Tensor] = []
+    setup_seed(seed)
+    for _ in range(num_layers):
+        key_cache = torch.empty(size=key_cache_shape, dtype=torch_dtype, device=device)
+        value_cache = torch.empty(
+            size=value_cache_shape, dtype=torch_dtype, device=device
+        )
+        key_cache.uniform_(*UNIFORM_RANGE)
+        value_cache.uniform_(*UNIFORM_RANGE)
+        key_caches.append(key_cache)
+        value_caches.append(value_cache)
+    return key_caches, value_caches
+
+
+def reference_masked_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    softmax_scale: float,
+    output_dtype: torch.dtype,
+    is_causal: bool = True,
+    sliding_window=0,
+) -> torch.Tensor:
+    """Reference implementation of masked attention."""
+    query = query.to(torch.float32)
+    key = key.to(torch.float32)
+    value = value.to(torch.float32)
+    num_query_heads = query.shape[1]
+    num_kv_heads = key.shape[1]
+    s_q = query.shape[0]
+    s_k = key.shape[0]
+    key = key.repeat_interleave(num_query_heads // num_kv_heads, dim=1)
+    value = value.repeat_interleave(num_query_heads // num_kv_heads, dim=1)
+
+    attention_weights = torch.einsum("qhd,khd->hqk", query, key) * softmax_scale
+
+    if is_causal:
+        query_len = query.shape[0]
+        key_len = key.shape[0]
+        attention_bias = torch.zeros(
+            query_len, key_len, dtype=torch.float32, device=query.device
+        )
+        causal_mask = torch.ones(
+            query_len, key_len, dtype=torch.bool, device=query.device
+        ).tril(diagonal=key_len - query_len)
+        attention_bias.masked_fill_(causal_mask.logical_not(), (-3.4e38))
+        attention_weights += attention_bias
+
+    # Handle position calculation for both context and generation phases
+    if s_q == s_k:
+        # Context phase: standard position calculation
+        query_positions = torch.arange(s_q, device=query.device)
+        key_positions = torch.arange(s_k, device=query.device)
+    else:
+        # Generation phase: query is at position s_k (after the cache)
+        query_positions = torch.arange(
+            s_k - s_q, s_k, device=query.device
+        )  # [s_k] for s_q=1
+        key_positions = torch.arange(s_k, device=query.device)  # [0,1,2,...,s_k-1]
+
+    # Create position difference matrix: query_pos - key_pos
+    pos_diff = query_positions.unsqueeze(1) - key_positions.unsqueeze(0)  # [s_q, s_k]
+
+    # Fallback: initialize the mask to all True, then progressively tighten with AND
+    window_mask = torch.ones_like(attention_weights, dtype=torch.bool)
+    if sliding_window > 0:
+        # Sliding window mask: allow attention only if 0 <= pos_diff < sliding_window_size
+        # sliding window size does not cover the diagonals
+        sliding_window_mask = pos_diff >= sliding_window + 1
+        window_mask &= sliding_window_mask
+
+    if sliding_window > 0:
+        attention_weights.masked_fill_(window_mask, float("-inf"))
+
+    attention_weights = torch.softmax(attention_weights, dim=-1)
+    output = torch.einsum("hqk,khd->qhd", attention_weights, value)
+    return output.to(output_dtype)
+
+
+def torch_mha_extend(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lengths: torch.Tensor,
+    query_output_indptr: torch.Tensor,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
+    sliding_window=0,
+) -> torch.Tensor:
+    """PyTorch reference implementation of paged attention."""
+    _num_blocks, num_heads, value_head_size, block_size = value_cache.shape
+    key_head_size = key_cache.shape[2] * key_cache.shape[4]
+    softmax_scale = 1.0 / (key_head_size**0.5)
+
+    output_dtype = query.dtype
+    kv_dtype = key_cache.dtype
+
+    queries_split = torch.tensor_split(query, query_output_indptr.tolist()[1:])
+    key_cache_flat = (
+        key_cache.permute(0, 3, 1, 2, 4).contiguous().view(-1, num_heads, key_head_size)
+    )
+    value_cache_flat = (
+        value_cache.permute(0, 3, 1, 2)
+        .contiguous()
+        .view(-1, num_heads, value_head_size)
+    )
+
+    batch_size = query_output_indptr.shape[0] - 1
+    outputs = []
+
+    for batch_idx in range(batch_size):
+        current_query = queries_split[batch_idx]
+        current_block_table = block_tables[batch_idx]
+        current_context_length = context_lengths[batch_idx].item()
+
+        token_indices = (
+            current_block_table.repeat_interleave(block_size)[:current_context_length]
+            * block_size
+            + torch.arange(current_context_length, device=current_block_table.device)
+            % block_size
         )
 
-    start = 0
-    for length, count in zip(case.lengths, counts):
-        end = start + count
-        if 0 < length <= 4 or (case.sink_dtype is not None and length in (257, 513)):
-            # Positive, periodic V covers short rows and makes repeated sink
-            # mass across multiple partitions observable without cancellation.
-            # Per-tensor cases keep their shared scale and use larger FP8 values.
-            token_values = (torch.arange(count * page) % 4 + 1).float()
-            token_values *= 0.25 if case.per_token else 32
-            key_quant[start:end].zero_()
-            value_quant[start:end] = token_values.reshape(count, 1, page, 1).to(
-                quant_dtype
-            )
-            if case.per_token:
-                key_scale[start:end].fill_(1)
-                value_scale[start:end].fill_(1)
-        if case.masked_scale:
-            assert case.per_token and case.sliding_window == 1
-            tokens = torch.arange(count * page)
-            visible = (tokens >= max(0, length - ql)) & (tokens < length)
-            key_quant[start:end].zero_()
-            key_scale[start:end].fill_(1)
-            value_scale[start:end] = torch.where(visible, 1.0, 1e9).reshape(
-                count, 1, page, 1
-            )
-            values = torch.where(visible, (tokens % 4 + 1).float() * 0.25, 0)
-            value_quant[start:end] = values.reshape(count, 1, page, 1).to(quant_dtype)
-        start = end
+        gathered_keys = (
+            key_cache_flat.view(torch.int8)[token_indices]
+            .view(kv_dtype)
+            .to(torch.float)
+        )
+        if key_scale is not None:
+            gathered_keys *= key_scale[:, token_indices].t().unsqueeze(-1)
 
-    selected = (
-        2 * torch.randperm(num_pages) + 1 if case.sparse else torch.arange(num_pages)
+        gathered_values = (
+            value_cache_flat.view(torch.int8)[token_indices]
+            .view(kv_dtype)
+            .to(torch.float)
+        )
+        if value_scale is not None:
+            gathered_values *= value_scale[:, token_indices].t().unsqueeze(-1)
+
+        attention_output = reference_masked_attention(
+            current_query,
+            gathered_keys,
+            gathered_values,
+            softmax_scale,
+            output_dtype,
+            is_causal=True,
+            sliding_window=sliding_window,
+        )
+        outputs.append(attention_output)
+
+    return torch.cat(outputs)
+
+
+def quantize_kv_cache_per_tensor(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    quant_dtype: torch.dtype,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    num_blocks, num_heads, _, block_size = value_cache.shape
+    key_head_dim = key_cache.shape[2] * key_cache.shape[4]
+    elements_per_vector = 16 // quant_dtype.itemsize
+    key_cache_reshaped = (
+        key_cache.permute(0, 1, 3, 2, 4)
+        .reshape(num_blocks, num_heads, block_size, -1)
+        .contiguous()
     )
-    physical_pages = 2 * num_pages + 1 if case.sparse else num_pages
-
-    def scatter(tensor):
-        if not case.sparse:
-            return tensor
-        result = torch.zeros((physical_pages, *tensor.shape[1:]), dtype=tensor.dtype)
-        result[selected] = tensor
-        return result
-
-    key_quant, value_quant = scatter(key_quant), scatter(value_quant)
-    if case.per_token:
-        key_scale, value_scale = scatter(key_scale), scatter(value_scale)
-    key_cache = (
-        key_quant.reshape(physical_pages, kv_heads, page, dim // 16, 16)
+    key_cache_reshaped = (
+        key_cache_reshaped.view(
+            num_blocks,
+            num_heads,
+            block_size,
+            key_head_dim // elements_per_vector,
+            elements_per_vector,
+        )
         .permute(0, 1, 3, 2, 4)
         .contiguous()
     )
-    value_cache = (
-        value_quant.reshape(physical_pages, kv_heads, page // 16, 16, dim)
-        .permute(0, 1, 2, 4, 3)
-        .contiguous()
-        if case.trans_v
-        else value_quant.permute(0, 1, 3, 2).contiguous()
+    quantized_keys, key_scales_original = per_tensor_quant(
+        key_cache_reshaped, quant_dtype=quant_dtype
     )
-    table = torch.zeros((batch, max(counts)), dtype=torch.int32)
-    start = 0
-    for seq, count in enumerate(counts):
-        table[seq, :count] = selected[start : start + count]
-        start += count
-    context = torch.tensor(case.lengths, dtype=torch.int32)
-    sinks = None
-    if case.sink_dtype is not None:
-        logits = [float("-inf"), float("inf"), -1000, 1000, -2, 0, 0.5, 5]
-        if case.sink_dtype == torch.float32:
-            logits += [-3e38, 3e38]
-        sinks = (
-            torch.tensor(logits, dtype=case.sink_dtype)
-            .repeat((heads + len(logits) - 1) // len(logits))[:heads]
-            .contiguous()
-        )
-        # Distinguish heads even when GQA is a multiple of the sentinel period.
-        offset = torch.arange(heads).to(case.sink_dtype) * 0.125
-        sinks = torch.where(sinks.abs() < 10, sinks + offset, sinks)
-    parts = case.num_partitions
-    if parts is None:
-        parts = get_recommended_splits(
-            batch,
-            kv_heads,
-            KV_COMPUTE_BLOCK // page,
-            case.max_partitions,
-            max_context_length=max(case.lengths),
-        )
-    plan = (
-        plan_pa_decode(
-            context,
-            kv_heads,
-            max_partitions=parts,
-            workgroup_budget=case.workgroup_budget,
-            sliding_window=case.sliding_window,
-            query_length=ql if case.sliding_window > 0 else 1,
-        )
-        if planned
-        else None
+    quantized_values, value_scales_original = per_tensor_quant(
+        value_cache, quant_dtype=quant_dtype
     )
-    rows = ql * case.query_group_size
-    shape = (
-        (kv_heads, plan.capacity, rows) if planned else (batch, kv_heads, parts, rows)
+    key_scales_flat = key_scales_original.expand(num_heads, num_blocks * block_size)
+    value_scales_flat = value_scales_original.expand(num_heads, num_blocks * block_size)
+    return (
+        quantized_keys,
+        key_scales_flat,
+        quantized_values,
+        value_scales_flat,
+        key_scales_original,
+        value_scales_original,
     )
-    psum = torch.full(shape, float("nan"), dtype=torch.float32)
-    pmax = torch.full_like(psum, float("nan"))
-    pout = torch.full((*shape, dim), float("nan"), dtype=case.dtype)
-    args = (
-        torch.full_like(query, float("nan")),
+
+
+def shuffle_value_cache_layout(value_cache: torch.Tensor) -> torch.Tensor:
+    elements_per_vector = 16 // value_cache.element_size()
+    num_blocks, num_kv_heads, head_size, block_size = value_cache.shape
+    value_cache_reshaped = value_cache.view(
+        num_blocks,
+        num_kv_heads,
+        head_size,
+        block_size // elements_per_vector,
+        elements_per_vector,
+    )
+    return value_cache_reshaped.permute(0, 1, 3, 2, 4).contiguous()
+
+
+@_requires_tile_pa
+@pytest.mark.parametrize(
+    ("compute_type", "query_length", "value_head_size", "num_partitions"),
+    [
+        pytest.param("bf16", 1, 128, 4, id="bf16-qlen1-v128"),
+        pytest.param("bf16", 1, 192, 4, id="bf16-qlen1-v192"),
+        pytest.param("bf16", 4, 128, 4, id="bf16-qlen4-v128"),
+        pytest.param("bf16", 4, 192, 4, id="bf16-qlen4-v192"),
+        pytest.param("fp8", 4, 128, 4, id="fp8-qlen4-v128"),
+        pytest.param("fp8", 4, 192, 4, id="fp8-qlen4-v192"),
+        pytest.param("bf16", 8, 128, 1, id="bf16-qlen8-v128-one-shot"),
+        pytest.param("bf16", 8, 128, 4, id="bf16-qlen8-v128-split"),
+        pytest.param("fp8", 8, 128, 1, id="fp8-qlen8-v128-one-shot"),
+        pytest.param("fp8", 8, 128, 4, id="fp8-qlen8-v128-split"),
+    ],
+)
+@pytest.mark.parametrize("head_size", [128, 192])
+@pytest.mark.parametrize("num_heads", [(16, 1)])
+@pytest.mark.parametrize("context_length", [1027])
+@pytest.mark.parametrize("batch_size", [2])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize(
+    "entrypoint",
+    ["direct", "ps-allocate", "ps-preallocated"],
+    ids=["direct", "ps-allocate", "ps-preallocated"],
+)
+def test_tile_pa_vectorized_5d_matches_torch(
+    compute_type: str,
+    query_length: int,
+    value_head_size: int,
+    num_partitions: int,
+    head_size: int,
+    num_heads: tuple[int, int],
+    context_length: int,
+    batch_size: int,
+    block_size: int,
+    entrypoint: str,
+) -> None:
+    from aiter.ops.flydsl.pa_decode import pa_decode_tile
+
+    num_query_heads, num_kv_heads = num_heads
+    blocks_per_sequence = triton.cdiv(context_length, block_size)
+    total_blocks = batch_size * blocks_per_sequence
+    device = torch.device("cuda:0")
+    cache_dtype = dtypes.d_dtypes[compute_type]
+
+    setup_seed(20260821)
+    query = torch.empty(
+        batch_size * query_length,
+        num_query_heads,
+        head_size,
+        dtype=torch.bfloat16,
+        device=device,
+    ).uniform_(-0.5, 0.5)
+    key_caches, value_caches = create_kv_cache(
+        total_blocks,
+        block_size,
+        1,
+        num_kv_heads,
+        head_size,
+        "auto",
+        torch.bfloat16,
+        seed=20260821,
+        device=str(device),
+        itemsize=1 if compute_type == "fp8" else cache_dtype.itemsize,
+        value_head_size=value_head_size,
+    )
+    key_cache = key_caches[0]
+    value_cache = value_caches[0]
+    key_scale_flat = None
+    value_scale_flat = None
+    key_scale = None
+    value_scale = None
+    if compute_type == "fp8":
+        (
+            key_cache,
+            key_scale_flat,
+            value_cache,
+            value_scale_flat,
+            key_scale,
+            value_scale,
+        ) = quantize_kv_cache_per_tensor(
+            key_cache,
+            value_cache,
+            quant_dtype=cache_dtype,
+        )
+    block_tables = torch.arange(
+        total_blocks - 1, -1, -1, dtype=torch.int32, device=device
+    ).reshape(batch_size, blocks_per_sequence)
+    context_lengths = torch.full(
+        (batch_size,), context_length, dtype=torch.int32, device=device
+    )
+    query_output_indptr = torch.arange(
+        0,
+        (batch_size + 1) * query_length,
+        query_length,
+        dtype=torch.int32,
+        device=device,
+    )
+    expected = torch_mha_extend(
         query,
         key_cache,
         value_cache,
-        context,
-        table,
-        dim**-0.5,
-        ql,
-        parts,
-        KV_COMPUTE_BLOCK,
-        quant_dtype,
-        None,
-        key_scale,
-        value_scale,
-        psum,
-        pmax,
-        pout,
-        None,
-        sinks,
-    )
-    options = {"sliding_window": case.sliding_window, "work_plan": plan}
-    reference = partial(
-        run_torch,
-        query,
-        key_quant,
-        value_quant.permute(0, 1, 3, 2),
-        table,
-        context,
-        key_scale,
-        value_scale,
-        query_length=ql,
-        sliding_window=case.sliding_window,
-        sinks=sinks,
-    )
-    return args, options, reference
-
-
-def _run_flydsl(*args, sliding_window=0, work_plan=None):
-    # Fixtures use the core signature; the wrapper inserts ps before sinks.
-    args = (*args[:-1], True, args[-1])
-    if work_plan is None:
-        torch.ops.aiter.pa_decode_flydsl(*args, sliding_window=sliding_window)
-    else:
-        plan_pa_decode(
-            args[4],
-            args[2].shape[1],
-            max_partitions=args[8],
-            query_length=args[7],
-            sliding_window=sliding_window,
-            plan=work_plan,
-        )
-        pa_decode_flydsl(*args, sliding_window=sliding_window, work_plan=work_plan)
-    return args[0]
-
-
-def _assert_close(output, reference):
-    assert torch.isfinite(output).all()
-    torch.testing.assert_close(
-        output.float(),
-        reference.float(),
-        atol=ACCURACY_TOLERANCE,
-        rtol=ACCURACY_TOLERANCE,
-    )
-
-
-def _assert_plan(plan, lengths):
-    """Independent integer oracle for absolute tiles, budgets and packed slots."""
-    first = [
-        (
-            max(0, length - plan.query_length + 1 - plan.sliding_window) // 256
-            if plan.sliding_window > 0
-            else 0
-        )
-        for length in lengths
-    ]
-    last = [(max(0, length) + 255) // 256 for length in lengths]
-    tiles = [end - begin for begin, end in zip(first, last)]
-    remaining = plan.capacity - sum(count > 0 for count in tiles)
-    total = max(sum(tiles), 1)
-    prefix, work, reductions = 0, [], []
-    for seq, (length, begin, count) in enumerate(zip(lengths, first, tiles)):
-        extra = (prefix + count) * remaining // total - prefix * remaining // total
-        parts = min(int(count > 0) + extra, count, plan.max_partitions)
-        prefix += count
-        reductions.append([len(work), parts])
-        for part in range(parts):
-            work.append(
-                [
-                    seq,
-                    begin + part * count // parts,
-                    begin + (part + 1) * count // parts,
-                    length,
-                ]
-            )
-    assert len(work) <= plan.capacity
-    active = len(work)
-    work += [[0, 0, 0, 0]] * (plan.capacity - active)
-    assert plan.reduce_info.cpu().tolist() == reductions
-    assert plan.work_info.cpu().tolist() == work
-    return active
-
-
-def _assert_contracts(args, options):
-    """Reuse the valid inputs for API validation instead of separate fixtures."""
-    heads = args[1].shape[1]
-    for invalid, error in [
-        ([0.0] * heads, TypeError),
-        (torch.zeros(1, heads), ValueError),
-        (torch.zeros(heads - 1), ValueError),
-        (torch.zeros(heads, dtype=torch.int32), TypeError),
-        (torch.zeros(heads, dtype=torch.float64), TypeError),
-        (torch.zeros(heads, device="cpu"), ValueError),
-        (torch.zeros(heads * 2)[::2], ValueError),
-    ]:
-        with pytest.raises(error, match="sinks"):
-            pa_decode(*args[:-1], sinks=invalid, **options)
-    for value, error in [(-2, ValueError), (1.5, TypeError)]:
-        with pytest.raises(error, match="sliding_window"):
-            pa_decode(*args, **{**options, "sliding_window": value})
-        with pytest.raises(error, match="sliding_window"):
-            plan_pa_decode(args[4], args[2].shape[1], sliding_window=value)
-    for value, error in [(0, ValueError), (1.5, TypeError)]:
-        with pytest.raises(error, match="query_length"):
-            pa_decode(*args[:7], value, *args[8:], **options)
-        with pytest.raises(error, match="query_length"):
-            plan_pa_decode(args[4], args[2].shape[1], query_length=value)
-    plan = options["work_plan"]
-    if plan is not None:
-        context, heads = args[4], args[2].shape[1]
-        reuse = {
-            "max_partitions": plan.max_partitions,
-            "sliding_window": plan.sliding_window,
-            "query_length": plan.query_length,
-            "plan": plan,
-        }
-        changes = [
-            (
-                {"max_partitions": 1 if plan.max_partitions != 1 else 2},
-                "max_partitions",
-            ),
-            ({"sliding_window": plan.sliding_window + 1}, "sliding_window"),
-            ({"workgroup_budget": 1}, "workgroup_budget"),
-        ]
-        if plan.sliding_window > 0:
-            changes.append(({"query_length": plan.query_length + 1}, "query_length"))
-        for change, message in changes:
-            with pytest.raises(ValueError, match=message):
-                plan_pa_decode(context, heads, **{**reuse, **change})
-        for lengths, kv_heads in [(context.repeat(2), heads), (context, heads + 1)]:
-            with pytest.raises(ValueError):
-                plan_pa_decode(lengths, kv_heads, **reuse)
-        with pytest.raises(ValueError, match="sliding_window"):
-            pa_decode(*args, **{**options, "sliding_window": plan.sliding_window + 1})
-        if plan.sliding_window > 0:
-            wrong_plan = plan_pa_decode(
-                context,
-                heads,
-                max_partitions=plan.max_partitions,
-                sliding_window=plan.sliding_window,
-                query_length=plan.query_length + 1,
-            )
-            with pytest.raises(ValueError, match="query_length"):
-                pa_decode(*args, **{**options, "work_plan": wrong_plan})
-
-
-def _case(
-    name,
-    shape=(4, 1, 16, 128),
-    cache=(128, 1, 1),
-    parts=7,
-    window=0,
-    sink=None,
-    **kwargs,
-):
-    # shape = (QL, KV heads, GQA, D); cache = (page size, transposed V, per-token).
-    ql, heads, group, dim = shape
-    page, trans_v, per_token = cache
-    return pytest.param(
-        DecodeCase(
-            query_length=ql,
-            num_kv_heads=heads,
-            query_group_size=group,
-            head_dim=dim,
-            block_size=page,
-            trans_v=bool(trans_v),
-            per_token=bool(per_token),
-            num_partitions=parts,
-            sliding_window=window,
-            sink_dtype=sink,
-            **kwargs,
-        ),
-        id=name,
-    )
-
-
-def _cases(columns, rows, *, prefix="", **shared):
-    """Expand a small parameter table using the same defaults as _case."""
-    return [
-        _case(
-            prefix + name,
-            **{**shared, **dict(zip(columns.split(), values, strict=True))},
-        )
-        for name, *values in rows
-    ]
-
-
-# Every row uses the same correctness/contract flow in static and planned modes.
-# Positive windows reject static calls; disabled windows run numerics in both.
-BF16, FP16, FP32 = torch.bfloat16, torch.float16, torch.float32
-LENS_1024 = (0, 1, 1025, 1281)
-LENS_4096 = (0, 1, 4097, 4353)
-LENS_8192 = (0, 1, 8193, 8449)
-CASES = [
-    # Scalar scales, head dimensions and ordinary MTP/window boundaries.
-    *_cases(
-        "shape cache parts window sink",
-        [
-            ("scalar-direct", (1, 2, 8, 128), (16, 1, 0), 1, 0, None),
-            ("scalar-window-sinks", (1, 2, 8, 128), (128, 1, 0), 7, 257, FP32),
-            ("head1024", (1, 2, 4, 1024), (128, 1, 0), 256, 8192, FP32),
-            ("mtp3-window", (3, 1, 16, 128), (128, 0, 1), 7, 257, FP16),
-            ("mtp2-odd-parts", (2, 2, 16, 128), (16, 0, 1), 3, 0, None),
-            ("window256", (3, 2, 8, 128), (128, 0, 1), 7, 256, None),
-            ("window509", (4, 1, 16, 128), (64, 0, 1), 86, 509, FP16),
-            ("window8192", (2, 1, 16, 128), (128, 1, 1), 256, 8192, None),
-            ("head64-mtp-window", (4, 2, 4, 64), (16, 1, 1), 256, 1, FP32),
-            ("hkv2-direct-sinks", (1, 2, 8, 128), (128, 1, 1), 1, 1, BF16),
-        ],
-    ),
-    _case("head64-fp16", (2, 2, 4, 64), (16, 0, 0), 7, 257, BF16, dtype=FP16),
-    _case("scalar-fp16-mtp", cache=(128, 1, 0), parts=3, dtype=FP16),
-    _case(
-        "register-64-65",
-        (1, 2, 4, 256),
-        (64, 1, 0),
-        86,
-        sink=FP16,
-        dtype=FP16,
-        lengths=(0, 1, 257, 16384, 16385),
-    ),
-    # Explicit splits also cover padded query rows and direct/partitioned sinks.
-    _case(
-        "np1-fused-sink", cache=(16, 1, 1), parts=1, window=1, sink=FP32, query_splits=1
-    ),
-    _case("np1-split-sink", parts=1, window=1, sink=BF16, query_splits=4),
-    _case(
-        "split2-hkv2-full-m1",
-        (2, 2, 16, 128),
-        parts=17,
-        window=1024,
-        sink=FP32,
-        lengths=(0, 769, 1025, 2049),
-        query_splits=2,
-        wide_kv_addressing=True,
-    ),
-    _case(
-        "split4-hkv2-full-m1",
-        (4, 2, 16, 128),
-        (16, 0, 1),
-        34,
-        4096,
-        BF16,
-        lengths=(1, 257, 4353, 0),
-        query_splits=4,
-    ),
-    _case(
-        "full-m1-fp16-d256",
-        (2, 2, 8, 256),
-        (64, 1, 1),
-        5,
-        257,
-        FP16,
-        dtype=FP16,
-        lengths=(0, 1, 257, 513),
-        query_splits=1,
-    ),
-    _case(
-        "split4-hkv1-g15-plain-v-window-wide",
-        (4, 1, 15, 128),
-        (128, 0, 1),
-        8,
-        1024,
-        FP32,
-        lengths=LENS_1024,
-        workgroup_budget=24,
-        query_splits=4,
-        wide_kv_addressing=True,
-    ),
-    _case(
-        "disabled-window-wide",
-        cache=(16, 0, 1),
-        parts=256,
-        window=-1,
-        sink=FP32,
-        query_splits=1,
-        wide_kv_addressing=True,
-    ),
-    _case(
-        "fused-narrow",
-        cache=(16, 0, 1),
-        parts=1,
-        sink=FP32,
-        query_splits=1,
-        wide_kv_addressing=False,
-    ),
-    _case("fused-wide", parts=8, query_splits=1, wide_kv_addressing=True),
-    _case(
-        "fused-hkv2-window",
-        (4, 2, 16, 128),
-        (128, 0, 1),
-        8,
-        257,
-        BF16,
-        query_splits=1,
-        wide_kv_addressing=False,
-    ),
-    # Small/large batches and overprovisioned or tight plan capacities.
-    _case("mtp2-query-split", (2, 1, 16, 128), parts=3, lengths=(257, 259)),
-    _case(
-        "mtp8-query-split",
-        (8, 1, 16, 128),
-        (64, 1, 1),
-        8,
-        1024,
-        FP32,
-        lengths=(1023, 1024, 1031, 4099),
-        query_splits=8,
-    ),
-    *_cases(
-        "cache parts window lengths workgroup_budget",
-        [
-            ("window-query-split", (16, 1, 1), 7, 1024, (1023, 1024, 1025, 4099), None),
-            ("window-capacity", (128, 1, 1), 256, 1024, (0, 3, 1024, 4099), None),
-            ("dense-capacity", (128, 0, 1), 256, 0, (257, 259, 1027, 4099), 17),
-            ("window-large-grid", (128, 1, 1), 7, 1024, (1027,) * 200, None),
-        ],
-        prefix="mtp4-",
-    ),
-    # Ragged/empty owners, both window endpoints and their immediate neighbors.
-    *_cases(
-        "parts window lengths workgroup_budget",
-        [
-            ("window4096", 18, 4096, LENS_4096, 72),
-            ("window8192-batch12", 34, 8192, LENS_8192 * 3, 408),
-            ("window6000-batch5", 25, 6000, (0, 1, 6001, 6145, 6257), 125),
-            ("window4095-fallback", 18, 4095, LENS_4096, 72),
-            ("window8193-fallback", 34, 8193, LENS_8192, 136),
-            ("window1024-rejected", 6, 1024, LENS_1024 * 2, 48),
-            ("excess-partitions", 35, 8192, LENS_8192, 140),
-            ("tight-capacity", 34, 8192, LENS_8192, 135),
-            (
-                "window4096-batch24",
-                18,
-                4096,
-                (0, 1, 3, 4, 257, 1025, 2049, 4096, 4097, 4098, 4353, 4354) * 2,
-                432,
-            ),
-            (
-                "window4096-np64",
-                64,
-                4096,
-                (0, 1, 769, 1793, 4096, 4097, 4353, 4354),
-                144,
-            ),
-            ("window8192-np256-fallback", 256, 8192, (0, 1, 8449, 8450), 136),
-        ],
-        prefix="batch-first-",
-        sink=FP32,
-    ),
-    *_cases(
-        "parts lengths workgroup_budget",
-        [
-            ("window8192", 34, (0, 1, 3, 4, 257, 8193, 8449, 0), 272),
-            ("excess-capacity", 35, LENS_8192, 137),
-        ],
-        prefix="batch-first-",
-        window=8192,
-        sink=BF16,
-    ),
-    *_cases(
-        "cache parts wide_kv_addressing",
-        [
-            ("window4096-wide", (128, 1, 1), 18, True),
-            ("window4096-plain-v", (128, 0, 1), 18, None),
-            ("window4096-plain-v-wide", (128, 0, 1), 18, True),
-            ("window4096-np64-plain-v-wide", (128, 0, 1), 64, True),
-        ],
-        prefix="batch-first-",
-        window=4096,
-        sink=FP32,
-        lengths=LENS_4096,
-        workgroup_budget=72,
-    ),
-    _case(
-        "batch-first-window8192-plain-v-auto",
-        cache=(128, 0, 1),
-        parts=34,
-        window=8192,
-        sink=FP32,
-        lengths=LENS_8192,
-        workgroup_budget=136,
-    ),
-    # QL1: layouts, address widths, head counts and padded GQA sizes.
-    *_cases(
-        "workgroup_budget wide_kv_addressing",
-        [
-            ("prefetch", 512, None),
-            ("prefetch-small-capacity", 263, None),
-            ("prefetch-wide", 512, True),
-        ],
-        prefix="ql1-window-",
-        shape=(1, 1, 16, 128),
-        parts=64,
-        window=8192,
-        lengths=(8193,) * 8,
-    ),
-    *_cases(
-        "shape parts workgroup_budget",
-        [
-            ("hkv2-g8-window-prefetch", (1, 2, 8, 128), 64, 264),
-            ("hkv1-g8-large-np-prefetch", (1, 1, 8, 128), 256, 132),
-        ],
-        prefix="ql1-",
-        window=8192,
-        sink=FP32,
-        lengths=LENS_8192,
-    ),
-    *_cases(
-        "shape cache workgroup_budget",
-        [
-            ("hkv4-page128-multi", (1, 4, 16, 128), (128, 1, 1), 32),
-            ("hkv4-page16-multi", (1, 4, 16, 128), (16, 1, 1), 32),
-            ("hkv4-plain-v-multi", (1, 4, 16, 128), (128, 0, 1), 32),
-            ("hkv2-g15-plain-v-multi", (1, 2, 15, 128), (128, 0, 1), 16),
-        ],
-        prefix="ql1-",
-        parts=2,
-        window=1024,
-        sink=FP32,
-        lengths=LENS_1024,
-    ),
-    *_cases(
-        "shape workgroup_budget query_splits",
-        [
-            ("ql1-hkv4-page16-direct-sinks", (1, 4, 16, 128), 16, None),
-            ("ql1-hkv2-g9-page16-direct-sinks", (1, 2, 9, 128), 8, None),
-            ("split2-hkv2-g9-page16-direct-sinks", (2, 2, 9, 128), 8, 2),
-        ],
-        cache=(16, 1, 1),
-        parts=1,
-        sink=FP32,
-        lengths=(0, 1, 257, 769),
-    ),
-    *_cases(
-        "shape",
-        [
-            (f"ql1-hkv2-g{group}-window", (1, 2, group, 128))
-            for group in (7, *range(9, 16), 17)
-        ],
-        parts=8,
-        window=1024,
-        sink=FP32,
-        lengths=LENS_1024,
-        workgroup_budget=40,
-    ),
-    *_cases(
-        "shape cache window sink lengths",
-        [
-            ("1wg", (1, 2, 8, 128), (128, 1, 1), 1, FP32, (257,) * 16),
-            ("2wg", (1, 2, 8, 128), (128, 1, 1), 0, None, (257,) * 32),
-            ("page16", (1, 2, 8, 128), (16, 1, 1), 257, FP16, (257,) * 32),
-            ("plain-v", (1, 2, 16, 128), (128, 0, 1), 0, BF16, (257,) * 32),
-        ],
-        prefix="hkv2-prefetch-",
-        parts=8,
-    ),
-    # Large/automatic partition counts and integer-limit windows.
-    _case(
-        "long-200k",
-        cache=(128, 0, 1),
-        parts=256,
-        sink=FP32,
-        lengths=(0, 1, 3, 4, 255, 256, 257, 200003),
-    ),
-    _case(
-        "long-np64",
-        cache=(16, 1, 1),
-        parts=64,
-        lengths=(0, 3, 257, 16384, 16385, 65537),
-    ),
-    _case("large-batch-auto", cache=(128, 0, 1), parts=None, lengths=(257,) * 200),
-    _case("small-batch-auto", (1, 1, 8, 128), (16, 0, 0), None, lengths=(257,) * 3),
-    _case(
-        "exact-parts-override",
-        (1, 1, 16, 128),
-        parts=5,
-        lengths=(200000,),
-        max_partitions=4,
-    ),
-    _case("window-int64", cache=(16, 1, 1), window=2**40, wide_kv_addressing=True),
-    *_cases(
-        "window sink",
-        [("max", 2**31 - 1, None), ("overflow", 2**31, FP32)],
-        prefix="window-int32-",
-        cache=(16, 0, 1),
-        parts=1,
-    ),
-    _case(
-        "window-huge-padded-query",
-        (3, 2, 8, 128),
-        parts=1,
-        window=2**31 - 1,
-        sink=FP32,
-        lengths=(0, 1, 2, 257),
-    ),
-    _case(
-        "window255-budget",
-        (2, 2, 16, 128),
-        (64, 0, 1),
-        64,
-        255,
-        BF16,
-        workgroup_budget=17,
-    ),
-    # Masked per-token scales and poisoned reducer padding/tail boundaries.
-    *_cases(
-        "shape sink",
-        [("decode", (1, 1, 16, 128), FP32), ("mtp", (4, 1, 16, 128), None)],
-        prefix="masked-scale-",
-        window=1,
-        lengths=(511,),
-        masked_scale=True,
-    ),
-    *_cases(
-        "parts window lengths workgroup_budget",
-        [
-            ("np33-tail-empty", 33, 1, (1, 257, 513, 0, 0), 5),
-            ("shortcount-boundary", 34, 1024, (0, 769, 1025, 0), 24),
-            ("eightcount-boundary", 34, 2048, (0, 1793, 2049, 0), 48),
-        ],
-        prefix="reduce-",
-        sink=FP32,
-    ),
-    _case(
-        "reduce-np64-tail-padding",
-        (4, 2, 8, 128),
-        (16, 0, 1),
-        64,
-        255,
-        BF16,
-        lengths=(1, 3, 257, 258, 514, 515, 0, 0),
-        workgroup_budget=32,
-    ),
-    _case("empty", window=1, sink=FP16, lengths=(0,) * 4),
-]
-
-
-@pytest.mark.parametrize("planned", [False, True], ids=["static", "planned"])
-@pytest.mark.parametrize("case", CASES)
-def test_pa_decode(case, planned, monkeypatch):
-    """Check real kernels, static/planned metadata, and graph replays."""
-    args, options, reference = _make_inputs(case, planned)
-    output, context = args[0], args[4]
-    scratch, sinks, plan = args[14:17], args[-1], options["work_plan"]
-    if plan is not None and case.workgroup_budget is not None:
-        budget_slots = (
-            case.workgroup_budget + case.num_kv_heads - 1
-        ) // case.num_kv_heads
-        assert plan.capacity == min(
-            context.numel() * args[8], max(context.numel(), budget_slots)
-        )
-
-    # Force only explicitly requested variants; ordinary cases use production defaults.
-    module = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    overrides = {
-        name: getattr(case, name)
-        for name in ("query_splits", "wide_kv_addressing")
-        if getattr(case, name) is not None
-    }
-    if overrides:
-        build_tile = module.compile_pa_decode_tile
-
-        def compile_tile(**kwargs):
-            return build_tile(**{**kwargs, **overrides})
-
-        monkeypatch.setattr(module, "compile_pa_decode_tile", compile_tile)
-    if not planned and args[8] == 1:
-
-        def unexpected_reducer(*_args, **_kwargs):
-            raise AssertionError("static NP=1 must not launch a reducer")
-
-        monkeypatch.setattr(module, "launch_pa_decode_ps_reduce", unexpected_reducer)
-
-    def check(disabled_sink=False):
-        _assert_close(output, reference(sinks=None) if disabled_sink else reference())
-        visible = (
-            context[:, None]
-            - case.query_length
-            + 1
-            + torch.arange(case.query_length, device=context.device)
-        )
-        assert (output[(visible <= 0).flatten()] == 0).all()
-        if sinks is not None:
-            assert (output[:, torch.isposinf(sinks)] == 0).all()
-        if plan is not None:
-            active = _assert_plan(plan, context.cpu().tolist())
-            for tensor in scratch:
-                assert torch.isnan(tensor[:, active:]).all()
-        elif args[8] == 1:
-            assert all(torch.isnan(tensor).all() for tensor in scratch)
-
-    _run_flydsl(*args, **options)
-    check()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        _run_flydsl(*args, **options)
-    original_sinks = sinks.clone() if sinks is not None else None
-    for step, lengths in enumerate(
-        (
-            tuple(max(0, length - 7) for length in case.lengths),
-            (0,) * len(case.lengths),
-            case.lengths,
-        )
-    ):
-        context.copy_(torch.tensor(lengths, dtype=torch.int32))
-        if sinks is not None:
-            if step == 2:
-                sinks.fill_(float("-inf"))
-            else:
-                sinks.copy_(original_sinks.roll(step + 1))
-        for tensor in (output, *scratch):
-            tensor.fill_(float("nan"))
-        graph.replay()
-        check(disabled_sink=step == 2)
-
-    _assert_contracts(args, options)
-    if plan is not None:
-        # Exercise planner integer limits without allocating an INT32_MAX KV cache.
-        lengths = (-1, 0, 1, 257, 2**31 - 1)
-        extreme_plan = plan_pa_decode(
-            torch.tensor(lengths, dtype=torch.int32),
-            case.num_kv_heads,
-            max_partitions=args[8],
-            sliding_window=case.sliding_window,
-            query_length=case.query_length,
-        )
-        _assert_plan(extreme_plan, lengths)
-
-
-@pytest.mark.parametrize("query_length", [4, 8])
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, "fp8"])
-def test_mimo_qk192_v128_full_attention(cache_dtype, query_length):
-    """Exercise the MiMo target-verification contract through the public API."""
-    if get_gfx_runtime() != "gfx950":
-        pytest.skip("MiMo D192/V128 target verification requires gfx950")
-
-    torch.manual_seed(20260918 + query_length)
-    batch_size = 1
-    num_q_heads, num_kv_heads = 16, 1
-    head_dim, value_head_dim = 192, 128
-    block_size, context_length, num_partitions = 64, 1024, 4
-    num_blocks = context_length // block_size
-
-    query = (
-        torch.randn(
-            batch_size * query_length,
-            num_q_heads,
-            head_dim,
-            dtype=torch.float32,
-        )
-        * 0.2
-    ).to(torch.bfloat16)
-    key = (
-        torch.randn(
-            num_blocks,
-            block_size,
-            num_kv_heads,
-            head_dim,
-            dtype=torch.float32,
-        )
-        * 0.2
-    ).to(torch.bfloat16)
-    value = (
-        torch.randn(
-            num_blocks,
-            block_size,
-            num_kv_heads,
-            value_head_dim,
-            dtype=torch.float32,
-        )
-        * 0.2
-    ).to(torch.bfloat16)
-
-    if cache_dtype == "fp8":
-        quant_dtype = torch.float8_e4m3fn
-        key_quant, key_scale = per_tensor_quant(key, quant_dtype=quant_dtype)
-        value_quant, value_scale = per_tensor_quant(value, quant_dtype=quant_dtype)
-        key_reference = key_quant.float() * key_scale
-        value_reference = value_quant.float() * value_scale
-        pack = 16
-        compute_type = quant_dtype
-    else:
-        key_quant, value_quant = key, value
-        key_scale = value_scale = None
-        key_reference, value_reference = key.float(), value.float()
-        pack = 8
-        compute_type = torch.bfloat16
-
-    key_cache = (
-        key_quant.view(
-            num_blocks,
-            block_size,
-            num_kv_heads,
-            head_dim // pack,
-            pack,
-        )
-        .permute(0, 2, 3, 1, 4)
-        .contiguous()
-    )
-    value_cache = (
-        value_quant.permute(0, 2, 3, 1)
-        .contiguous()
-        .view(
-            num_blocks,
-            num_kv_heads,
-            value_head_dim,
-            block_size // pack,
-            pack,
-        )
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-    )
-    block_tables = torch.arange(num_blocks, dtype=torch.int32).view(
-        batch_size, num_blocks
-    )
-    context_lengths = torch.full(
-        (batch_size,), context_length, dtype=torch.int32
-    )
-    output = torch.empty(
-        batch_size * query_length,
-        num_q_heads,
-        value_head_dim,
-        dtype=torch.bfloat16,
+        block_tables,
+        context_lengths,
+        query_output_indptr,
+        key_scale_flat,
+        value_scale_flat,
     )
     partial_shape = (
         batch_size,
         num_kv_heads,
         num_partitions,
-        query_length * (num_q_heads // num_kv_heads),
+        query_length * (num_query_heads // num_kv_heads),
     )
-    exp_sums = torch.empty(partial_shape, dtype=torch.float32)
-    max_logits = torch.empty_like(exp_sums)
-    temporary_output = torch.empty(
-        *partial_shape, value_head_dim, dtype=torch.bfloat16
+    actual = torch.full(
+        (batch_size * query_length, num_query_heads, value_head_size),
+        float("nan"),
+        dtype=query.dtype,
+        device=device,
     )
-
-    pa_decode_flydsl(
-        output,
-        query,
-        key_cache,
-        value_cache,
-        context_lengths,
-        block_tables,
-        head_dim**-0.5,
-        query_length,
-        num_partitions,
-        compute_type=compute_type,
-        key_scale=key_scale,
-        value_scale=value_scale,
-        exp_sums=exp_sums,
-        max_logits=max_logits,
-        temporary_output=temporary_output,
+    pmax = torch.empty(partial_shape, dtype=torch.float32, device=device)
+    psum = torch.empty(partial_shape, dtype=torch.float32, device=device)
+    pout = torch.empty(
+        (*partial_shape, value_head_size), dtype=query.dtype, device=device
     )
-
-    key_reference = key_reference.view(
-        context_length, num_kv_heads, head_dim
-    ).repeat_interleave(num_q_heads // num_kv_heads, dim=1)
-    value_reference = value_reference.view(
-        context_length, num_kv_heads, value_head_dim
-    ).repeat_interleave(num_q_heads // num_kv_heads, dim=1)
-    scores = torch.einsum(
-        "qhd,khd->hqk", query.float(), key_reference.float()
-    ) * (head_dim**-0.5)
-    causal = torch.ones(
-        query_length, context_length, dtype=torch.bool
-    ).tril(diagonal=context_length - query_length)
-    scores.masked_fill_(~causal.unsqueeze(0), float("-inf"))
-    reference = torch.einsum(
-        "hqk,khd->qhd", torch.softmax(scores, dim=-1), value_reference.float()
-    ).to(torch.bfloat16)
-
-    torch.testing.assert_close(output, reference, rtol=0.02, atol=0.02)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        pa_decode_flydsl(
-            output,
-            query,
-            key_cache,
-            value_cache,
-            context_lengths,
-            block_tables,
-            head_dim**-0.5,
-            query_length,
-            num_partitions,
-            compute_type=compute_type,
+    value_cache = shuffle_value_cache_layout(value_cache)
+    if entrypoint == "direct":
+        pa_decode_tile(
+            output=actual,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_tables=block_tables,
+            context_lengths=context_lengths,
             key_scale=key_scale,
             value_scale=value_scale,
-            exp_sums=exp_sums,
-            max_logits=max_logits,
-            temporary_output=temporary_output,
+            softmax_scale=head_size**-0.5,
+            num_partitions=num_partitions,
+            pmax=pmax,
+            psum=psum,
+            pout=pout,
         )
-    output.fill_(float("nan"))
-    graph.replay()
-    torch.testing.assert_close(output, reference, rtol=0.02, atol=0.02)
+    else:
+        if not HAS_FLYDSL_PS:
+            pytest.skip("FlyDSL `pa_decode_ps_launch` is not available")
+        kv_page_indices = block_tables.flatten()
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * blocks_per_sequence,
+            blocks_per_sequence,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        def launch_ps():
+            return flydsl_ps_launch(
+                output=actual,
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                context_lengths=context_lengths,
+                kv_page_indices=kv_page_indices,
+                kv_indptr=kv_indptr,
+                softmax_scale=head_size**-0.5,
+                key_scale=key_scale,
+                value_scale=value_scale,
+                block_tables=block_tables,
+                max_context_partition_num=num_partitions,
+                exp_sums=psum if entrypoint == "ps-preallocated" else None,
+                max_logits=pmax if entrypoint == "ps-preallocated" else None,
+                temporary_output=pout if entrypoint == "ps-preallocated" else None,
+            )
+
+        path = launch_ps()
+        assert path == "ps_small_block"
+        if (
+            entrypoint == "ps-preallocated"
+            and (query_length == 8 or (compute_type == "bf16" and query_length == 4))
+            and value_head_size == 128
+        ):
+            capture_stream = torch.cuda.Stream()
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream):
+                launch_ps()
+            torch.cuda.current_stream().wait_stream(capture_stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                launch_ps()
+            actual.fill_(float("nan"))
+            graph.replay()
+    torch.cuda.synchronize()
+
+    tolerance = 2.0e-2 if compute_type == "fp8" else 5.0e-3
+    assert bool(torch.isfinite(actual).all().item())
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
 
 
-@benchmark()
-def run_pa_decode_tile_case(
-    batch_size,
-    num_query_heads,
-    num_kv_heads,
-    head_dim,
-    context_length,
-    block_size,
-    dtype,
-    trans_v,
-    max_partitions=None,
-    per_token=False,
-    query_length=1,
-    num_partitions=None,
+@_requires_tile_pa
+@pytest.mark.parametrize(
+    "compute_type,head_size,batch_size,num_heads,num_partitions,block_size",
+    [
+        ("bf16", 128, 9, (16, 1), 3, 16),
+        ("bf16", 192, 17, (18, 2), 1, 64),
+        ("fp8", 128, 9, (32, 2), 3, 16),
+        ("fp8", 128, 17, (48, 2), 4, 64),
+    ],
+)
+def test_tile_pa_qlen8_grouped_grid_tail(
+    compute_type, head_size, batch_size, num_heads, num_partitions, block_size
 ):
-    """CLI-only timing wrapper around the same input/reference/launch helpers."""
-    if min(batch_size, context_length, query_length, num_query_heads, num_kv_heads) < 1:
-        raise ValueError(
-            "batch, context, query length and head counts must be positive"
-        )
-    if num_query_heads % num_kv_heads:
-        raise ValueError("num_query_heads must be divisible by num_kv_heads")
-    if dtype not in (dtypes.fp16, dtypes.bf16):
-        raise ValueError("pa_decode only supports fp16/bf16")
-    if num_partitions is not None and not 1 <= num_partitions <= MAX_CONTEXT_PARTITIONS:
-        raise ValueError(f"num_partitions must be in [1, {MAX_CONTEXT_PARTITIONS}]")
-    case = DecodeCase(
-        lengths=(context_length,) * batch_size,
-        query_length=query_length,
-        num_kv_heads=num_kv_heads,
-        query_group_size=num_query_heads // num_kv_heads,
-        head_dim=head_dim,
-        block_size=block_size,
-        dtype=dtype,
-        trans_v=trans_v,
+    """Partial sequence blocks preserve query-group and KV-head addressing."""
+    test_tile_pa_vectorized_5d_matches_torch(
+        compute_type=compute_type,
+        query_length=8,
+        value_head_size=128,
         num_partitions=num_partitions,
-        max_partitions=max_partitions,
-        per_token=per_token,
-        sparse=False,
+        head_size=head_size,
+        num_heads=num_heads,
+        context_length=1031,
+        batch_size=batch_size,
+        block_size=block_size,
+        entrypoint="ps-preallocated",
     )
-    args, options, reference_call = _make_inputs(case)
-    reference = reference_call()
-    del reference_call
-    # Keep tensors positional so allocation rotation accounts for their memory.
-    output, us = run_perftest(_run_flydsl, *args, **options)
-    _assert_close(output, reference)
-    query, table = args[1], args[5]
-    attended = sum(
-        max(0, context_length - query_length + 1 + p) for p in range(query_length)
+
+
+@_requires_tile_pa
+@pytest.mark.parametrize("num_partitions", [1, 4])
+@pytest.mark.parametrize(
+    "compute_type,query_length,num_heads",
+    [
+        ("bf16", 1, (16, 1)),
+        ("fp8", 1, (16, 1)),
+        ("bf16", 4, (16, 1)),
+        ("fp8", 4, (16, 1)),
+        ("bf16", 8, (16, 1)),
+        ("fp8", 8, (16, 1)),
+        ("bf16", 5, (16, 1)),  # Padded local M-tiles in the final group.
+        ("bf16", 8, (17, 1)),  # Three groups and a partial final M-tile.
+        ("bf16", 8, (32, 2)),  # Query groups must not become KV-head IDs.
+    ],
+)
+@pytest.mark.parametrize("query_value", [0.0, -512.0], ids=["zero", "negative"])
+def test_tile_pa_constant_query_causal_frontier(
+    compute_type, num_partitions, query_length, num_heads, query_value
+):
+    """Constant logits must stay finite and see their own causal prefix."""
+    from aiter.ops.flydsl.pa_decode import pa_decode_tile
+
+    context_length = 9
+    num_query_heads, num_kv_heads = num_heads
+    cache_dtype = dtypes.d_dtypes[compute_type]
+    vector = 16 // cache_dtype.itemsize
+    query = torch.full(
+        (query_length, num_query_heads, 192),
+        query_value,
+        dtype=torch.bfloat16,
+        device="cuda",
     )
-    flops = 4 * batch_size * num_query_heads * attended * head_dim
-    scale_elements = batch_size * num_kv_heads * context_length if per_token else 1
-    nbytes = (
-        2 * query.numel() * query.element_size()
-        + 2
-        * batch_size
-        * num_kv_heads
-        * context_length
-        * head_dim
-        * args[2].element_size()
-        + table.numel() * table.element_size()
-        + args[4].numel() * args[4].element_size()
-        + scale_elements * (args[12].element_size() + args[13].element_size())
+    key = torch.ones(
+        (2, num_kv_heads, 192 // vector, 64, vector), dtype=cache_dtype, device="cuda"
     )
+    # Constant scores make the visible values' arithmetic mean an independent oracle.
+    # A nonzero physical page and large finite padding catch page/tail mistakes.
+    value = torch.full(
+        (2, num_kv_heads, 128, 64), 64.0, dtype=torch.bfloat16, device="cuda"
+    )
+    head_offsets = torch.arange(num_kv_heads, dtype=torch.float32, device="cuda") * 16
+    value[1, :, :, :context_length] = head_offsets[:, None, None] + torch.arange(
+        1, context_length + 1, device="cuda"
+    )
+    value = shuffle_value_cache_layout(value.to(cache_dtype))
+    table = torch.tensor([[1]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([context_length], dtype=torch.int32, device="cuda")
+    scale = (
+        torch.ones(1, dtype=torch.float32, device="cuda")
+        if compute_type == "fp8"
+        else None
+    )
+    output = torch.full(
+        (query_length, num_query_heads, 128),
+        float("nan"),
+        dtype=query.dtype,
+        device="cuda",
+    )
+
+    pa_decode_tile(
+        output,
+        query,
+        key,
+        value,
+        table,
+        lengths,
+        scale,
+        scale,
+        num_partitions=num_partitions,
+    )
+    visible = (
+        context_length - query_length + torch.arange(1, query_length + 1, device="cuda")
+    )
+    expected = ((visible.float() + 1) / 2).view(query_length, 1, 1)
+    expected = (
+        expected
+        + head_offsets.repeat_interleave(num_query_heads // num_kv_heads)[None, :, None]
+    )
+    expected = expected.expand_as(output)
+    tolerance = 2.0e-2 if compute_type == "fp8" else 5.0e-3
+    torch.testing.assert_close(output.float(), expected, rtol=tolerance, atol=tolerance)
+
+
+@_requires_tile_pa
+@pytest.mark.parametrize(
+    ("compute_type", "block_size", "sliding_window"),
+    [
+        pytest.param("bf16", 1024, 0, id="bf16-page1024"),
+        pytest.param("fp8", 64, 128, id="asymmetric-fp8-sliding-window"),
+    ],
+)
+def test_pa_decode_ps_rejects_unsupported_bf16_asymmetric_paths(
+    compute_type: str, block_size: int, sliding_window: int
+) -> None:
+    if not HAS_FLYDSL_PS:
+        pytest.skip("FlyDSL `pa_decode_ps_launch` is not available")
+
+    device = torch.device("cuda:0")
+    head_size = 192
+    value_head_size = 128
+    num_query_heads = 16
+    num_kv_heads = 1
+    cache_dtype = dtypes.d_dtypes[compute_type]
+    vector_width = 8 if compute_type == "bf16" else 16
+    query = torch.empty(
+        1, num_query_heads, head_size, dtype=torch.bfloat16, device=device
+    )
+    output = torch.empty(
+        1, num_query_heads, value_head_size, dtype=query.dtype, device=device
+    )
+    key_cache = torch.empty(
+        1,
+        num_kv_heads,
+        head_size // vector_width,
+        block_size,
+        vector_width,
+        dtype=cache_dtype,
+        device=device,
+    )
+    value_cache = torch.empty(
+        1,
+        num_kv_heads,
+        block_size // vector_width,
+        value_head_size,
+        vector_width,
+        dtype=cache_dtype,
+        device=device,
+    )
+    scale = None
+    if compute_type == "fp8":
+        scale = torch.ones(1, dtype=torch.float32, device=device)
+
+    with pytest.raises(
+        ValueError,
+        match="BF16 KV and asymmetric value dimensions currently require",
+    ):
+        flydsl_ps_launch(
+            output=output,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            context_lengths=torch.ones(1, dtype=torch.int32, device=device),
+            kv_page_indices=torch.zeros(1, dtype=torch.int32, device=device),
+            kv_indptr=torch.tensor([0, 1], dtype=torch.int32, device=device),
+            softmax_scale=head_size**-0.5,
+            key_scale=scale,
+            value_scale=scale,
+            sliding_window=sliding_window,
+            block_tables=torch.zeros((1, 1), dtype=torch.int32, device=device),
+            max_context_partition_num=1,
+        )
+
+
+@_requires_tile_pa
+def test_pa_decode_ps_rejects_non_divisible_gqa_heads() -> None:
+    if not HAS_FLYDSL_PS:
+        pytest.skip("FlyDSL `pa_decode_ps_launch` is not available")
+
+    device = torch.device("cuda:0")
+    query = torch.empty(1, 3, 192, dtype=torch.bfloat16, device=device)
+    output = torch.empty(1, 3, 128, dtype=query.dtype, device=device)
+    key_cache = torch.empty(1, 2, 24, 64, 8, dtype=torch.bfloat16, device=device)
+    value_cache = torch.empty(1, 2, 8, 128, 8, dtype=torch.bfloat16, device=device)
+
+    with pytest.raises(ValueError, match="must be divisible"):
+        flydsl_ps_launch(
+            output=output,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            context_lengths=torch.ones(1, dtype=torch.int32, device=device),
+            kv_page_indices=torch.zeros(1, dtype=torch.int32, device=device),
+            kv_indptr=torch.tensor([0, 1], dtype=torch.int32, device=device),
+            softmax_scale=192**-0.5,
+            block_tables=torch.zeros((1, 1), dtype=torch.int32, device=device),
+            max_context_partition_num=1,
+        )
+
+
+@_requires_tile_pa
+@pytest.mark.parametrize("compute_type", ["fp8"])
+@pytest.mark.parametrize("num_partitions", [1])
+@pytest.mark.parametrize("head_size", [192])
+@pytest.mark.parametrize("num_heads", [(16, 1)])
+@pytest.mark.parametrize("query_length", [1])
+@pytest.mark.parametrize("context_length", [2])
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("trans_v", [True])
+@pytest.mark.parametrize("block_size", [64])
+def test_fp8_cache_offset_above_2gib(
+    compute_type: str,
+    num_partitions: int,
+    head_size: int,
+    num_heads: tuple[int, int],
+    query_length: int,
+    context_length: int,
+    batch_size: int,
+    trans_v: bool,
+    block_size: int,
+) -> None:
+    assert trans_v
+    num_query_heads, num_kv_heads = num_heads
+    cache_dtype = dtypes.d_dtypes[compute_type]
+    page_bytes = num_kv_heads * head_size * block_size * cache_dtype.itemsize
+    high_page = triton.cdiv(2**31, page_bytes)
+    total_blocks = high_page + 1
+    device = torch.device("cuda:0")
+
+    query = torch.ones(
+        batch_size * query_length,
+        num_query_heads,
+        head_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    key_cache = torch.empty(
+        total_blocks,
+        num_kv_heads,
+        head_size // 16,
+        block_size,
+        16,
+        dtype=cache_dtype,
+        device=device,
+    )
+    value_cache = torch.empty(
+        total_blocks,
+        num_kv_heads,
+        block_size // 16,
+        head_size,
+        16,
+        dtype=cache_dtype,
+        device=device,
+    )
+    # Rounded-up tiles use page 0 for bounded fallback loads. Keep both that
+    # page and the selected high page finite so masked PV lanes cannot see NaNs.
+    key_cache[0].zero_()
+    value_cache[0].zero_()
+    key_cache[high_page].zero_()
+    value_cache[high_page].zero_()
+
+    # Make the output sensitive to both selected K/V token addresses. If K
+    # wraps to page 0, the opposing values average to zero.
+    key_cache[high_page, 0, :, 0, :].fill_(-0.25)
+    key_cache[high_page, 0, :, 1, :].fill_(0.25)
+    value_cache[high_page, 0, 0, :, 0].fill_(-1.0)
+    value_cache[high_page, 0, 0, :, 1].fill_(1.0)
+
+    selected_keys = (
+        key_cache[high_page]
+        .permute(2, 0, 1, 3)
+        .reshape(block_size, num_kv_heads, head_size)[:context_length]
+    )
+    selected_values = (
+        value_cache[high_page]
+        .permute(1, 3, 0, 2)
+        .reshape(block_size, num_kv_heads, head_size)[:context_length]
+    )
+    expected = reference_masked_attention(
+        query,
+        selected_keys,
+        selected_values,
+        head_size**-0.5,
+        query.dtype,
+    )
+    assert expected.float().abs().min().item() > 0.5
+
+    block_tables = torch.full(
+        (batch_size, 1), high_page, dtype=torch.int32, device=device
+    )
+    context_lengths = torch.full(
+        (batch_size,), context_length, dtype=torch.int32, device=device
+    )
+    scale = torch.ones(1, dtype=torch.float32, device=device)
+    actual = torch.full_like(query, float("nan"))
+    from aiter.ops.flydsl.pa_decode import pa_decode_tile
+
+    pa_decode_tile(
+        output=actual,
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_tables=block_tables,
+        context_lengths=context_lengths,
+        key_scale=scale,
+        value_scale=scale,
+        softmax_scale=head_size**-0.5,
+        num_partitions=num_partitions,
+    )
+    torch.cuda.synchronize()
+
+    assert bool(torch.isfinite(actual).all().item())
+    torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=2.0e-2)
+
+
+@_requires_tile_pa
+class TestBF16Wave:
+    @pytest.fixture
+    def force_wave(self, monkeypatch):
+        from flydsl.runtime.device import get_rocm_arch
+
+        from aiter.ops.flydsl import pa_decode as tile
+        from aiter.ops.flydsl.kernels.pa_decode_bf16_wave import (
+            compile_pa_decode_bf16_wave,
+        )
+
+        if str(get_rocm_arch()).split(":", 1)[0] != "gfx950":
+            pytest.skip("The async BF16 specialization requires gfx950")
+
+        def compile_small_case(**kw):
+            assert kw["query_length"] == 8 and kw["query_group_size"] == 16
+            assert kw["kv_dtype"] == "bf16" and kw["block_size"] == 64
+            assert kw["v_head_dim"] == 128
+            return compile_pa_decode_bf16_wave(
+                kw["head_dim"], kw["num_partitions"], kw["softmax_scale"]
+            )
+
+        # Production preserves the generic kernel for these deliberately small grids.
+        monkeypatch.setattr(tile, "compile_pa_decode_tile", compile_small_case)
+
+    @pytest.mark.parametrize("entrypoint", ["direct", "ps-allocate", "ps-preallocated"])
+    @pytest.mark.parametrize(
+        "head_dim,context,parts,heads",
+        [
+            (128, 8, 1, (16, 1)),
+            (192, 9, 4, (32, 2)),
+            (128, 63, 3, (32, 2)),
+            (192, 64, 1, (16, 1)),
+            (128, 65, 4, (16, 1)),
+            (192, 127, 3, (32, 2)),
+            (128, 129, 1, (32, 2)),
+            (192, 1027, 8, (16, 1)),
+        ],
+    )
+    def test_bf16_wave_reference(
+        self, force_wave, head_dim, context, parts, heads, entrypoint
+    ):
+        test_tile_pa_vectorized_5d_matches_torch(
+            compute_type="bf16",
+            query_length=8,
+            value_head_size=128,
+            num_partitions=parts,
+            head_size=head_dim,
+            num_heads=heads,
+            context_length=context,
+            batch_size=3,
+            block_size=64,
+            entrypoint=entrypoint,
+        )
+
+    @pytest.mark.parametrize("parts", [1, 4])
+    @pytest.mark.parametrize("heads", [(16, 1), (32, 2)])
+    @pytest.mark.parametrize("query_value", [0.0, -512.0])
+    def test_bf16_wave_constant_logits(self, force_wave, parts, heads, query_value):
+        test_tile_pa_constant_query_causal_frontier(
+            "bf16", parts, 8, heads, query_value
+        )
+
+    @pytest.mark.parametrize("head_dim", [128, 192])
+    @pytest.mark.parametrize("parts", [1, 8])
+    def test_bf16_wave_varlen_strides_and_replay(self, force_wave, head_dim, parts):
+        from aiter.ops.flydsl.pa_decode import pa_decode_tile
+
+        setup_seed(20260919)
+        batch, qlen, qheads, kvheads = 3, 8, 32, 2
+        query = torch.randn(
+            batch * qlen, qheads * 2, head_dim, device="cuda", dtype=torch.bfloat16
+        )[:, ::2]
+        output_storage = torch.full(
+            (batch * qlen, qheads * 2, 128),
+            float("nan"),
+            device="cuda",
+            dtype=query.dtype,
+        )
+        output = output_storage[:, ::2]
+        keys, values = create_kv_cache(
+            10,
+            64,
+            1,
+            kvheads,
+            head_dim,
+            "auto",
+            torch.bfloat16,
+            seed=20260919,
+            device="cuda",
+            itemsize=2,
+            value_head_size=128,
+        )
+        table = torch.tensor(
+            [[9, 8, 7], [6, 5, 4], [3, 2, 1]], device="cuda", dtype=torch.int32
+        )
+        lengths = torch.tensor([8, 65, 129], device="cuda", dtype=torch.int32)
+        indptr = torch.arange(
+            0, (batch + 1) * qlen, qlen, device="cuda", dtype=torch.int32
+        )
+        expected = torch_mha_extend(
+            query, keys[0], values[0], table, lengths, indptr, None, None
+        )
+        value = shuffle_value_cache_layout(values[0])
+        partial_shape = (batch, kvheads, parts, 128)
+        pmax = torch.empty(partial_shape, device="cuda", dtype=torch.float32)
+        psum = torch.empty_like(pmax)
+        pout = torch.empty((*partial_shape, 128), device="cuda", dtype=query.dtype)
+
+        def launch():
+            pa_decode_tile(
+                output,
+                query,
+                keys[0],
+                value,
+                table,
+                lengths,
+                None,
+                None,
+                num_partitions=parts,
+                pmax=pmax,
+                psum=psum,
+                pout=pout,
+            )
+
+        launch()
+        torch.testing.assert_close(output, expected, rtol=0.005, atol=0.005)
+        first = output.clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            launch()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            launch()
+        for _ in range(3):
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.testing.assert_close(output, first, rtol=0, atol=0)
+
+        # Replay must observe changed KV/query data and a moved causal frontier.
+        query.mul_(0.5)
+        keys[0].neg_()
+        values[0].mul_(0.5)
+        value.copy_(shuffle_value_cache_layout(values[0]))
+        lengths.copy_(torch.tensor([9, 64, 128], device="cuda", dtype=lengths.dtype))
+        expected = torch_mha_extend(
+            query, keys[0], values[0], table, lengths, indptr, None, None
+        )
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(output, expected, rtol=0.005, atol=0.005)
+        updated = output.clone()
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(output, updated, rtol=0, atol=0)
+        assert bool(torch.isnan(output_storage[:, 1::2]).all().item())
+
+    def test_bf16_wave_page_offset_above_2gib(self, force_wave):
+        from aiter.ops.flydsl.pa_decode import pa_decode_tile
+
+        # Both K and V page bases exceed a signed 32-bit byte offset.
+        page = (1 << 31) // (128 * 64 * 2) + 3
+        key = torch.empty(
+            (page + 1, 1, 192 // 8, 64, 8), device="cuda", dtype=torch.bfloat16
+        )
+        value = torch.empty(
+            (page + 1, 1, 64 // 8, 128, 8), device="cuda", dtype=torch.bfloat16
+        )
+        key[page].fill_(1)
+        value[page].fill_(2)
+        query = torch.zeros((8, 16, 192), device="cuda", dtype=torch.bfloat16)
+        output = torch.full(
+            (8, 16, 128), float("nan"), device="cuda", dtype=query.dtype
+        )
+        table = torch.tensor([[page]], device="cuda", dtype=torch.int32)
+        lengths = torch.tensor([9], device="cuda", dtype=torch.int32)
+        for parts in (1, 4):
+            pa_decode_tile(
+                output,
+                query,
+                key,
+                value,
+                table,
+                lengths,
+                None,
+                None,
+                num_partitions=parts,
+            )
+            torch.testing.assert_close(
+                output, torch.full_like(output, 2), rtol=0, atol=0
+            )
+
+    @pytest.mark.parametrize(
+        "batch,parts,expect_wave", [(31, 8, False), (32, 8, True), (256, 1, True)]
+    )
+    def test_bf16_wave_dispatch(self, monkeypatch, batch, parts, expect_wave):
+        from flydsl.runtime.device import get_rocm_arch
+
+        from aiter.ops.flydsl import pa_decode as tile
+        from aiter.ops.flydsl.kernels import pa_decode_bf16_wave as wave
+
+        if str(get_rocm_arch()).split(":", 1)[0] != "gfx950":
+            pytest.skip("The async BF16 specialization requires gfx950")
+        selected = []
+        original_wave = wave.compile_pa_decode_bf16_wave
+        original_tile = tile.compile_pa_decode_tile
+
+        def record_wave(*args, **kw):
+            selected.append("wave")
+            return original_wave(*args, **kw)
+
+        def record_tile(*args, **kw):
+            selected.append("tile")
+            return original_tile(*args, **kw)
+
+        monkeypatch.setattr(wave, "compile_pa_decode_bf16_wave", record_wave)
+        monkeypatch.setattr(tile, "compile_pa_decode_tile", record_tile)
+        test_tile_pa_vectorized_5d_matches_torch(
+            compute_type="bf16",
+            query_length=8,
+            value_head_size=128,
+            num_partitions=parts,
+            head_size=192,
+            num_heads=(16, 1),
+            context_length=65,
+            batch_size=batch,
+            block_size=64,
+            entrypoint="direct",
+        )
+        assert selected == ["wave" if expect_wave else "tile"]
+
+
+@_requires_tile_pa
+class TestFP8Wave:
+    @pytest.fixture(scope="class", autouse=True)
+    def fp8_wave(self):
+        from flydsl.runtime.device import get_rocm_arch
+
+        from aiter.ops.flydsl import pa_decode as tile
+
+        if str(get_rocm_arch()).split(":", 1)[0] != "gfx950":
+            pytest.skip("The FP8 wave specialization requires gfx950")
+        return tile
+
+    @pytest.mark.parametrize("entrypoint", ["direct", "ps-allocate", "ps-preallocated"])
+    @pytest.mark.parametrize(
+        "dim,context,parts,heads",
+        [
+            (128, 8, 1, (16, 1)),
+            (192, 9, 4, (32, 2)),
+            (128, 63, 3, (32, 2)),
+            (192, 64, 1, (16, 1)),
+            (128, 65, 4, (16, 1)),
+            (192, 127, 3, (32, 2)),
+            (128, 129, 1, (32, 2)),
+            (192, 193, 1, (16, 1)),
+            (128, 257, 4, (32, 2)),
+            (192, 1027, 8, (16, 1)),
+            (128, 2049, 1, (16, 1)),
+            (192, 2049, 32, (32, 2)),
+        ],
+    )
+    def test_fp8_wave_reference(self, dim, context, parts, heads, entrypoint):
+        test_tile_pa_vectorized_5d_matches_torch(
+            compute_type="fp8",
+            query_length=8,
+            value_head_size=128,
+            num_partitions=parts,
+            head_size=dim,
+            num_heads=heads,
+            context_length=context,
+            batch_size=3,
+            block_size=64,
+            entrypoint=entrypoint,
+        )
+
+    @pytest.mark.parametrize("dim", [128, 192])
+    @pytest.mark.parametrize("context", [65, 769])
+    @pytest.mark.parametrize("batch,parts", [(9, 1), (17, 3), (64, 1), (65, 1)])
+    def test_fp8_wave_grouped_grid_boundaries(self, dim, context, batch, parts):
+        # Exercise partial eight-sequence groups and both sides of the small-grid gate.
+        test_tile_pa_vectorized_5d_matches_torch(
+            compute_type="fp8",
+            query_length=8,
+            value_head_size=128,
+            num_partitions=parts,
+            head_size=dim,
+            num_heads=(16, 1),
+            context_length=context,
+            batch_size=batch,
+            block_size=64,
+            entrypoint="direct",
+        )
+
+    @pytest.mark.parametrize("parts", [1, 4])
+    @pytest.mark.parametrize("heads", [(16, 1), (32, 2)])
+    @pytest.mark.parametrize("query_value", [0.0, -512.0])
+    def test_fp8_wave_constant_frontier(self, fp8_wave, parts, heads, query_value):
+        qheads, kvheads = heads
+        query = torch.full(
+            (8, qheads, 192), query_value, device="cuda", dtype=torch.bfloat16
+        )
+        key = torch.ones(
+            (2, kvheads, 12, 64, 16), device="cuda", dtype=torch.float8_e4m3fn
+        )
+        values = torch.full((2, kvheads, 128, 64), 64.0, device="cuda")
+        offsets = torch.arange(kvheads, device="cuda") * 16
+        values[1, :, :, :9] = offsets[:, None, None] + torch.arange(
+            1, 10, device="cuda"
+        )
+        values = values.to(key.dtype)
+        value = shuffle_value_cache_layout(values)
+        table = torch.tensor([[1]], device="cuda", dtype=torch.int32)
+        lengths = torch.tensor([9], device="cuda", dtype=torch.int32)
+        scale = torch.ones(1, device="cuda")
+        output = torch.empty((8, qheads, 128), device="cuda", dtype=query.dtype)
+        fp8_wave.pa_decode_tile(
+            output,
+            query,
+            key,
+            value,
+            table,
+            lengths,
+            scale,
+            scale,
+            num_partitions=parts,
+        )
+        # The oracle must average stored FP8 values, including rounding above 16.
+        prefix = values[1, :, 0, :9].float().cumsum(-1)
+        visible = torch.arange(2, 10, device="cuda")
+        expected = (
+            (prefix[:, visible - 1] / visible)
+            .T.repeat_interleave(16, 1)[:, :, None]
+            .expand_as(output)
+        )
+        torch.testing.assert_close(output.float(), expected, rtol=0.02, atol=0.02)
+
+    @pytest.mark.parametrize("dim", [128, 192])
+    @pytest.mark.parametrize("parts", [1, 4, 32])
+    @pytest.mark.parametrize("zero_query", [False, True])
+    @pytest.mark.parametrize(
+        "contexts", [(8, 321, 1089), (511, 512, 513), (513, 769, 1089), (63, 255, 1027)]
+    )
+    def test_fp8_wave_page_signatures_and_mutated_graph(
+        self, fp8_wave, dim, parts, zero_query, contexts
+    ):
+        setup_seed(20260919)
+        batch, qlen, qheads, kvheads = 3, 8, 32, 2
+        max_blocks = max((length + 63) // 64 for length in contexts)
+        pages = batch * max_blocks + 1
+        query = torch.randn(
+            batch * qlen, qheads * 2, dim, device="cuda", dtype=torch.bfloat16
+        )[:, ::2]
+        if zero_query:
+            query.zero_()
+        storage = torch.full(
+            (batch * qlen, qheads * 2, 128),
+            float("nan"),
+            device="cuda",
+            dtype=query.dtype,
+        )
+        output = storage[:, ::2]
+        key = torch.randn(pages, kvheads, dim // 16, 64, 16, device="cuda").to(
+            torch.float8_e4m3fn
+        )
+        # Distinct values for pages, tokens, heads, and channels expose stale ring slots.
+        pg = torch.arange(pages, device="cuda")[:, None, None, None]
+        hd = torch.arange(kvheads, device="cuda")[None, :, None, None]
+        ch = torch.arange(128, device="cuda")[None, None, :, None]
+        tok = torch.arange(64, device="cuda")[None, None, None, :]
+        values = ((pg * 5 + hd * 3 + ch + tok * 7) % 15 - 7).to(torch.float8_e4m3fn)
+        value = shuffle_value_cache_layout(values)
+        table = (
+            torch.randperm(pages, device="cuda", dtype=torch.int64)[
+                : batch * max_blocks
+            ]
+            .to(torch.int32)
+            .reshape(batch, max_blocks)
+        )
+        lengths = torch.tensor(contexts, device="cuda", dtype=torch.int32)
+        indptr = torch.arange(
+            0, (batch + 1) * qlen, qlen, device="cuda", dtype=torch.int32
+        )
+        ks = torch.tensor([0.37], device="cuda")
+        vs = torch.tensor([0.63], device="cuda")
+        partial_shape = (batch, kvheads, parts, 128)
+        pmax = torch.empty(partial_shape, device="cuda")
+        psum = torch.empty_like(pmax)
+        pout = torch.empty((*partial_shape, 128), device="cuda", dtype=query.dtype)
+
+        def reference():
+            return torch_mha_extend(
+                query,
+                key,
+                values,
+                table,
+                lengths,
+                indptr,
+                ks.expand(kvheads, pages * 64),
+                vs.expand(kvheads, pages * 64),
+            )
+
+        def launch():
+            fp8_wave.pa_decode_tile(
+                output,
+                query,
+                key,
+                value,
+                table,
+                lengths,
+                ks,
+                vs,
+                num_partitions=parts,
+                pmax=pmax,
+                psum=psum,
+                pout=pout,
+            )
+
+        expected = reference()
+        launch()
+        torch.testing.assert_close(output, expected, rtol=0.02, atol=0.02)
+        first = output.clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            launch()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            launch()
+        for _ in range(32):
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.testing.assert_close(output, first, rtol=0, atol=0)
+
+        query.mul_(0.5)
+        key.copy_((-key.float()).to(key.dtype))
+        values.copy_((-values.float()).to(values.dtype))
+        value.copy_(shuffle_value_cache_layout(values))
+        table.copy_(table.flip(1))
+        lengths.copy_(
+            torch.tensor(
+                [contexts[2], contexts[0], contexts[1]],
+                device="cuda",
+                dtype=lengths.dtype,
+            )
+        )
+        ks.fill_(0.23)
+        vs.fill_(0.71)
+        expected = reference()
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(output, expected, rtol=0.02, atol=0.02)
+        updated = output.clone()
+        for _ in range(32):
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.testing.assert_close(output, updated, rtol=0, atol=0)
+        assert bool(torch.isnan(storage[:, 1::2]).all().item())
+
+    @pytest.mark.parametrize("dim", [128, 192])
+    @pytest.mark.parametrize("parts", [1, 4])
+    @pytest.mark.parametrize("context", [257, 769])
+    def test_fp8_wave_high_pages(self, fp8_wave, dim, parts, context):
+        high = (1 << 31) // (128 * 64) + 3
+        key = torch.empty(
+            (high + 1, 1, dim // 16, 64, 16), device="cuda", dtype=torch.float8_e4m3fn
+        )
+        value = torch.empty((high + 1, 1, 4, 128, 16), device="cuda", dtype=key.dtype)
+        key[0].zero_()
+        value[0].zero_()
+        key[high - 1].fill_(-0.25)
+        key[high].fill_(0.25)
+        value[high - 1].fill_(-1)
+        value[high].fill_(1)
+        query = torch.ones((8, 16, dim), device="cuda", dtype=torch.bfloat16)
+        output = torch.empty((8, 16, 128), device="cuda", dtype=query.dtype)
+        table = torch.tensor(
+            [[high - (page % 2) for page in range((context + 63) // 64)]],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        lengths = torch.tensor([context], device="cuda", dtype=torch.int32)
+        scale = torch.ones(1, device="cuda")
+        selected_k = torch.cat(
+            [key[p].permute(2, 0, 1, 3).reshape(64, 1, dim) for p in table[0].tolist()]
+        )[:context]
+        selected_v = torch.cat(
+            [
+                value[p].permute(1, 3, 0, 2).reshape(64, 1, 128)
+                for p in table[0].tolist()
+            ]
+        )[:context]
+        expected = reference_masked_attention(
+            query,
+            selected_k.float(),
+            selected_v.float(),
+            dim**-0.5,
+            query.dtype,
+            is_causal=True,
+        )
+        assert expected.float().abs().min().item() > 0.5
+        fp8_wave.pa_decode_tile(
+            output,
+            query,
+            key,
+            value,
+            table,
+            lengths,
+            scale,
+            scale,
+            num_partitions=parts,
+        )
+        torch.testing.assert_close(output, expected, rtol=0.02, atol=0.02)
+
+    @pytest.mark.parametrize(
+        "case,expected",
+        [
+            ("d128", "fp8-small"),
+            ("d192", "fp8-small"),
+            ("grid64", "fp8-small"),
+            ("grid65", "fp8-wave"),
+            ("qlen1", "generic"),
+            ("qlen4", "generic"),
+            ("gqa8", "generic"),
+            ("page16", "generic"),
+            ("d64", "generic"),
+            ("v192", "generic"),
+            ("fp16-query", "generic"),
+            ("per-token", "generic"),
+            ("plain-v", "generic"),
+            ("zero-scale", "generic"),
+            ("negative-scale", "generic"),
+            ("gfx942", "generic"),
+        ],
+    )
+    def test_fp8_wave_dispatch(self, monkeypatch, case, expected):
+        from aiter.ops.flydsl import pa_decode as tile
+        from aiter.ops.flydsl.kernels import pa_decode_fp8_small as small
+        from aiter.ops.flydsl.kernels import pa_decode_fp8_wave as wave
+
+        selected = []
+
+        def record_wave(*args, **kwargs):
+            selected.append("fp8-wave")
+            return {"launch": object()}
+
+        def record_small(*args, **kwargs):
+            selected.append("fp8-small")
+            return {"launch": object()}
+
+        def record_generic(**kwargs):
+            selected.append("generic")
+            return {"launch": object()}
+
+        monkeypatch.setattr(wave, "compile_pa_decode_fp8_wave", record_wave)
+        monkeypatch.setattr(small, "compile_pa_decode_fp8_small", record_small)
+        monkeypatch.setattr(tile, "compile_pa_decode_tile", record_generic)
+        monkeypatch.setattr(tile, "_run_compiled", lambda *args: None)
+        batch, qlen, heads, dim, vdim, page = 2, 8, 16, 128, 128, 64
+        qdtype, kvdtype = torch.bfloat16, torch.float8_e4m3fn
+        softmax_scale = None
+        if case == "d192":
+            dim = 192
+        elif case == "grid64":
+            batch = 64
+        elif case == "grid65":
+            batch = 65
+        elif case == "qlen1":
+            qlen = 1
+        elif case == "qlen4":
+            qlen = 4
+        elif case == "gqa8":
+            heads = 8
+        elif case == "page16":
+            page = 16
+        elif case == "d64":
+            dim = 64
+        elif case == "v192":
+            vdim = 192
+        elif case == "fp16-query":
+            qdtype = torch.float16
+        elif case == "zero-scale":
+            softmax_scale = 0.0
+        elif case == "negative-scale":
+            softmax_scale = -0.5
+        elif case == "gfx942":
+            kvdtype = torch.float8_e4m3fnuz
+            monkeypatch.setattr(tile, "get_rocm_arch", lambda: "gfx942")
+
+        query = torch.empty((batch * qlen, heads, dim), dtype=qdtype, device="cuda")
+        output = torch.empty((batch * qlen, heads, vdim), dtype=qdtype, device="cuda")
+        key = torch.empty((1, 1, dim // 16, page, 16), dtype=kvdtype, device="cuda")
+        vshape = (
+            (1, 1, vdim, page) if case == "plain-v" else (1, 1, page // 16, vdim, 16)
+        )
+        value = torch.empty(vshape, dtype=kvdtype, device="cuda")
+        table = torch.empty((batch, 1), dtype=torch.int32, device="cuda")
+        lengths = torch.empty((batch,), dtype=torch.int32, device="cuda")
+        scale_shape = (1, 1, page) if case == "per-token" else (1,)
+        scale = torch.empty(scale_shape, dtype=torch.float32, device="cuda")
+        tile.pa_decode_tile(
+            output,
+            query,
+            key,
+            value,
+            table,
+            lengths,
+            scale,
+            scale,
+            softmax_scale,
+            num_partitions=1,
+        )
+        assert selected == [expected]
+
+
+@_requires_tile_pa
+class TestMetadata:
+    @pytest.mark.parametrize("compute_type", ["bf16", "fp8"])
+    @pytest.mark.parametrize("entrypoint", ["direct", "ps-preallocated"])
+    @pytest.mark.parametrize(
+        "invalid,match",
+        [
+            ("table_rows", "block_tables must have shape"),
+            ("table_rank", "block_tables must have shape"),
+            ("table_empty", "block_tables must have shape"),
+            ("table_row_stride", "block_tables must be contiguous"),
+            ("table_column_stride", "block_tables must be contiguous"),
+            ("length_stride", "context_lengths must be contiguous"),
+            ("length_rank", "context_lengths must be a non-empty 1D"),
+            ("table_device", "block_tables must be on"),
+            ("length_device", "context_lengths must be on"),
+        ],
+    )
+    def test_tile_rejects_unsupported_metadata(
+        self, monkeypatch, compute_type, entrypoint, invalid, match
+    ):
+        from aiter.ops.flydsl import pa_decode as tile
+        from aiter.ops.flydsl.kernels import pa_decode_bf16_wave as wave
+        from aiter.ops.flydsl.kernels import pa_decode_fp8_small as small
+        from aiter.ops.flydsl.kernels import pa_decode_fp8_wave as fp8_wave
+
+        def unexpected_compile(*args, **kwargs):
+            pytest.fail("Invalid metadata reached kernel compilation or launch")
+
+        monkeypatch.setattr(tile, "compile_pa_decode_tile", unexpected_compile)
+        monkeypatch.setattr(wave, "compile_pa_decode_bf16_wave", unexpected_compile)
+        monkeypatch.setattr(fp8_wave, "compile_pa_decode_fp8_wave", unexpected_compile)
+        monkeypatch.setattr(small, "compile_pa_decode_fp8_small", unexpected_compile)
+        monkeypatch.setattr(tile, "_run_compiled", unexpected_compile)
+        batch, heads, dim, page, parts = 32, 16, 128, 64, 8
+        dtype = dtypes.d_dtypes[compute_type]
+        vector = 16 // dtype.itemsize
+        query = torch.empty(
+            (batch * 8, heads, dim), dtype=torch.bfloat16, device="cuda"
+        )
+        output = torch.empty_like(query)
+        key = torch.empty(
+            (batch * 2, 1, dim // vector, page, vector), dtype=dtype, device="cuda"
+        )
+        value = torch.empty(
+            (batch * 2, 1, page // vector, dim, vector), dtype=dtype, device="cuda"
+        )
+        table = torch.zeros((batch, 2), dtype=torch.int32, device="cuda")
+        lengths = torch.full((batch,), 65, dtype=torch.int32, device="cuda")
+        scale = (
+            torch.ones(1, dtype=torch.float32, device="cuda")
+            if compute_type == "fp8"
+            else None
+        )
+        partial_shape = (batch, 1, parts, 8 * heads)
+        pmax = torch.empty(partial_shape, dtype=torch.float32, device="cuda")
+        psum = torch.empty_like(pmax)
+        pout = torch.empty((*partial_shape, dim), dtype=query.dtype, device="cuda")
+        if invalid == "table_rows":
+            table = torch.zeros((batch + 1, 2), dtype=table.dtype, device=table.device)
+        elif invalid == "table_rank":
+            table = table.unsqueeze(-1)
+        elif invalid == "table_empty":
+            table = table[:, :0]
+        elif invalid == "table_row_stride":
+            table = torch.zeros((batch, 3), dtype=table.dtype, device=table.device)[
+                :, :2
+            ]
+        elif invalid == "table_column_stride":
+            table = torch.zeros((batch, 4), dtype=table.dtype, device=table.device)[
+                :, ::2
+            ]
+        elif invalid == "length_stride":
+            lengths = torch.full(
+                (batch * 2,), 65, dtype=lengths.dtype, device=lengths.device
+            )[::2]
+        elif invalid == "length_rank":
+            lengths = lengths.unsqueeze(-1)
+        elif invalid == "table_device":
+            table = table.cpu()
+        elif invalid == "length_device":
+            lengths = lengths.cpu()
+
+        with pytest.raises(ValueError, match=match):
+            if entrypoint == "direct":
+                tile.pa_decode_tile(
+                    output,
+                    query,
+                    key,
+                    value,
+                    table,
+                    lengths,
+                    scale,
+                    scale,
+                    num_partitions=parts,
+                )
+            else:
+                flydsl_ps_launch(
+                    output=output,
+                    query=query,
+                    key_cache=key,
+                    value_cache=value,
+                    context_lengths=lengths,
+                    kv_page_indices=torch.zeros(
+                        batch * 2, dtype=torch.int32, device="cuda"
+                    ),
+                    kv_indptr=torch.arange(
+                        0, (batch + 1) * 2, 2, dtype=torch.int32, device="cuda"
+                    ),
+                    softmax_scale=dim**-0.5,
+                    key_scale=scale,
+                    value_scale=scale,
+                    block_tables=table,
+                    max_context_partition_num=parts,
+                    max_logits=pmax,
+                    exp_sums=psum,
+                    temporary_output=pout,
+                )
+
+    @pytest.mark.parametrize("compute_type", ["bf16", "fp8"])
+    @pytest.mark.parametrize("entrypoint", ["direct", "ps-preallocated"])
+    def test_tile_dense_metadata_storage_offsets(
+        self, monkeypatch, compute_type, entrypoint
+    ):
+        original_reference = torch_mha_extend
+        seen = []
+
+        def reference(
+            query, key, value, table, lengths, indptr, ks, vs, *args, **kwargs
+        ):
+            padded_table = torch.empty(
+                (table.shape[0] + 1, table.shape[1]),
+                dtype=table.dtype,
+                device=table.device,
+            )
+            padded_table[1:].copy_(table)
+            table.set_(padded_table[1:])
+            padded_lengths = torch.empty(
+                (lengths.numel() + 1,), dtype=lengths.dtype, device=lengths.device
+            )
+            padded_lengths[1:].copy_(lengths)
+            lengths.set_(padded_lengths[1:])
+            assert table.is_contiguous() and lengths.is_contiguous()
+            assert table.storage_offset() > 0 and lengths.storage_offset() > 0
+            seen.append(True)
+            return original_reference(
+                query, key, value, table, lengths, indptr, ks, vs, *args, **kwargs
+            )
+
+        monkeypatch.setattr(sys.modules[__name__], "torch_mha_extend", reference)
+        test_tile_pa_vectorized_5d_matches_torch(
+            compute_type=compute_type,
+            query_length=8,
+            value_head_size=128,
+            num_partitions=8,
+            head_size=128,
+            num_heads=(16, 1),
+            context_length=65,
+            batch_size=32,
+            block_size=64,
+            entrypoint=entrypoint,
+        )
+        assert seen == [True]
+
+
+def make_case(dtype="bf16", parts=4):
+    kv_dtype = torch.bfloat16 if dtype == "bf16" else torch.float8_e4m3fn
+    vector = 16 // kv_dtype.itemsize
+    shape = (2, 1, parts, 128)
+    scale = torch.ones(1, device="cuda") if dtype == "fp8" else None
     return {
-        "gfx": get_gfx_runtime(),
-        "partitions": args[8],
-        "trans_v": trans_v,
-        "per_token": per_token,
-        "flydsl us": us,
-        "flydsl us/token": us / (batch_size * query_length),
-        "flydsl TFLOPS": flops / us / 1e6,
-        "flydsl TB/s": nbytes / us / 1e6,
-        "flydsl err": 0,
+        "output": torch.empty((16, 16, 128), device="cuda", dtype=torch.bfloat16),
+        "query": torch.zeros((16, 16, 128), device="cuda", dtype=torch.bfloat16),
+        "key_cache": torch.zeros(
+            (2, 1, 128 // vector, 64, vector), device="cuda", dtype=kv_dtype
+        ),
+        "value_cache": torch.ones(
+            (2, 1, 64 // vector, 128, vector), device="cuda", dtype=kv_dtype
+        ),
+        "block_tables": torch.tensor([[0], [1]], device="cuda", dtype=torch.int32),
+        "context_lengths": torch.full((2,), 8, device="cuda", dtype=torch.int32),
+        "key_scale": scale,
+        "value_scale": scale,
+        "num_partitions": parts,
+        "pmax": torch.empty(shape, device="cuda"),
+        "psum": torch.empty(shape, device="cuda"),
+        "pout": torch.empty((*shape, 128), device="cuda", dtype=torch.bfloat16),
     }
 
 
-def _positive_int(value):
-    value = int(value)
-    if value < 1:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return value
+@_requires_tile_pa
+class TestAPI:
+    def test_public_exports(self):
+        assert flydsl_pa_decode_tile is tile.pa_decode_tile
+        assert flydsl_pa_decode_ps is tile.pa_decode_ps_launch
+
+    @pytest.mark.parametrize(
+        "name", ["key_cache", "value_cache", "output", "pmax", "psum", "pout"]
+    )
+    def test_rejects_wrong_device_before_compile(self, monkeypatch, name):
+        args = make_case()
+        args[name] = args[name].cpu()
+        monkeypatch.setattr(
+            tile,
+            "compile_pa_decode_tile",
+            lambda **kw: pytest.fail("unexpected compilation"),
+        )
+        with pytest.raises(ValueError, match=name):
+            flydsl_pa_decode_tile(**args)
+
+    @pytest.mark.parametrize(
+        "name", ["key_cache", "value_cache", "pmax", "psum", "pout"]
+    )
+    def test_rejects_noncontiguous_storage(self, monkeypatch, name):
+        args = make_case()
+        original = args[name]
+        args[name] = torch.empty(
+            (*original.shape[:-1], original.shape[-1] * 2),
+            device="cuda",
+            dtype=original.dtype,
+        )[..., ::2]
+        monkeypatch.setattr(
+            tile,
+            "compile_pa_decode_tile",
+            lambda **kw: pytest.fail("unexpected compilation"),
+        )
+        with pytest.raises(ValueError, match=name):
+            flydsl_pa_decode_tile(**args)
+
+    @pytest.mark.parametrize("parts", [-1, 1.5, True])
+    def test_rejects_invalid_partition_count(self, parts):
+        args = make_case()
+        args["num_partitions"] = parts
+        with pytest.raises(ValueError, match="num_partitions"):
+            flydsl_pa_decode_tile(**args)
+
+    @pytest.mark.parametrize("name", ["pmax", "psum", "pout"])
+    def test_rejects_partial_workspace_set(self, name):
+        args = make_case()
+        args[name] = None
+        with pytest.raises(ValueError, match="provide all"):
+            flydsl_pa_decode_tile(**args)
+
+    @pytest.mark.parametrize("name", ["pmax", "psum", "pout"])
+    def test_rejects_wrong_workspace_dtype(self, name):
+        args = make_case()
+        args[name] = args[name].to(torch.float64)
+        with pytest.raises(ValueError, match=name):
+            flydsl_pa_decode_tile(**args)
+
+    @pytest.mark.parametrize("name", ["key_scale", "value_scale"])
+    def test_rejects_multielement_scalar_scale(self, name):
+        args = make_case("fp8")
+        args[name] = torch.ones(2, device="cuda")
+        with pytest.raises(ValueError, match="one element"):
+            flydsl_pa_decode_tile(**args)
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+    def test_np1_preallocated_dummy(self, dtype):
+        args = make_case(dtype, 1)
+        args["psum"] = args["pout"] = None
+        flydsl_pa_decode_tile(**args)
+        torch.testing.assert_close(
+            args["output"], torch.ones_like(args["output"]), rtol=0, atol=0
+        )
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+    def test_explicit_stream_and_replay(self, dtype):
+        args = make_case(dtype)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        args["stream"] = stream
+        flydsl_pa_decode_tile(**args)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            flydsl_pa_decode_tile(**args)
+        args["output"].zero_()
+        graph.replay()
+        torch.testing.assert_close(
+            args["output"], torch.ones_like(args["output"]), rtol=0, atol=0
+        )
+
+    def test_capture_rejects_python_scales_before_compile(self, monkeypatch):
+        args = make_case("fp8")
+        args["key_scale"] = args["value_scale"] = 1.0
+        monkeypatch.setattr(tile, "_is_current_stream_capturing", lambda: True)
+        with pytest.raises(ValueError, match="pre-created FP8 scale tensors"):
+            flydsl_pa_decode_tile(**args)
+
+    @pytest.mark.parametrize("kind", ["python", "cpu", "dtype"])
+    @pytest.mark.parametrize("entrypoint", ["direct", "ps"])
+    def test_explicit_stream_rejects_scale_conversion(self, kind, entrypoint):
+        args = make_case("fp8")
+        args["stream"] = torch.cuda.Stream()
+        if kind == "python":
+            args["key_scale"] = 1.0
+        elif kind == "cpu":
+            args["key_scale"] = args["key_scale"].cpu()
+        else:
+            args["key_scale"] = args["key_scale"].to(torch.float16)
+        with pytest.raises(
+            ValueError, match="Explicit-stream PA decode requires pre-created"
+        ):
+            if entrypoint == "direct":
+                flydsl_pa_decode_tile(**args)
+            else:
+                parts = args.pop("num_partitions")
+                pmax, psum, pout = (args.pop(name) for name in ("pmax", "psum", "pout"))
+                flydsl_pa_decode_ps(
+                    **args,
+                    kv_page_indices=None,
+                    kv_indptr=None,
+                    softmax_scale=128**-0.5,
+                    max_context_partition_num=parts,
+                    max_logits=pmax,
+                    exp_sums=psum,
+                    temporary_output=pout,
+                )
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+    def test_automatic_splits_remain_capped(self, dtype):
+        args = make_case(dtype)
+        args["num_partitions"] = None
+        args["pmax"] = args["psum"] = args["pout"] = None
+        assert 4 <= tile.get_recommended_splits(2, 1, 4) <= 8
+        flydsl_pa_decode_tile(**args)
+        torch.testing.assert_close(
+            args["output"], torch.ones_like(args["output"]), rtol=0, atol=0
+        )
+
+    @pytest.mark.parametrize("context", [8, 65, 511, 512, 513])
+    @pytest.mark.parametrize("dim", [128, 192])
+    def test_throughput_grid_fp8_short_context(self, dim, context):
+        test_tile_pa_vectorized_5d_matches_torch(
+            compute_type="fp8",
+            query_length=8,
+            value_head_size=128,
+            num_partitions=8,
+            head_size=dim,
+            num_heads=(16, 1),
+            context_length=context,
+            batch_size=32,
+            block_size=64,
+            entrypoint="ps-preallocated",
+        )
+
+    @pytest.mark.parametrize("dim", [128, 192])
+    @pytest.mark.parametrize("page", [16, 64])
+    @pytest.mark.parametrize("query_dtype", [torch.bfloat16, torch.float16])
+    def test_fp8_per_token_and_4d_value_fallback(self, dim, page, query_dtype):
+        setup_seed(20260919)
+        batch, context, heads, kv_heads, qlen, parts = 2, 1027, 32, 2, 8, 4
+        blocks = (context + page - 1) // page
+        pages = batch * blocks
+        query = torch.empty(
+            (batch * qlen, heads, dim), device="cuda", dtype=query_dtype
+        ).uniform_(-0.5, 0.5)
+        key = (
+            torch.empty((pages, kv_heads, dim // 16, page, 16), device="cuda")
+            .uniform_(-1, 1)
+            .to(torch.float8_e4m3fn)
+        )
+        value = (
+            torch.empty((pages, kv_heads, 128, page), device="cuda")
+            .uniform_(-1, 1)
+            .to(key.dtype)
+        )
+        ks = torch.empty((pages, kv_heads, page), device="cuda").uniform_(0.5, 1.0)
+        vs = torch.empty_like(ks).uniform_(0.25, 0.75)
+        table = torch.arange(
+            pages - 1, -1, -1, device="cuda", dtype=torch.int32
+        ).reshape(batch, blocks)
+        lengths = torch.full((batch,), context, device="cuda", dtype=torch.int32)
+        indptr = torch.arange(
+            0, (batch + 1) * qlen, qlen, device="cuda", dtype=torch.int32
+        )
+        expected = torch_mha_extend(
+            query,
+            key,
+            value,
+            table,
+            lengths,
+            indptr,
+            ks.permute(1, 0, 2).reshape(kv_heads, -1),
+            vs.permute(1, 0, 2).reshape(kv_heads, -1),
+        )
+        output = torch.empty_like(expected)
+        flydsl_pa_decode_tile(
+            output, query, key, value, table, lengths, ks, vs, num_partitions=parts
+        )
+        torch.testing.assert_close(output, expected, rtol=0.02, atol=0.02)
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+    @pytest.mark.parametrize("dim", [128, 192])
+    @pytest.mark.parametrize("parts", [3, 65])
+    def test_reducer_partition_boundaries(self, dtype, dim, parts):
+        """Cover non-power-of-two splits and the reducer's multi-wave branch."""
+        test_tile_pa_vectorized_5d_matches_torch(
+            compute_type=dtype,
+            query_length=8,
+            value_head_size=128,
+            num_partitions=parts,
+            head_size=dim,
+            num_heads=(32, 2),
+            context_length=129,
+            batch_size=2,
+            block_size=64,
+            entrypoint="ps-preallocated",
+        )
 
 
-def _parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description="FlyDSL pa_decode correctness + perf sweep"
+class TestStaticPlan:
+    @pytest.mark.parametrize(
+        "dtype,batch,parts,expected",
+        [
+            ("bf16", 31, 8, "tile"),
+            ("bf16", 32, 8, "bf16_wave"),
+            ("bf16", 96, 16, "bf16_wave"),
+            ("fp8", 8, 8, "fp8_small"),
+            ("fp8", 9, 8, "fp8_wave"),
+            ("fp8", 64, 1, "fp8_small"),
+            ("fp8", 65, 1, "fp8_wave"),
+        ],
     )
-    parser.add_argument(
-        "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default=[dtypes.bf16]
-    )
-    parser.add_argument(
-        "-b", "--batch", type=_positive_int, nargs="*", default=DEFAULT_BATCH_SIZES
-    )
-    parser.add_argument(
-        "-q",
-        "--query-length",
-        type=_positive_int,
-        nargs="+",
-        default=[1],
-        help="Query tokens per sequence; context lengths include them.",
-    )
-    parser.add_argument(
-        "-s",
-        "--shapes",
-        type=dtypes.str2tuple,
-        nargs="*",
-        default=DEFAULT_SHAPES,
-        help="num_query_heads,num_kv_heads,head_dim,context_length",
-    )
-    parser.add_argument(
-        "--block-size",
-        type=int,
-        nargs="*",
-        choices=[16, 64, 128],
-        default=[16, 64, 128],
-    )
-    parser.add_argument(
-        "--trans-v",
-        type=int,
-        nargs="*",
-        choices=[0, 1],
-        default=[0, 1],
-        help="0: plain V cache; 1: transposed V cache.",
-    )
-    parser.add_argument(
-        "--per-token",
-        type=int,
-        nargs="*",
-        choices=[0, 1],
-        default=[0],
-        help="0: per-tensor KV scales; 1: per-token KV scales.",
-    )
-    parser.add_argument(
-        "--max-partitions",
-        type=int,
-        default=None,
-        help="Upper clamp for automatic splits (4..256); 8 keeps the legacy clamp.",
-    )
-    parser.add_argument(
-        "--num-partitions",
-        type=_positive_int,
-        nargs="+",
-        default=[None],
-        help="Exact split counts (1..256), overriding --max-partitions.",
-    )
-    args = parser.parse_args(argv)
-    if (
-        args.max_partitions is not None
-        and not 4 <= args.max_partitions <= MAX_CONTEXT_PARTITIONS
+    @pytest.mark.parametrize("dim", [128, 192])
+    def test_kernel_and_workspace(
+        self, monkeypatch, dtype, batch, parts, expected, dim
     ):
-        parser.error(f"--max-partitions must be in [4, {MAX_CONTEXT_PARTITIONS}]")
-    if any(n is not None and n > MAX_CONTEXT_PARTITIONS for n in args.num_partitions):
-        parser.error(f"--num-partitions must be in [1, {MAX_CONTEXT_PARTITIONS}]")
-    for shape in args.shapes:
-        if not isinstance(shape, tuple) or len(shape) != 4 or any(n < 1 for n in shape):
-            parser.error("each --shapes value must contain four positive integers")
-        if shape[0] % shape[1]:
-            parser.error("num_query_heads must be divisible by num_kv_heads")
-    return args
+        from aiter.ops.flydsl.kernels.pa_decode_plan import make_pa_decode_plan
+
+        monkeypatch.setattr(
+            torch.cuda,
+            "get_device_properties",
+            lambda *a: pytest.fail("explicit planning read GPU properties"),
+        )
+        plan = make_pa_decode_plan(
+            arch="gfx950",
+            num_seqs=batch,
+            num_kv_heads=1,
+            query_group_size=16,
+            query_length=8,
+            head_dim=dim,
+            value_head_dim=128,
+            block_size=64,
+            query_dtype="bf16",
+            kv_dtype=dtype,
+            per_token_kv=False,
+            trans_v=True,
+            softmax_scale=None,
+            num_partitions=parts,
+        )
+        assert plan.kernel == expected
+        assert plan.num_partitions == parts
+        assert plan.scalar_shape == (batch, 1, parts, 128)
+        assert plan.output_shape == (batch, 1, parts, 128, 128)
+
+    def test_automatic_policy(self, monkeypatch):
+        from aiter.ops.flydsl.kernels.pa_decode_plan import get_recommended_splits
+
+        monkeypatch.setattr(
+            torch.cuda,
+            "get_device_properties",
+            lambda *a: SimpleNamespace(multi_processor_count=256),
+        )
+        for batch in (1, 3, 32, 96, 200):
+            for heads in (1, 2):
+                for blocks in (4, 16):
+                    expected = max(
+                        4, min(-(-512 // (batch * heads * blocks)) * blocks, 8)
+                    )
+                    assert get_recommended_splits(batch, heads, blocks) == expected
+        assert get_recommended_splits(3, 1, sliding_window=256, query_length=8) == 3
 
 
-def main():
-    # Parse before GPU checks so --help and invalid options remain usable.
-    args = _parse_args()
-    if not torch.cuda.is_available():
-        aiter.logger.warning("ROCm is not available; skipping pa_decode")
-        return
-    if get_gfx_runtime() not in SUPPORTED_GFX or pa_decode is None:
-        aiter.logger.warning("FlyDSL pa_decode is unavailable or unsupported; skipping")
-        return
-    torch.set_default_device("cuda")
-    rows = []
-    for dtype, batch, shape, page, trans_v, per_token, ql, parts in itertools.product(
-        args.dtype,
-        args.batch,
-        args.shapes,
-        args.block_size,
-        args.trans_v,
-        args.per_token,
-        args.query_length,
-        args.num_partitions,
-    ):
-        heads, kv_heads, dim, context = shape
-        rows.append(
-            run_pa_decode_tile_case(
-                batch,
-                heads,
-                kv_heads,
-                dim,
-                context,
-                page,
-                dtype,
-                bool(trans_v),
-                args.max_partitions,
-                bool(per_token),
-                query_length=ql,
+@_requires_tile_pa
+class TestCustomOp:
+    def test_schema_and_export(self):
+        import aiter
+
+        assert aiter.pa_decode_flydsl is pa_decode_flydsl
+        schema = torch.ops.aiter.pa_decode_flydsl.default._schema
+        mutated = {
+            a.name
+            for a in schema.arguments
+            if a.alias_info is not None and a.alias_info.is_write
+        }
+        assert mutated == {"output", "exp_sums", "max_logits", "temporary_output"}
+        assert not schema.returns
+        assert "work_plan" not in {argument.name for argument in schema.arguments}
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+    @pytest.mark.parametrize("dim", [128, 192])
+    @pytest.mark.parametrize("context", [8, 513, 1027])
+    @pytest.mark.parametrize("parts", [1, 8])
+    @pytest.mark.parametrize("entrypoint", ["python", "torch"])
+    def test_reference(self, monkeypatch, dtype, dim, context, parts, entrypoint):
+        calls = []
+        original = tile.pa_decode_tile
+
+        def record(*args, **kwargs):
+            assert not args
+            calls.append(kwargs)
+            return original(**kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(tile, "pa_decode_tile", record)
+            test_tile_pa_vectorized_5d_matches_torch(
+                compute_type=dtype,
+                query_length=8,
+                value_head_size=128,
                 num_partitions=parts,
+                head_size=dim,
+                num_heads=(16, 1),
+                context_length=context,
+                batch_size=32 if parts == 8 else 3,
+                block_size=64,
+                entrypoint="direct",
+            )
+        assert len(calls) == 1
+        args = calls[0]
+        expected = args["output"].clone()
+        args["output"].fill_(float("nan"))
+        operation = (
+            pa_decode_flydsl
+            if entrypoint == "python"
+            else torch.ops.aiter.pa_decode_flydsl
+        )
+        assert operation(**_custom_op_kwargs(args)) is None
+        torch.testing.assert_close(args["output"], expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+    @pytest.mark.parametrize("parts", [1, 4])
+    def test_operator_contract(self, dtype, parts):
+        args = make_case(dtype, parts)
+        kwargs = _custom_op_kwargs(args)
+        for key in ("output", "pmax", "psum", "pout"):
+            args[key].zero_()
+        writable = {"output", "exp_sums", "max_logits", "temporary_output"}
+        before = {
+            key: value.view(torch.uint8).clone()
+            for key, value in kwargs.items()
+            if isinstance(value, torch.Tensor) and key not in writable
+        }
+        torch.ops.aiter.pa_decode_flydsl(**kwargs)
+        for key, expected in before.items():
+            assert torch.equal(kwargs[key].view(torch.uint8), expected)
+        # SchemaCheckMode uses allclose, which does not support CUDA FP8 in
+        # PyTorch 2.9. Check those read-only bytes above; keep FakeTensor/AOT.
+        checks_to_run = ("test_faketensor", "test_aot_dispatch_dynamic")
+        if dtype == "bf16":
+            checks_to_run = ("test_schema", *checks_to_run)
+        checks = torch.library.opcheck(
+            torch.ops.aiter.pa_decode_flydsl.default,
+            (),
+            kwargs,
+            test_utils=checks_to_run,
+        )
+        assert all(value == "SUCCESS" for value in checks.values())
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+    def test_fake_does_not_launch(self, monkeypatch, dtype):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        kwargs = _custom_op_kwargs(make_case(dtype))
+        monkeypatch.setattr(
+            tile,
+            "pa_decode_tile",
+            lambda *a, **k: pytest.fail("FakeTensor dispatched a GPU kernel"),
+        )
+        with FakeTensorMode() as mode:
+            fake = {
+                key: (
+                    mode.from_tensor(value)
+                    if isinstance(value, torch.Tensor)
+                    else value
+                )
+                for key, value in kwargs.items()
+            }
+            assert torch.ops.aiter.pa_decode_flydsl(**fake) is None
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+    def test_capture_and_compile(self, dtype):
+        args = make_case(dtype)
+        kwargs = _custom_op_kwargs(args)
+        op = torch.ops.aiter.pa_decode_flydsl
+        op(**kwargs)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            op(**kwargs)
+        args["output"].zero_()
+        graph.replay()
+        torch.testing.assert_close(
+            args["output"], torch.ones_like(args["output"]), rtol=0, atol=0
+        )
+
+        def run(
+            output, query, key, value, lengths, table, ks, vs, sums, maxima, partial
+        ):
+            torch.ops.aiter.pa_decode_flydsl(
+                output,
+                query,
+                key,
+                value,
+                lengths,
+                table,
+                128**-0.5,
+                8,
+                4,
+                compute_type=key.dtype,
+                key_scale=ks,
+                value_scale=vs,
+                exp_sums=sums,
+                max_logits=maxima,
+                temporary_output=partial,
+            )
+            return output
+
+        compiled = torch.compile(run, backend="aot_eager", fullgraph=True, dynamic=True)
+        args["output"].zero_()
+        result = compiled(
+            *(
+                kwargs[key]
+                for key in (
+                    "output",
+                    "query",
+                    "key_cache",
+                    "value_cache",
+                    "context_lengths",
+                    "block_tables",
+                    "key_scale",
+                    "value_scale",
+                    "exp_sums",
+                    "max_logits",
+                    "temporary_output",
+                )
             )
         )
-    aiter.logger.info(
-        "pa_decode summary (markdown):\n%s", pd.DataFrame(rows).to_markdown(index=False)
+        torch.testing.assert_close(result, torch.ones_like(result), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("dim", [128, 192])
+    @pytest.mark.parametrize("parts", [1, 8])
+    @pytest.mark.skipif(_ARCH != "gfx950", reason="FP8 wave replay requires gfx950")
+    def test_mutated_context_graph(self, dim, parts):
+        TestFP8Wave().test_fp8_wave_page_signatures_and_mutated_graph(
+            SimpleNamespace(pa_decode_tile=_registered_tile),
+            dim,
+            parts,
+            False,
+            (511, 512, 513),
+        )
+
+    def test_per_token_four_dimensional_scales(self):
+        args = make_case("fp8")
+        args["key_scale"] = torch.ones((2, 1, 64, 1), device="cuda")
+        args["value_scale"] = (
+            (torch.arange(1, 65, device="cuda", dtype=torch.float32) / 100)
+            .reshape(1, 1, 64, 1)
+            .expand(2, 1, 64, 1)
+            .contiguous()
+        )
+        kwargs = _custom_op_kwargs(args)
+        torch.ops.aiter.pa_decode_flydsl(**kwargs)
+        expected = (
+            ((torch.arange(1, 9, device="cuda", dtype=torch.float32) + 1) / 200)
+            .repeat(2)
+            .reshape(16, 1, 1)
+            .expand_as(args["output"])
+        )
+        torch.testing.assert_close(
+            args["output"].float(), expected, rtol=0.02, atol=0.02
+        )
+
+    @pytest.mark.parametrize(
+        "changes,match",
+        [
+            ({"query_length": 4}, "query_length"),
+            ({"context_partition_size": 64}, "context_partition_size"),
+            ({"compute_type": torch.float16}, "compute_type"),
+            ({"sliding_window": 64}, "full attention"),
+            ({"sliding_window": -2}, "full attention"),
+        ],
     )
+    def test_rejects_unsupported_contract(self, changes, match):
+        kwargs = _custom_op_kwargs(make_case())
+        kwargs.update(changes)
+        with pytest.raises(ValueError, match=match):
+            torch.ops.aiter.pa_decode_flydsl(**kwargs)
 
+    @pytest.mark.parametrize("name", ["query_scale", "alibi_slopes", "sinks"])
+    def test_rejects_unsupported_tensor_options(self, name):
+        kwargs = _custom_op_kwargs(make_case())
+        kwargs[name] = torch.ones(1, device="cuda")
+        with pytest.raises(ValueError):
+            torch.ops.aiter.pa_decode_flydsl(**kwargs)
 
-if __name__ == "__main__":
-    main()
+    @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+    def test_rejects_padded_block_table(self, dtype):
+        kwargs = _custom_op_kwargs(make_case(dtype))
+        kwargs["block_tables"] = torch.zeros((2, 2), device="cuda", dtype=torch.int32)[
+            :, :1
+        ]
+        with pytest.raises(ValueError, match="block_tables must be contiguous"):
+            torch.ops.aiter.pa_decode_flydsl(**kwargs)
+
+    def test_registration_does_not_import_decode_backend(self):
+        import os
+        import subprocess
+
+        code = """
+import importlib.abc
+import sys
+attempts = []
+class BlockDecode(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "aiter.ops.flydsl.pa_decode":
+            attempts.append(fullname)
+            raise ModuleNotFoundError("decode backend intentionally unavailable", name=fullname)
+sys.meta_path.insert(0, BlockDecode())
+import aiter
+import torch
+assert callable(aiter.pa_decode_flydsl)
+assert torch.ops.aiter.pa_decode_flydsl.default._schema
+assert "aiter.ops.flydsl.pa_decode" not in sys.modules
+assert not attempts
+"""
+        subprocess.run(
+            [sys.executable, "-c", code],
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+    def test_automatic_splits(self, dtype):
+        args = make_case(dtype)
+        args["num_partitions"] = 0
+        args["pmax"] = args["psum"] = args["pout"] = None
+        torch.ops.aiter.pa_decode_flydsl(**_custom_op_kwargs(args))
+        torch.testing.assert_close(
+            args["output"], torch.ones_like(args["output"]), rtol=0, atol=0
+        )
