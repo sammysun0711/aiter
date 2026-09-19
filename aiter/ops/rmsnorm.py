@@ -630,3 +630,31 @@ def rmsnorm(
     epsilon: float,
     gemma_norm: bool = False,
 ) -> None: ...
+
+
+@compile_ops("module_rmsnorm_quant", develop=True)
+def mimo_add_rmsnorm_fp8_group_quant(
+    quantized: Tensor,
+    normalized: Tensor,
+    scale: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    weight: Tensor,
+    epsilon: float,
+) -> None:
+    """MiMo N=6144 fused add, RMSNorm, and per-1x128 FP8 quantization."""
+    ...
+
+
+@compile_ops("module_rmsnorm_quant", develop=True)
+def mimo_rmsnorm_fp8_group_quant(
+    quantized: Tensor,
+    normalized: Tensor,
+    scale: Tensor,
+    input: Tensor,
+    weight: Tensor,
+    epsilon: float,
+) -> None:
+    """MiMo N=6144 fused RMSNorm and per-1x128 FP8 quantization."""
+    ...

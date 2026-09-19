@@ -29,6 +29,7 @@ The kernel implements self-attention only (Lq == Lk). Cross-attention
 from __future__ import annotations
 
 from functools import lru_cache
+from numbers import Real
 
 import torch
 import torch.nn.functional as F
@@ -42,9 +43,11 @@ from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
 
 __all__ = [
     "flydsl_flash_attn_batch_func",
+    "flydsl_flash_attn_batch_prefill_func",
     "flydsl_flash_attn_func",
     "flydsl_flash_attn_varlen_bwd",
     "flydsl_flash_attn_varlen_func",
+    "flydsl_paged_attention_swa_bf16",
 ]
 
 
@@ -218,6 +221,229 @@ def flydsl_flash_attn_func(
     if seq_len_pad != seq_len_real:
         return o_p[:, :seq_len_real, :, :].contiguous()
     return o_p
+
+
+def flydsl_flash_attn_batch_prefill_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    kv_indptr,
+    kv_page_indices,
+    max_seqlen_q,
+    max_seqlen_k,
+    *,
+    dropout_p=0.0,
+    softmax_scale=None,
+    logits_soft_cap=0.0,
+    causal=False,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+    deterministic=False,
+    return_lse=False,
+    return_attn_probs=False,
+    out=None,
+    kv_last_page_lens=None,
+    block_table=None,
+    seqlen_k=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    kv_block_descale=None,
+    sink_ptr=None,
+    sink_size=0,
+):
+    """Native gfx950 FP8 paged prefill, or None for another AITER backend."""
+    if not all(torch.is_tensor(tensor) for tensor in (q, k, v)):
+        return None
+    if not (
+        q.ndim == 3
+        and q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+        and q.is_cuda
+        and q.device == k.device == v.device
+        and causal
+        and dropout_p == 0.0
+        and logits_soft_cap == 0.0
+        and len(window_size) >= 2
+        and all(w < 0 for w in window_size[:2])
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and alibi_slopes is None
+        and sink_ptr is None
+        and sink_size == 0
+        and kv_block_descale is None
+        and not return_lse
+        and not return_attn_probs
+        and not any(tensor.requires_grad for tensor in (q, k, v))
+    ):
+        return None
+    from .kernels.flash_attn_paged_fp8_func_gfx950 import (
+        _cache_geometry,
+        _gpu_arch,
+        _is_valid_softmax_scale,
+        flydsl_flash_attn_paged_fp8_func,
+    )
+
+    if _gpu_arch(q.device) != "gfx950":
+        return None
+    if softmax_scale is not None and not isinstance(softmax_scale, Real):
+        return None
+    if not _is_valid_softmax_scale(softmax_scale):
+        return None
+    if any(
+        not torch.is_tensor(scale)
+        or scale.dtype != torch.float32
+        or scale.numel() != 1
+        or scale.device != q.device
+        or scale.requires_grad
+        for scale in (q_descale, k_descale, v_descale)
+    ):
+        return None
+    if out is not None and (out.dtype != torch.bfloat16 or not out.is_contiguous()):
+        return None
+    # These positional metadata arguments remain part of the AITER contract
+    # even when the rectangular block table takes precedence over CSR lookup.
+    if not all(
+        torch.is_tensor(tensor)
+        and tensor.dtype == torch.int32
+        and tensor.device == q.device
+        and tensor.ndim == 1
+        for tensor in (cu_seqlens_q, kv_indptr, kv_page_indices)
+    ):
+        return None
+    if kv_indptr.shape != cu_seqlens_q.shape:
+        return None
+    try:
+        _cache_geometry(q, k, v)
+    except NotImplementedError:
+        return None
+    return flydsl_flash_attn_paged_fp8_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        max_seqlen_q,
+        max_seqlen_k,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        out=out,
+    )
+
+
+@lru_cache(maxsize=64)
+def _get_paged_attention_swa_bf16(
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_v: int,
+    page_size: int,
+    window_left: int,
+    has_sink: bool,
+    block_n: int | None,
+    query_tile: int | None,
+):
+    from .kernels.mha_pa_swa_bf16 import PagedAttention
+
+    return PagedAttention(
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_v,
+        page_size,
+        is_causal=True,
+        window_left=window_left,
+        has_sink=has_sink,
+        block_n=block_n,
+        query_tile=query_tile,
+    )
+
+
+def flydsl_paged_attention_swa_bf16(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    *,
+    window_left: int,
+    kv_last_page_lens: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    causal: bool = True,
+    cu_seqlens_k: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    sink_ptr: torch.Tensor | None = None,
+    stream: torch.cuda.Stream | None = None,
+    return_lse: bool = False,
+    lse: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
+    block_n: int | None = None,
+    query_tile: int | None = None,
+):
+    """Run native BF16 paged sliding-window attention on gfx942/gfx950.
+
+    The cache must use page-64 SHUFFLE-5D layout. ``window_left`` counts only
+    keys to the left of the current query; a model window that includes the
+    current token therefore maps to ``window_left=model_window-1``.
+    Caller-owned metadata, scale, output, and LSE buffers make the operation
+    suitable for CUDA/HIP graph capture after the shape-specific first call.
+    """
+    if not causal:
+        raise ValueError("FlyDSL paged SWA requires causal=True")
+    if q.ndim != 3 or k.ndim != 5 or v.ndim != 5:
+        raise ValueError("expected packed Q [T,H,D] and SHUFFLE-5D paged K/V")
+
+    # DFlash verification uses very short Q (normally 4 or 8) against a 1K
+    # visible window. The generic BM32/BN32 default leaves half or more of the
+    # query tile idle there; MI355X tuning selects BM16/BN64 for this regime.
+    if max_seqlen_q <= 16 and window_left >= 64:
+        block_n = 64 if block_n is None else block_n
+        query_tile = 16 if query_tile is None else query_tile
+
+    op = _get_paged_attention_swa_bf16(
+        q.shape[1],
+        k.shape[1],
+        q.shape[2],
+        v.shape[3],
+        k.shape[3],
+        int(window_left),
+        sink_ptr is not None,
+        block_n,
+        query_tile,
+    )
+    return op(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        kv_indptr,
+        kv_page_indices,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal,
+        q_descale,
+        k_descale,
+        v_descale,
+        kv_last_page_lens,
+        out=out,
+        sink_ptr=sink_ptr,
+        stream=stream,
+        return_lse=return_lse,
+        lse=lse,
+        softmax_scale=softmax_scale,
+    )
 
 
 @lru_cache(maxsize=64)

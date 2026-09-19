@@ -40,4 +40,20 @@ void rmsnorm(aiter_tensor_t& out,
              double epsilon,
              bool gemma_norm = false);
 
+void mimo_add_rmsnorm_fp8_group_quant(aiter_tensor_t& quantized,
+                                      aiter_tensor_t& normalized,
+                                      aiter_tensor_t& scale,
+                                      aiter_tensor_t& input,
+                                      aiter_tensor_t& residual_in,
+                                      aiter_tensor_t& residual_out,
+                                      aiter_tensor_t& weight,
+                                      double epsilon);
+
+void mimo_rmsnorm_fp8_group_quant(aiter_tensor_t& quantized,
+                                  aiter_tensor_t& normalized,
+                                  aiter_tensor_t& scale,
+                                  aiter_tensor_t& input,
+                                  aiter_tensor_t& weight,
+                                  double epsilon);
+
 } // namespace aiter

@@ -1612,6 +1612,7 @@ def cmdGenFunc_mha_batch_prefill(
         filter_fwd += "_nsink*"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
+        f"--targets {get_gfx()} "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
     ]
     return {
@@ -4096,6 +4097,40 @@ def mha_batch_prefill_func(
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+    if q.dtype == torch.float8_e4m3fn:
+        from .flydsl.fmha_kernels import flydsl_flash_attn_batch_prefill_func
+
+        flydsl_result = flydsl_flash_attn_batch_prefill_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            kv_indptr,
+            kv_page_indices,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            out=out,
+            kv_last_page_lens=kv_last_page_lens,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            kv_block_descale=kv_block_descale,
+            sink_ptr=sink_ptr,
+            sink_size=sink_size,
+        )
+        if flydsl_result is not None:
+            return flydsl_result
     if sink_ptr is not None:
         assert sink_ptr.device == q.device, "sink_ptr must be on the same device as q"
         assert sink_ptr.shape[0] == q.size(1), "sink_ptr has incorrect shape"
@@ -4126,8 +4161,12 @@ def mha_batch_prefill_func(
     else:
         if k.size(-1) != head_size_q_og:
             raise ValueError("K linear layout does not match Q head size")
-        if k.size(1) != v.size(1) or k.size(2) != v.size(2):
-            raise ValueError("K/V linear layout must match page size and head count")
+        if k.dim() == 4:
+            same_token_head_shape = k.shape[:3] == v.shape[:3]
+        else:
+            same_token_head_shape = k.shape[:2] == v.shape[:2]
+        if not same_token_head_shape:
+            raise ValueError("K/V linear layout must match token/page and head axes")
     if k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("Batch prefill requires K/V with contiguous last dimension")
     out_padded, softmax_lse, S_dmask, _rng_state = _mha_batch_prefill(

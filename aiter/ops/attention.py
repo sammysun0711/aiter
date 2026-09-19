@@ -22,12 +22,79 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 from ..jit.core import compile_ops, is_experimental_enabled
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 
+try:
+    from aiter.ops.flydsl.pa_decode import PADecodePlan
+    from aiter.ops.flydsl.pa_decode import pa_decode as _pa_decode_flydsl
+except (ImportError, AttributeError, RuntimeError, OSError):
+    _pa_decode_flydsl = None
+
 MD_NAME = "module_attention"
+
+
+def pa_decode_flydsl(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    context_lengths: torch.Tensor,
+    block_tables: torch.Tensor,
+    softmax_scale: float,
+    query_length: int,
+    max_context_partition_num: int | None = None,
+    context_partition_size: int = 256,
+    compute_type: torch.dtype = torch.bfloat16,
+    query_scale: torch.Tensor = None,
+    key_scale: torch.Tensor = None,
+    value_scale: torch.Tensor = None,
+    exp_sums: torch.Tensor = None,
+    max_logits: torch.Tensor = None,
+    temporary_output: torch.Tensor = None,
+    alibi_slopes: torch.Tensor = None,
+    ps: bool = True,
+    sinks: torch.Tensor = None,
+    sliding_window: int = 0,
+    work_plan: "PADecodePlan | None" = None,
+) -> None:
+    """FlyDSL paged decode with optional GPU-planned partition metadata."""
+    if _pa_decode_flydsl is None:
+        raise RuntimeError("pa_decode_flydsl requires the `flydsl` package")
+    _pa_decode_flydsl(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        softmax_scale,
+        query_length,
+        max_context_partition_num,
+        context_partition_size,
+        compute_type,
+        query_scale,
+        key_scale,
+        value_scale,
+        exp_sums,
+        max_logits,
+        temporary_output,
+        alibi_slopes,
+        sinks,
+        sliding_window,
+        ps,
+        work_plan=work_plan,
+    )
+
 
 direct_register_custom_op(
     "pa_decode_gluon",
     pa_decode_gluon,
     ["output", "exp_sums", "max_logits", "temporary_output"],
+)
+
+direct_register_custom_op(
+    "pa_decode_flydsl",
+    pa_decode_flydsl,
+    ["output", "exp_sums", "max_logits", "temporary_output"],
+    python_only_args=("work_plan",),
 )
 
 
