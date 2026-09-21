@@ -14,15 +14,14 @@ gfx950 retains its K32 MFMA path; gfx942 splits each K32 into two native K16s.
 import functools
 import math
 
-import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import as_ir_value, gpu, rocdl
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from flydsl.expr import as_ir_value, gpu, rocdl
 
-from .mha_pa_swa_dsl import select, rmem, resource, wait
-
+from .mha_pa_swa_dsl import resource, rmem, select, wait
 
 BM, DV, PAGE, THREADS = 16, 128, 64, 64
 LOG2E = math.log2(math.e)
@@ -42,15 +41,36 @@ def _max(a, b):
 
 def _page(table, index):
     address = fx.Int64(fx.ptrtoint(fx.get_iter(table) + fx.Int64(index)))
-    value = fx.Int32(llvm.inline_asm(fx.Int32.ir_type, [address.ir_value()],
-                                    "s_load_dword $0, $1, 0", "=s,s,~{memory}", has_side_effects=True))
-    return fx.Int32(llvm.inline_asm(fx.Int32.ir_type, [value.ir_value()],
-                                   "s_waitcnt lgkmcnt(0)", "=s,0", has_side_effects=True))
+    value = fx.Int32(
+        llvm.inline_asm(
+            fx.Int32.ir_type,
+            [address.ir_value()],
+            "s_load_dword $0, $1, 0",
+            "=s,s,~{memory}",
+            has_side_effects=True,
+        )
+    )
+    return fx.Int32(
+        llvm.inline_asm(
+            fx.Int32.ir_type,
+            [value.ir_value()],
+            "s_waitcnt lgkmcnt(0)",
+            "=s,0",
+            has_side_effects=True,
+        )
+    )
 
 
 def _exp(value):
-    return fx.Float32(llvm.call_intrinsic(fx.Float32.ir_type, "llvm.amdgcn.exp2.f32",
-                                         [fx.Float32(value).ir_value()], [], []))
+    return fx.Float32(
+        llvm.call_intrinsic(
+            fx.Float32.ir_type,
+            "llvm.amdgcn.exp2.f32",
+            [fx.Float32(value).ir_value()],
+            [],
+            [],
+        )
+    )
 
 
 def _maxf(a, b):
@@ -60,8 +80,14 @@ def _maxf(a, b):
 def _local_reduce(values, maximum=False):
     partials = [values[i] for i in range(values.numel)]
     while len(partials) > 1:
-        partials = [(_maxf(partials[i], partials[i + 1]) if maximum else partials[i] + partials[i + 1])
-                    for i in range(0, len(partials), 2)]
+        partials = [
+            (
+                _maxf(partials[i], partials[i + 1])
+                if maximum
+                else partials[i] + partials[i + 1]
+            )
+            for i in range(0, len(partials), 2)
+        ]
     return partials[0]
 
 
@@ -80,8 +106,12 @@ def _row_reduce(value, maximum=False, arch=950):
     for swap in (rocdl.permlane16_swap, rocdl.permlane32_swap):
         bits = value.bitcast(fx.Int32).ir_value()
         pair = swap(pair_type, bits, bits, False, True)
-        lo = fx.Int32(llvm.extractvalue(fx.Int32.ir_type, pair, [0])).bitcast(fx.Float32)
-        hi = fx.Int32(llvm.extractvalue(fx.Int32.ir_type, pair, [1])).bitcast(fx.Float32)
+        lo = fx.Int32(llvm.extractvalue(fx.Int32.ir_type, pair, [0])).bitcast(
+            fx.Float32
+        )
+        hi = fx.Int32(llvm.extractvalue(fx.Int32.ir_type, pair, [1])).bitcast(
+            fx.Float32
+        )
         value = _maxf(lo, hi) if maximum else lo + hi
     return value
 
@@ -97,13 +127,22 @@ def _mma(k, arch):
     # the second k%8 >= 4. Q/K and P/V use the SAME K permutation, so their
     # dot products need no cross-lane repack. Explicit fragment shapes below
     # double the K-iteration count and preserve the original register order.
-    return fx.make_tiled_mma(fx.make_mma_atom(rocdl.MFMA(16, 16, _atom_k(k, arch), fx.BFloat16)),
-                             fx.make_layout((1, 1, 1), (1, 1, 1)))
+    return fx.make_tiled_mma(
+        fx.make_mma_atom(rocdl.MFMA(16, 16, _atom_k(k, arch), fx.BFloat16)),
+        fx.make_layout((1, 1, 1), (1, 1, 1)),
+    )
 
 
 def _load(resource, voffset, soffset, words=4):
-    return fx.Vector(rocdl.raw_ptr_buffer_load(ir.VectorType.get([words], fx.Int32.ir_type), as_ir_value(resource),
-                                              fx.Int32(voffset).ir_value(), fx.Int32(soffset).ir_value(), fx.Int32(0).ir_value()))
+    return fx.Vector(
+        rocdl.raw_ptr_buffer_load(
+            ir.VectorType.get([words], fx.Int32.ir_type),
+            as_ir_value(resource),
+            fx.Int32(voffset).ir_value(),
+            fx.Int32(soffset).ir_value(),
+            fx.Int32(0).ir_value(),
+        )
+    )
 
 
 def _resource(tensor, size):
@@ -111,8 +150,14 @@ def _resource(tensor, size):
 
 
 def _q_load(resource, lane, dq, qrow, arch, row_base=0):
-    parts = [_load(resource, (((lane & 15) + row_base) * qrow + (lane >> 4) * 8 + k * 32) * 2, 0)
-             for k in range(dq // 32)]
+    parts = [
+        _load(
+            resource,
+            (((lane & 15) + row_base) * qrow + (lane >> 4) * 8 + k * 32) * 2,
+            0,
+        )
+        for k in range(dq // 32)
+    ]
     words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
     frag = _mma(32, arch).make_fragment_B(rmem((BM, dq), fx.BFloat16))
     frag.store(words.bitcast(fx.BFloat16))
@@ -131,7 +176,11 @@ def _k_load(tensor, lane, tile, physical, dq, hk, hkv, bn):
     parts = []
     base = (tile & 63) * 16
     for n in range(bn // 16):
-        row = lane & 15 if bn == 16 else (lane & 3) + ((lane & 12) << 1) + (n & 1) * 4 + (n // 2) * 32
+        row = (
+            lane & 15
+            if bn == 16
+            else (lane & 3) + ((lane & 12) << 1) + (n & 1) * 4 + (n // 2) * 32
+        )
         for k in range(dq // 32):
             offset = (((lane >> 4) + k * 4) * PAGE + row) * 16
             parts.append(_load(resource, offset, base))
@@ -156,7 +205,9 @@ def _v_load(tensor, lane, tile, physical, hk, hkv, bn):
             token = (lane >> 4) * (atom_k // 4) + k * atom_k
             offset = (token // 8 * DV + n * 16 + (lane & 15)) * 16 + (token & 7) * 2
             parts.append(_load(resource, offset, base, atom_k // 8))
-    words = fx.Vector.from_elements([p[i] for p in parts for i in range(atom_k // 8)], fx.Int32)
+    words = fx.Vector.from_elements(
+        [p[i] for p in parts for i in range(atom_k // 8)], fx.Int32
+    )
     return words
 
 
@@ -167,18 +218,45 @@ def _qk_pair(q0, q1, words, dq, bn, arch):
     k.store(fx.Vector(words).bitcast(fx.BFloat16))
     qs = rmem((atom_k // 4, dq // atom_k, 2), fx.BFloat16)
     a, b = q0.load(), q1.load()
-    qs.store(fx.Vector.from_elements([a[i] for i in range(a.numel)] + [b[i] for i in range(b.numel)], fx.BFloat16))
+    qs.store(
+        fx.Vector.from_elements(
+            [a[i] for i in range(a.numel)] + [b[i] for i in range(b.numel)], fx.BFloat16
+        )
+    )
     score = mma.make_fragment_C(rmem((bn, 32), fx.Float32))
     score.fill(0.0)
-    fx.gemm(mma, score, select(k, [0, 2, 1]), select(qs, [0, 2, 1]), score, traversal_order="mnk")
+    fx.gemm(
+        mma,
+        score,
+        select(k, [0, 2, 1]),
+        select(qs, [0, 2, 1]),
+        score,
+        traversal_order="mnk",
+    )
     values = score.load()
-    return (fx.Vector.from_elements([values[i] for i in range(bn // 4)], fx.Float32),
-            fx.Vector.from_elements([values[i + bn // 4] for i in range(bn // 4)], fx.Float32))
+    return (
+        fx.Vector.from_elements([values[i] for i in range(bn // 4)], fx.Float32),
+        fx.Vector.from_elements(
+            [values[i + bn // 4] for i in range(bn // 4)], fx.Float32
+        ),
+    )
 
 
 @flyc.jit
-def _softmax_tile(scores, output, maximum, total, scale, row, tile, kv_len, q_len,
-                  WINDOW: fx.Constexpr[int], BN: fx.Constexpr[int], ARCH: fx.Constexpr[int]):
+def _softmax_tile(
+    scores,
+    output,
+    maximum,
+    total,
+    scale,
+    row,
+    tile,
+    kv_len,
+    q_len,
+    WINDOW: fx.Constexpr[int],
+    BN: fx.Constexpr[int],
+    ARCH: fx.Constexpr[int],
+):
     lane = fx.Int32(gpu.thread_id("x"))
     values = fx.Vector(scores)
     diagonal = kv_len - q_len + row
@@ -187,7 +265,11 @@ def _softmax_tile(scores, output, maximum, total, scale, row, tile, kv_len, q_le
     if (tile < diagonal0 + 15 - WINDOW) | (tile + BN > diagonal0 + 1):
         masked = []
         for i in fx.range_constexpr(BN // 4):
-            col = tile + ((lane >> 4) * 4 + i if BN == 16 else (lane >> 4) * 8 + (i // 8) * 32 + i % 8)
+            col = tile + (
+                (lane >> 4) * 4 + i
+                if BN == 16
+                else (lane >> 4) * 8 + (i // 8) * 32 + i % 8
+            )
             # Live query rows imply diagonal < kv_len; unsigned distance
             # combines causal and left-window bounds into one comparison.
             valid = fx.Uint32(diagonal - col) <= fx.Uint32(WINDOW)
@@ -197,7 +279,9 @@ def _softmax_tile(scores, output, maximum, total, scale, row, tile, kv_len, q_le
     maximum, total, output = fx.Float32(maximum), fx.Float32(total), fx.Vector(output)
     advance = candidate - maximum > 8.0
     new_max = advance.select(_maxf(maximum, candidate), maximum)
-    probs = fx.Vector.from_elements([_exp(values[i] - new_max) for i in range(BN // 4)], fx.Float32)
+    probs = fx.Vector.from_elements(
+        [_exp(values[i] - new_max) for i in range(BN // 4)], fx.Float32
+    )
     ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, advance.ir_value()))
     if ballot != fx.Int64(0):
         correction = _exp(maximum - new_max)
@@ -211,15 +295,33 @@ def _pv_pair(p0, p1, vwords, o0, o1, bn, arch):
     atom_k = _atom_k(16 if bn == 16 else 32, arch)
     mma = _mma(atom_k, arch)
     ps = rmem((atom_k // 4, bn // atom_k, 2), fx.BFloat16)
-    ps.store(fx.Vector.from_elements([p0[i] for i in range(bn // 4)] + [p1[i] for i in range(bn // 4)], fx.BFloat16))
+    ps.store(
+        fx.Vector.from_elements(
+            [p0[i] for i in range(bn // 4)] + [p1[i] for i in range(bn // 4)],
+            fx.BFloat16,
+        )
+    )
     vs = rmem((atom_k // 4, bn // atom_k, 8), fx.BFloat16)
     vs.store(fx.Vector(vwords).bitcast(fx.BFloat16))
     acc = mma.make_fragment_C(rmem((128, 32), fx.Float32))
-    acc.store(fx.Vector.from_elements([o0[i] for i in range(32)] + [o1[i] for i in range(32)], fx.Float32))
-    fx.gemm(mma, acc, select(vs, [0, 2, 1]), select(ps, [0, 2, 1]), acc, traversal_order="mnk")
+    acc.store(
+        fx.Vector.from_elements(
+            [o0[i] for i in range(32)] + [o1[i] for i in range(32)], fx.Float32
+        )
+    )
+    fx.gemm(
+        mma,
+        acc,
+        select(vs, [0, 2, 1]),
+        select(ps, [0, 2, 1]),
+        acc,
+        traversal_order="mnk",
+    )
     values = acc.load()
-    return (fx.Vector.from_elements([values[i] for i in range(32)], fx.Float32),
-            fx.Vector.from_elements([values[i + 32] for i in range(32)], fx.Float32))
+    return (
+        fx.Vector.from_elements([values[i] for i in range(32)], fx.Float32),
+        fx.Vector.from_elements([values[i + 32] for i in range(32)], fx.Float32),
+    )
 
 
 @flyc.jit
@@ -235,14 +337,30 @@ def _mask_v(words, lane, tile, kv_len, BN: fx.Constexpr[int]):
                 mask = (token < kv_len).select(fx.Int32(0xFFFF), fx.Int32(0))
                 mask = mask | (token + 1 < kv_len).select(fx.Int32(-65536), fx.Int32(0))
                 masks.append(mask)
-        values = fx.Vector.from_elements([values[i] & masks[i % len(masks)] for i in range(values.numel)], fx.Int32)
+        values = fx.Vector.from_elements(
+            [values[i] & masks[i % len(masks)] for i in range(values.numel)], fx.Int32
+        )
     return values
 
 
 @flyc.jit
-def _compute(q, kwords, vwords, output, maximum, total, scale, row, tile, kv_len, q_len,
-             WINDOW: fx.Constexpr[int], BN: fx.Constexpr[int], DQ: fx.Constexpr[int], ARCH: fx.Constexpr[int]):
-    lane = fx.Int32(gpu.thread_id("x"))
+def _compute(
+    q,
+    kwords,
+    vwords,
+    output,
+    maximum,
+    total,
+    scale,
+    row,
+    tile,
+    kv_len,
+    q_len,
+    WINDOW: fx.Constexpr[int],
+    BN: fx.Constexpr[int],
+    DQ: fx.Constexpr[int],
+    ARCH: fx.Constexpr[int],
+):
     qk_atom_k = _atom_k(32, ARCH)
     k_storage = rmem((qk_atom_k // 4, DQ // qk_atom_k, BN // 16), fx.BFloat16)
     k_storage.store(fx.Vector(kwords).bitcast(fx.BFloat16))
@@ -250,8 +368,20 @@ def _compute(q, kwords, vwords, output, maximum, total, scale, row, tile, kv_len
     scores = _mma(32, ARCH).make_fragment_C(rmem((BN, BM), fx.Float32))
     scores.fill(0.0)
     fx.gemm(_mma(32, ARCH), scores, k, q, scores, traversal_order="kmn")
-    probs, output, new_max, total = _softmax_tile(scores.load(), output, maximum, total, scale,
-                                                row, tile, kv_len, q_len, WINDOW, BN, ARCH)
+    probs, output, new_max, total = _softmax_tile(
+        scores.load(),
+        output,
+        maximum,
+        total,
+        scale,
+        row,
+        tile,
+        kv_len,
+        q_len,
+        WINDOW,
+        BN,
+        ARCH,
+    )
     atom_k = _atom_k(16 if BN == 16 else 32, ARCH)
     pmma = _mma(atom_k, ARCH)
     p = pmma.make_fragment_B(rmem((BM, BN), fx.BFloat16))
@@ -262,8 +392,18 @@ def _compute(q, kwords, vwords, output, maximum, total, scale, row, tile, kv_len
         words = fx.Vector(vwords)
         parts = []
         for begin in fx.range_constexpr(0, words.numel, 8):
-            chunk = fx.Vector.from_elements([words[i] for i in range(begin, min(begin + 8, words.numel))], fx.Int32)
-            pinned = fx.Vector(llvm.inline_asm(chunk.ir_value().type, [chunk.ir_value()], "", "=v,0", has_side_effects=True))
+            chunk = fx.Vector.from_elements(
+                [words[i] for i in range(begin, min(begin + 8, words.numel))], fx.Int32
+            )
+            pinned = fx.Vector(
+                llvm.inline_asm(
+                    chunk.ir_value().type,
+                    [chunk.ir_value()],
+                    "",
+                    "=v,0",
+                    has_side_effects=True,
+                )
+            )
             parts.extend(pinned[i] for i in range(pinned.numel))
         vwords = fx.Vector.from_elements(parts, fx.Int32)
     v_storage = rmem((atom_k // 4, BN // atom_k, DV // 16), fx.BFloat16)
@@ -276,14 +416,41 @@ def _compute(q, kwords, vwords, output, maximum, total, scale, row, tile, kv_len
 
 
 @flyc.kernel(known_block_size=[THREADS, 1, 1])
-def _swa_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
-    CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor,
-    QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor, SINK: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], DQ: fx.Constexpr[int],
-    QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
-    WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool],
-    WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float], BN: fx.Constexpr[int], ARCH: fx.Constexpr[int]):
-    head, batch, qb = fx.Int32(gpu.block_id("x")), fx.Int32(gpu.block_id("y")), fx.Int32(gpu.block_id("z"))
+def _swa_kernel(
+    Q: fx.Tensor,
+    K: fx.Tensor,
+    V: fx.Tensor,
+    O: fx.Tensor,
+    LSE: fx.Tensor,
+    CQ: fx.Tensor,
+    KI: fx.Tensor,
+    PAGES: fx.Tensor,
+    LAST: fx.Tensor,
+    QS: fx.Tensor,
+    KS: fx.Tensor,
+    VS: fx.Tensor,
+    SINK: fx.Tensor,
+    H: fx.Constexpr[int],
+    HK: fx.Constexpr[int],
+    NP: fx.Constexpr[int],
+    DQ: fx.Constexpr[int],
+    QROW: fx.Constexpr[int],
+    QHEAD: fx.Constexpr[int],
+    OROW: fx.Constexpr[int],
+    OHEAD: fx.Constexpr[int],
+    WINDOW: fx.Constexpr[int],
+    HAS_SINK: fx.Constexpr[bool],
+    PER_TOKEN: fx.Constexpr[bool],
+    WITH_LSE: fx.Constexpr[bool],
+    SCALE: fx.Constexpr[float],
+    BN: fx.Constexpr[int],
+    ARCH: fx.Constexpr[int],
+):
+    head, batch, qb = (
+        fx.Int32(gpu.block_id("x")),
+        fx.Int32(gpu.block_id("y")),
+        fx.Int32(gpu.block_id("z")),
+    )
     lane = fx.Int32(gpu.thread_id("x"))
     q0 = _uniform(CQ[batch])
     q_len = _uniform(CQ[batch + 1]) - q0
@@ -295,13 +462,24 @@ def _swa_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.
         valid_q = _min(fx.Int32(BM), q_len - qstart)
         row = qstart + (lane & 15)
         hkv = head // (H // HK)
-        table = fx.make_view(fx.get_iter(PAGES) + fx.Int64(start), fx.make_layout(pages, 1))
-        gq = _resource(fx.make_view(fx.get_iter(Q) + ((fx.Int64(q0) + fx.Int64(qstart)) * QROW + fx.Int64(head) * QHEAD),
-                                     fx.make_layout(BM * QROW, 1)), valid_q * QROW * 2)
+        table = fx.make_view(
+            fx.get_iter(PAGES) + fx.Int64(start), fx.make_layout(pages, 1)
+        )
+        gq = _resource(
+            fx.make_view(
+                fx.get_iter(Q)
+                + ((fx.Int64(q0) + fx.Int64(qstart)) * QROW + fx.Int64(head) * QHEAD),
+                fx.make_layout(BM * QROW, 1),
+            ),
+            valid_q * QROW * 2,
+        )
         q = _q_load(gq, lane, DQ, QROW, ARCH)
         scale = fx.Float32(KS[0]) * fx.Float32(SCALE * LOG2E)
         if fx.const_expr(PER_TOKEN):
-            scale = scale * rocdl.make_buffer_tensor(QS, max_size=False)[(q0 + row) * H + head]
+            scale = (
+                scale
+                * rocdl.make_buffer_tensor(QS, max_size=False)[(q0 + row) * H + head]
+            )
         else:
             scale = scale * QS[0]
         first = _max(qstart + kv_len - q_len - WINDOW, fx.Int32(0)) & -BN
@@ -320,58 +498,201 @@ def _swa_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.
             for tile in range(first, end, fx.Int32(BN)):
                 wait(vmcnt=0)
                 vw = _mask_v(vw, lane, tile, kv_len, BN)
-                output, maximum, total = _compute(q, k, vw, output, maximum, total, scale,
-                                                  row, tile, kv_len, q_len, WINDOW, BN, DQ, ARCH)
+                output, maximum, total = _compute(
+                    q,
+                    k,
+                    vw,
+                    output,
+                    maximum,
+                    total,
+                    scale,
+                    row,
+                    tile,
+                    kv_len,
+                    q_len,
+                    WINDOW,
+                    BN,
+                    DQ,
+                    ARCH,
+                )
                 if tile + BN < end:
                     page = _page(table, (tile + BN) >> 6)
                     k = _k_load(K, lane, tile + BN, page, DQ, HK, hkv, BN)
                     vw = _v_load(V, lane, tile + BN, page, HK, hkv, BN)
-        outbuf = rocdl.make_buffer_tensor(fx.make_view(
-            fx.get_iter(O) + ((fx.Int64(q0) + fx.Int64(qstart)) * OROW + fx.Int64(head) * OHEAD),
-            fx.make_layout(BM * OROW, 1)), num_records_bytes=valid_q * OROW * 2)
+        outbuf = rocdl.make_buffer_tensor(
+            fx.make_view(
+                fx.get_iter(O)
+                + ((fx.Int64(q0) + fx.Int64(qstart)) * OROW + fx.Int64(head) * OHEAD),
+                fx.make_layout(BM * OROW, 1),
+            ),
+            num_records_bytes=valid_q * OROW * 2,
+        )
         total = _row_reduce(total, arch=ARCH)
         inv = (total > 0.0).select(fx.Float32(1.0) / total, fx.Float32(0.0)) * VS[0]
         atom = fx.make_copy_atom(rocdl.BufferCopy64b(), fx.BFloat16)
         for n in fx.range_constexpr(DV // 16):
-            values = fx.Vector.from_elements([output[n * 4 + j] * inv for j in range(4)], fx.Float32)
+            values = fx.Vector.from_elements(
+                [output[n * 4 + j] * inv for j in range(4)], fx.Float32
+            )
             src = rmem(4, fx.BFloat16)
             src.store(values.to(fx.BFloat16))
             offset = (lane & 15) * OROW + (lane >> 4) * 4 + n * 16
-            fx.copy(atom, src, fx.make_view(fx.get_iter(outbuf) + offset, fx.make_layout(4, 1)))
-        if fx.const_expr(WITH_LSE):
+            fx.copy(
+                atom,
+                src,
+                fx.make_view(fx.get_iter(outbuf) + offset, fx.make_layout(4, 1)),
+            )
+        if fx.const_expr(WITH_LSE):  # noqa: SIM102 - inner predicate is runtime SSA
             if (lane < 16) & (lane < valid_q):
-                log_l = fx.Float32(llvm.call_intrinsic(fx.Float32.ir_type, "llvm.log2.f32", [total.ir_value()], [], []))
+                log_l = fx.Float32(
+                    llvm.call_intrinsic(
+                        fx.Float32.ir_type, "llvm.log2.f32", [total.ir_value()], [], []
+                    )
+                )
                 LSE[(q0 + row) * H + head] = (total > 0.0).select(
-                    (maximum + log_l) * fx.Float32(math.log(2.0)), fx.Float32(float("-inf")))
+                    (maximum + log_l) * fx.Float32(math.log(2.0)),
+                    fx.Float32(float("-inf")),
+                )
 
 
 @flyc.jit
-def _launch(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
-    CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor,
-    QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor, SINK: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], B: fx.Constexpr[int], MAX_Q: fx.Constexpr[int],
-    DQ: fx.Constexpr[int], QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
-    WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool], WITH_LSE: fx.Constexpr[bool],
-    SCALE: fx.Constexpr[float], BN: fx.Constexpr[int], QUERY_TILE: fx.Constexpr[int], ARCH: fx.Constexpr[int], stream: fx.Stream):
+def _launch(
+    Q: fx.Tensor,
+    K: fx.Tensor,
+    V: fx.Tensor,
+    O: fx.Tensor,
+    LSE: fx.Tensor,
+    CQ: fx.Tensor,
+    KI: fx.Tensor,
+    PAGES: fx.Tensor,
+    LAST: fx.Tensor,
+    QS: fx.Tensor,
+    KS: fx.Tensor,
+    VS: fx.Tensor,
+    SINK: fx.Tensor,
+    H: fx.Constexpr[int],
+    HK: fx.Constexpr[int],
+    NP: fx.Constexpr[int],
+    B: fx.Int32,
+    MAX_Q: fx.Int32,
+    DQ: fx.Constexpr[int],
+    QROW: fx.Constexpr[int],
+    QHEAD: fx.Constexpr[int],
+    OROW: fx.Constexpr[int],
+    OHEAD: fx.Constexpr[int],
+    WINDOW: fx.Constexpr[int],
+    HAS_SINK: fx.Constexpr[bool],
+    PER_TOKEN: fx.Constexpr[bool],
+    WITH_LSE: fx.Constexpr[bool],
+    SCALE: fx.Constexpr[float],
+    BN: fx.Constexpr[int],
+    QUERY_TILE: fx.Constexpr[int],
+    ARCH: fx.Constexpr[int],
+    stream: fx.Stream,
+):
+    grid_y = fx.Int64(B)
     if fx.const_expr(QUERY_TILE == 32):
-        _swa32_kernel(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK,
-            H, HK, NP, DQ, QROW, QHEAD, OROW, OHEAD, WINDOW, HAS_SINK, PER_TOKEN, WITH_LSE, SCALE, BN, ARCH,
-        ).launch(grid=(H, B, (MAX_Q + 31) // 32), block=(THREADS, 1, 1), stream=stream)
+        grid_z = (fx.Int64(MAX_Q) + fx.Int64(31)) // fx.Int64(32)
+        _swa32_kernel(
+            Q,
+            K,
+            V,
+            O,
+            LSE,
+            CQ,
+            KI,
+            PAGES,
+            LAST,
+            QS,
+            KS,
+            VS,
+            SINK,
+            H,
+            HK,
+            NP,
+            DQ,
+            QROW,
+            QHEAD,
+            OROW,
+            OHEAD,
+            WINDOW,
+            HAS_SINK,
+            PER_TOKEN,
+            WITH_LSE,
+            SCALE,
+            BN,
+            ARCH,
+        ).launch(grid=(H, grid_y, grid_z), block=(THREADS, 1, 1), stream=stream)
     else:
-        _swa_kernel(Q, K, V, O, LSE, CQ, KI, PAGES, LAST, QS, KS, VS, SINK,
-            H, HK, NP, DQ, QROW, QHEAD, OROW, OHEAD, WINDOW, HAS_SINK, PER_TOKEN, WITH_LSE, SCALE, BN, ARCH,
-        ).launch(grid=(H, B, (MAX_Q + BM - 1) // BM), block=(THREADS, 1, 1), stream=stream)
+        grid_z = (fx.Int64(MAX_Q) + fx.Int64(BM - 1)) // fx.Int64(BM)
+        _swa_kernel(
+            Q,
+            K,
+            V,
+            O,
+            LSE,
+            CQ,
+            KI,
+            PAGES,
+            LAST,
+            QS,
+            KS,
+            VS,
+            SINK,
+            H,
+            HK,
+            NP,
+            DQ,
+            QROW,
+            QHEAD,
+            OROW,
+            OHEAD,
+            WINDOW,
+            HAS_SINK,
+            PER_TOKEN,
+            WITH_LSE,
+            SCALE,
+            BN,
+            ARCH,
+        ).launch(grid=(H, grid_y, grid_z), block=(THREADS, 1, 1), stream=stream)
 
 
 @flyc.kernel(known_block_size=[THREADS, 1, 1])
-def _swa32_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: fx.Tensor,
-    CQ: fx.Tensor, KI: fx.Tensor, PAGES: fx.Tensor, LAST: fx.Tensor,
-    QS: fx.Tensor, KS: fx.Tensor, VS: fx.Tensor, SINK: fx.Tensor,
-    H: fx.Constexpr[int], HK: fx.Constexpr[int], NP: fx.Constexpr[int], DQ: fx.Constexpr[int],
-    QROW: fx.Constexpr[int], QHEAD: fx.Constexpr[int], OROW: fx.Constexpr[int], OHEAD: fx.Constexpr[int],
-    WINDOW: fx.Constexpr[int], HAS_SINK: fx.Constexpr[bool], PER_TOKEN: fx.Constexpr[bool],
-    WITH_LSE: fx.Constexpr[bool], SCALE: fx.Constexpr[float], BN: fx.Constexpr[int], ARCH: fx.Constexpr[int]):
-    head, batch, qb = fx.Int32(gpu.block_id("x")), fx.Int32(gpu.block_id("y")), fx.Int32(gpu.block_id("z"))
+def _swa32_kernel(
+    Q: fx.Tensor,
+    K: fx.Tensor,
+    V: fx.Tensor,
+    O: fx.Tensor,
+    LSE: fx.Tensor,
+    CQ: fx.Tensor,
+    KI: fx.Tensor,
+    PAGES: fx.Tensor,
+    LAST: fx.Tensor,
+    QS: fx.Tensor,
+    KS: fx.Tensor,
+    VS: fx.Tensor,
+    SINK: fx.Tensor,
+    H: fx.Constexpr[int],
+    HK: fx.Constexpr[int],
+    NP: fx.Constexpr[int],
+    DQ: fx.Constexpr[int],
+    QROW: fx.Constexpr[int],
+    QHEAD: fx.Constexpr[int],
+    OROW: fx.Constexpr[int],
+    OHEAD: fx.Constexpr[int],
+    WINDOW: fx.Constexpr[int],
+    HAS_SINK: fx.Constexpr[bool],
+    PER_TOKEN: fx.Constexpr[bool],
+    WITH_LSE: fx.Constexpr[bool],
+    SCALE: fx.Constexpr[float],
+    BN: fx.Constexpr[int],
+    ARCH: fx.Constexpr[int],
+):
+    head, batch, qb = (
+        fx.Int32(gpu.block_id("x")),
+        fx.Int32(gpu.block_id("y")),
+        fx.Int32(gpu.block_id("z")),
+    )
     lane = fx.Int32(gpu.thread_id("x"))
     q0 = _uniform(CQ[batch])
     q_len = _uniform(CQ[batch + 1]) - q0
@@ -383,10 +704,20 @@ def _swa32_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: f
         valid_q = _min(fx.Int32(32), q_len - qstart)
         row = qstart + (lane & 15)
         hkv = head // (H // HK)
-        table = fx.make_view(fx.get_iter(PAGES) + fx.Int64(start), fx.make_layout(pages, 1))
-        gq = _resource(fx.make_view(fx.get_iter(Q) + ((fx.Int64(q0) + fx.Int64(qstart)) * QROW + fx.Int64(head) * QHEAD),
-                                     fx.make_layout(32 * QROW, 1)), valid_q * QROW * 2)
-        q_lo, q_hi = _q_load(gq, lane, DQ, QROW, ARCH), _q_load(gq, lane, DQ, QROW, ARCH, 16)
+        table = fx.make_view(
+            fx.get_iter(PAGES) + fx.Int64(start), fx.make_layout(pages, 1)
+        )
+        gq = _resource(
+            fx.make_view(
+                fx.get_iter(Q)
+                + ((fx.Int64(q0) + fx.Int64(qstart)) * QROW + fx.Int64(head) * QHEAD),
+                fx.make_layout(32 * QROW, 1),
+            ),
+            valid_q * QROW * 2,
+        )
+        q_lo, q_hi = _q_load(gq, lane, DQ, QROW, ARCH), _q_load(
+            gq, lane, DQ, QROW, ARCH, 16
+        )
         scale0 = fx.Float32(KS[0]) * fx.Float32(SCALE * LOG2E)
         scale1 = scale0
         if fx.const_expr(PER_TOKEN):
@@ -403,7 +734,9 @@ def _swa32_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: f
             maximum0 = _maxf(maximum0, sink)
             total0 = _exp(sink - maximum0) * fx.Float32(0.25)
         maximum1, total1 = maximum0, total0
-        output0, output1 = fx.Vector.filled(32, 0.0, fx.Float32), fx.Vector.filled(32, 0.0, fx.Float32)
+        output0, output1 = fx.Vector.filled(32, 0.0, fx.Float32), fx.Vector.filled(
+            32, 0.0, fx.Float32
+        )
         wait(vmcnt=0)
         for tile in range(first, end, fx.Int32(BN)):
             page = _page(table, tile >> 6)
@@ -412,16 +745,46 @@ def _swa32_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: f
             rocdl.sched_barrier(0)
             vw = _v_load(V, lane, tile, page, HK, hkv, BN)
             score0, score1 = _qk_pair(q_lo, q_hi, kw, DQ, BN, ARCH)
-            p0, output0, maximum0, total0 = _softmax_tile(score0, output0, maximum0, total0, scale0,
-                                                        row, tile, kv_len, q_len, WINDOW, BN, ARCH)
-            p1, output1, maximum1, total1 = _softmax_tile(score1, output1, maximum1, total1, scale1,
-                                                        row + 16, tile, kv_len, q_len, WINDOW, BN, ARCH)
+            p0, output0, maximum0, total0 = _softmax_tile(
+                score0,
+                output0,
+                maximum0,
+                total0,
+                scale0,
+                row,
+                tile,
+                kv_len,
+                q_len,
+                WINDOW,
+                BN,
+                ARCH,
+            )
+            p1, output1, maximum1, total1 = _softmax_tile(
+                score1,
+                output1,
+                maximum1,
+                total1,
+                scale1,
+                row + 16,
+                tile,
+                kv_len,
+                q_len,
+                WINDOW,
+                BN,
+                ARCH,
+            )
             wait(vmcnt=0)
             rocdl.sched_barrier(0)
             vw = _mask_v(vw, lane, tile, kv_len, BN)
             output0, output1 = _pv_pair(p0, p1, vw, output0, output1, BN, ARCH)
-        outbuf = rocdl.make_buffer_tensor(fx.make_view(fx.get_iter(O) + ((fx.Int64(q0) + fx.Int64(qstart)) * OROW + fx.Int64(head) * OHEAD),
-                                           fx.make_layout(32 * OROW, 1)), num_records_bytes=valid_q * OROW * 2)
+        outbuf = rocdl.make_buffer_tensor(
+            fx.make_view(
+                fx.get_iter(O)
+                + ((fx.Int64(q0) + fx.Int64(qstart)) * OROW + fx.Int64(head) * OHEAD),
+                fx.make_layout(32 * OROW, 1),
+            ),
+            num_records_bytes=valid_q * OROW * 2,
+        )
         atom = fx.make_copy_atom(rocdl.BufferCopy64b(), fx.BFloat16)
         for m in fx.range_constexpr(2):
             values = output0 if m == 0 else output1
@@ -430,14 +793,32 @@ def _swa32_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, LSE: f
             inv = (total > 0.0).select(fx.Float32(1.0) / total, fx.Float32(0.0)) * VS[0]
             for n in fx.range_constexpr(8):
                 src = rmem(4, fx.BFloat16)
-                src.store(fx.Vector.from_elements([values[n * 4 + j] * inv for j in range(4)], fx.Float32).to(fx.BFloat16))
+                src.store(
+                    fx.Vector.from_elements(
+                        [values[n * 4 + j] * inv for j in range(4)], fx.Float32
+                    ).to(fx.BFloat16)
+                )
                 offset = ((lane & 15) + m * 16) * OROW + (lane >> 4) * 4 + n * 16
-                fx.copy(atom, src, fx.make_view(fx.get_iter(outbuf) + offset, fx.make_layout(4, 1)))
-            if fx.const_expr(WITH_LSE):
+                fx.copy(
+                    atom,
+                    src,
+                    fx.make_view(fx.get_iter(outbuf) + offset, fx.make_layout(4, 1)),
+                )
+            if fx.const_expr(WITH_LSE):  # noqa: SIM102 - inner predicate is runtime SSA
                 if (lane < 16) & (lane + m * 16 < valid_q):
-                    log_l = fx.Float32(llvm.call_intrinsic(fx.Float32.ir_type, "llvm.log2.f32", [total.ir_value()], [], []))
+                    log_l = fx.Float32(
+                        llvm.call_intrinsic(
+                            fx.Float32.ir_type,
+                            "llvm.log2.f32",
+                            [total.ir_value()],
+                            [],
+                            [],
+                        )
+                    )
                     LSE[(q0 + row + m * 16) * H + head] = (total > 0.0).select(
-                        (maximum + log_l) * fx.Float32(math.log(2.0)), fx.Float32(float("-inf")))
+                        (maximum + log_l) * fx.Float32(math.log(2.0)),
+                        fx.Float32(float("-inf")),
+                    )
 
 
 def _flat(tensor):
@@ -447,6 +828,33 @@ def _flat(tensor):
     return tensor.as_strided((extent,), (1,))
 
 
+def _static_compile_signature(args):
+    """Build the local compiled-call key without dynamic tensor extents.
+
+    FlyDSL's normal torch tensor arguments use dynamic memref shapes and
+    non-unit strides.  Dtype, rank, and unit-stride axes still describe the
+    ABI family; exact token/page counts are runtime metadata and must not
+    create one local compiled callable per request tail.
+    """
+    signature = []
+    # _launch argument indices 16 and 17 are runtime Int32 B and MAX_Q. Keep
+    # their ABI type in the local key, not their per-request values.
+    runtime_i32_indices = (16, 17)
+    for index, arg in enumerate(args):
+        if isinstance(arg, torch.Tensor):
+            unit_stride_axes = tuple(
+                i for i, stride in enumerate(arg.stride()) if stride == 1
+            )
+            signature.append(("tensor", arg.dtype, arg.ndim, unit_stride_axes))
+        elif index in runtime_i32_indices:
+            signature.append(("runtime_i32",))
+        elif hasattr(arg, "cuda_stream"):
+            signature.append(("stream",))
+        else:
+            signature.append(arg)
+    return tuple(signature)
+
+
 class _SWA:
     def __init__(self, heads, kv_heads, dq, window, sink, block_n, query_tile):
         self.heads, self.kv_heads, self.dq = heads, kv_heads, dq
@@ -454,9 +862,30 @@ class _SWA:
         self.block_n, self.query_tile = block_n, query_tile
         self._compiled = {}
 
-    def __call__(self, Q, K, V, cu_seqlens_q, cu_seqlens_k, kv_indptr, kv_page_indices,
-                 max_seqlen_q, max_seqlen_k, causal, q_descale, k_descale, v_descale,
-                 kv_last_page_lens, out=None, sink_ptr=None, stream=None, *, return_lse=False, lse=None, softmax_scale=None):
+    def __call__(
+        self,
+        Q,
+        K,
+        V,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        kv_indptr,
+        kv_page_indices,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal,
+        q_descale,
+        k_descale,
+        v_descale,
+        kv_last_page_lens,
+        out=None,
+        sink_ptr=None,
+        stream=None,
+        *,
+        return_lse=False,
+        lse=None,
+        softmax_scale=None
+    ):
         if not Q.is_cuda:
             raise NotImplementedError("single-wave SWA requires gfx942 or gfx950")
         arch = torch.cuda.get_device_properties(Q.device).gcnArchName.split(":", 1)[0]
@@ -467,32 +896,71 @@ class _SWA:
         if not causal:
             raise ValueError("SWA requires bottom-right causal attention")
         if Q.ndim != 3 or Q.shape[1:] != (self.heads, self.dq) or Q.stride(-1) != 1:
-            raise ValueError("Q must be [tokens, heads, Dqk] with contiguous head dimension")
-        if K.ndim != 5 or V.ndim != 5 or K.shape != (V.shape[0], self.kv_heads, self.dq // 8, PAGE, 8) or V.shape[1:] != (self.kv_heads, 8, DV, 8):
+            raise ValueError(
+                "Q must be [tokens, heads, Dqk] with contiguous head dimension"
+            )
+        if (
+            K.ndim != 5
+            or V.ndim != 5
+            or K.shape != (V.shape[0], self.kv_heads, self.dq // 8, PAGE, 8)
+            or V.shape[1:] != (self.kv_heads, 8, DV, 8)
+        ):
             raise ValueError("K/V require page64 SHUFFLE-5D layout")
-        if K.device != Q.device or V.device != Q.device or not K.is_contiguous() or not V.is_contiguous():
+        if (
+            K.device != Q.device
+            or V.device != Q.device
+            or not K.is_contiguous()
+            or not V.is_contiguous()
+        ):
             raise ValueError("K/V must be contiguous on the input GPU")
         if self.has_sink:
-            if sink_ptr is None or sink_ptr.shape != (self.heads,) or sink_ptr.dtype != torch.float32 or sink_ptr.device != Q.device or not sink_ptr.is_contiguous():
-                raise ValueError("sink must be contiguous FP32 [heads] on the input GPU")
+            if (
+                sink_ptr is None
+                or sink_ptr.shape != (self.heads,)
+                or sink_ptr.dtype != torch.float32
+                or sink_ptr.device != Q.device
+                or not sink_ptr.is_contiguous()
+            ):
+                raise ValueError(
+                    "sink must be contiguous FP32 [heads] on the input GPU"
+                )
         elif sink_ptr is not None:
             raise ValueError("sink_ptr requires has_sink=True")
         batch = cu_seqlens_q.numel() - 1
-        if batch < 1 or kv_indptr.numel() != batch + 1 or kv_last_page_lens.numel() != batch:
+        if (
+            batch < 1
+            or kv_indptr.numel() != batch + 1
+            or kv_last_page_lens.numel() != batch
+        ):
             raise ValueError("inconsistent batch metadata")
         metadata = (cu_seqlens_q, kv_indptr, kv_page_indices, kv_last_page_lens)
         if cu_seqlens_k is not None:
             if cu_seqlens_k.numel() != batch + 1:
                 raise ValueError("inconsistent KV prefix length")
             metadata += (cu_seqlens_k,)
-        if any(t.ndim != 1 or t.dtype != torch.int32 or t.device != Q.device or not t.is_contiguous() for t in metadata):
+        if any(
+            t.ndim != 1
+            or t.dtype != torch.int32
+            or t.device != Q.device
+            or not t.is_contiguous()
+            for t in metadata
+        ):
             raise ValueError("metadata must be contiguous device int32")
         if min(max_seqlen_q, max_seqlen_k) < 0:
             raise ValueError("maximum lengths must be nonnegative")
-        if any(t.dtype != torch.float32 or t.device != Q.device or not t.is_contiguous() for t in (q_descale, k_descale, v_descale)):
+        if any(
+            t.dtype != torch.float32 or t.device != Q.device or not t.is_contiguous()
+            for t in (q_descale, k_descale, v_descale)
+        ):
             raise ValueError("descales must be contiguous device FP32")
-        if k_descale.numel() != 1 or v_descale.numel() != 1 or q_descale.numel() not in (1, Q.shape[0] * self.heads):
-            raise ValueError("expected scalar K/V and scalar or per-token/head Q descales")
+        if (
+            k_descale.numel() != 1
+            or v_descale.numel() != 1
+            or q_descale.numel() not in (1, Q.shape[0] * self.heads)
+        ):
+            raise ValueError(
+                "expected scalar K/V and scalar or per-token/head Q descales"
+            )
         scale = self.dq**-0.5 if softmax_scale is None else float(softmax_scale)
         if not math.isfinite(scale) or scale <= 0:
             raise ValueError("softmax_scale must be finite and positive")
@@ -501,26 +969,67 @@ class _SWA:
             raise ValueError("stream must belong to the input GPU")
         with torch.cuda.stream(stream):
             if out is None:
-                out = torch.empty(Q.shape[0], self.heads, DV, device=Q.device, dtype=torch.bfloat16)
+                out = torch.empty(
+                    Q.shape[0], self.heads, DV, device=Q.device, dtype=torch.bfloat16
+                )
             if return_lse and lse is None:
-                lse = torch.empty(Q.shape[0], self.heads, device=Q.device, dtype=torch.float32)
-        if out.shape != (Q.shape[0], self.heads, DV) or out.dtype != torch.bfloat16 or out.device != Q.device or out.stride(-1) != 1:
+                lse = torch.empty(
+                    Q.shape[0], self.heads, device=Q.device, dtype=torch.float32
+                )
+        if (
+            out.shape != (Q.shape[0], self.heads, DV)
+            or out.dtype != torch.bfloat16
+            or out.device != Q.device
+            or out.stride(-1) != 1
+        ):
             raise ValueError("invalid output buffer")
-        if lse is not None and (lse.shape != Q.shape[:2] or lse.dtype != torch.float32 or lse.device != Q.device or not lse.is_contiguous()):
+        if lse is not None and (
+            lse.shape != Q.shape[:2]
+            or lse.dtype != torch.float32
+            or lse.device != Q.device
+            or not lse.is_contiguous()
+        ):
             raise ValueError("LSE must be contiguous FP32 [tokens, heads]")
         if Q.shape[0] and max_seqlen_q:
             # Keep paged K/V rank-5. FlyDSL 0.3.2 marshals dynamic shape
             # dimensions as signed int32, so flattening a large serving cache
             # can overflow even though every physical cache dimension and the
             # kernel's 64-bit page offset are valid.
-            args = (_flat(Q), K, V, _flat(out), _flat(lse) if lse is not None else k_descale,
-                    cu_seqlens_q, kv_indptr, kv_page_indices, kv_last_page_lens,
-                    _flat(q_descale), k_descale.view(-1), v_descale.view(-1), sink_ptr if self.has_sink else k_descale,
-                    self.heads, self.kv_heads, K.shape[0], batch, max_seqlen_q, self.dq,
-                    Q.stride(0), Q.stride(1), out.stride(0), out.stride(1), self.window, self.has_sink,
-                        q_descale.numel() != 1, lse is not None, scale, self.block_n, self.query_tile, int(arch[3:]), stream)
-            signature = tuple((a.dtype, tuple(a.shape)) if isinstance(a, torch.Tensor) else ("stream",) if hasattr(a, "cuda_stream") else a for a in args)
-            key = (Q.device, signature)
+            args = (
+                _flat(Q),
+                K,
+                V,
+                _flat(out),
+                _flat(lse) if lse is not None else k_descale,
+                cu_seqlens_q,
+                kv_indptr,
+                kv_page_indices,
+                kv_last_page_lens,
+                _flat(q_descale),
+                k_descale.view(-1),
+                v_descale.view(-1),
+                sink_ptr if self.has_sink else k_descale,
+                self.heads,
+                self.kv_heads,
+                K.shape[0],
+                batch,
+                max_seqlen_q,
+                self.dq,
+                Q.stride(0),
+                Q.stride(1),
+                out.stride(0),
+                out.stride(1),
+                self.window,
+                self.has_sink,
+                q_descale.numel() != 1,
+                lse is not None,
+                scale,
+                self.block_n,
+                self.query_tile,
+                int(arch[3:]),
+                stream,
+            )
+            key = (Q.device, _static_compile_signature(args))
             compiled = self._compiled.get(key)
             with torch.cuda.device(Q.device):
                 if compiled is None:
@@ -531,9 +1040,21 @@ class _SWA:
 
 
 @functools.cache
-def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_size,
-                   is_causal=True, quant_query_mode="per-token", key_layout="vectorized",
-                   window_left=128, has_sink=False, *, block_n=None, query_tile=None):
+def PagedAttention(
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_v,
+    page_size,
+    is_causal=True,
+    quant_query_mode="per-token",
+    key_layout="vectorized",
+    window_left=128,
+    has_sink=False,
+    *,
+    block_n=None,
+    query_tile=None
+):
     """Return a native gfx942/gfx950 direct-paged, single-wave SWA callable.
 
     The default is BM16/BN16 for window_left<=16, BM32/BN32 otherwise.
@@ -542,16 +1063,40 @@ def PagedAttention(num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, page_siz
     query lengths bounded by max_seqlen_q. Sink logits are unscaled natural
     logits (finite or -inf), and contribute no value to the numerator.
     """
-    if head_dim_qk not in (128, 192) or (head_dim_v, page_size, key_layout) != (DV, PAGE, "vectorized"):
-        raise NotImplementedError("SWA supports BF16 D128/D192 V128 page64 SHUFFLE-5D only")
-    if not is_causal or not isinstance(window_left, int) or not 0 <= window_left < 2**31:
-        raise ValueError("SWA requires causal=True and a nonnegative signed-int32 window")
+    if head_dim_qk not in (128, 192) or (head_dim_v, page_size, key_layout) != (
+        DV,
+        PAGE,
+        "vectorized",
+    ):
+        raise NotImplementedError(
+            "SWA supports BF16 D128/D192 V128 page64 SHUFFLE-5D only"
+        )
+    if (
+        not is_causal
+        or not isinstance(window_left, int)
+        or not 0 <= window_left < 2**31
+    ):
+        raise ValueError(
+            "SWA requires causal=True and a nonnegative signed-int32 window"
+        )
     if num_qo_heads <= 0 or num_kv_heads <= 0 or num_qo_heads % num_kv_heads:
         raise ValueError("query heads must be a positive multiple of KV heads")
     block_n = (16 if window_left <= 16 else 32) if block_n is None else block_n
     query_tile = (16 if window_left <= 16 else 32) if query_tile is None else query_tile
-    if quant_query_mode not in ("per-token", "per-tensor") or block_n not in (16, 32, 64):
+    if quant_query_mode not in ("per-token", "per-tensor") or block_n not in (
+        16,
+        32,
+        64,
+    ):
         raise ValueError("invalid scale mode or block_n")
     if query_tile not in (16, 32):
         raise ValueError("query_tile must be 16 or 32")
-    return _SWA(num_qo_heads, num_kv_heads, head_dim_qk, window_left, has_sink, block_n, query_tile)
+    return _SWA(
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        window_left,
+        has_sink,
+        block_n,
+        query_tile,
+    )

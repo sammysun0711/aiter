@@ -3,13 +3,16 @@
 
 """DFlash-shaped coverage for native FlyDSL paged BF16 SWA."""
 
+import itertools
 import os
 
 import pytest
 import torch
 
 from aiter.ops.flydsl import flydsl_paged_attention_swa_bf16
-
+from aiter.ops.flydsl.kernels.mha_pa_swa_bf16 import (
+    _static_compile_signature,
+)
 
 PAGE_SIZE = 64
 HEAD_DIM = 128
@@ -17,8 +20,69 @@ VALUE_HEAD_DIM = 128
 WINDOW_LEFT = 1023
 
 
+def test_static_compile_signature_ignores_dynamic_extents():
+    stream = type("FakeStream", (), {"cuda_stream": 1})()
+
+    def make_args(query_tokens, page_indices, max_q, batch=1, dtype=torch.bfloat16):
+        return (
+            torch.empty(query_tokens, dtype=dtype),
+            torch.empty(8, 1, 24, 64, 8, dtype=torch.bfloat16),
+            torch.empty(8, 1, 8, 128, 8, dtype=torch.bfloat16),
+            torch.empty(query_tokens, dtype=torch.bfloat16),
+            torch.empty(query_tokens, dtype=torch.float32),
+            torch.empty(batch + 1, dtype=torch.int32),
+            torch.empty(batch + 1, dtype=torch.int32),
+            torch.empty(page_indices, dtype=torch.int32),
+            torch.empty(batch, dtype=torch.int32),
+            torch.empty(query_tokens, dtype=torch.float32),
+            torch.empty(1, dtype=torch.float32),
+            torch.empty(1, dtype=torch.float32),
+            torch.empty(16, dtype=torch.float32),
+            16,
+            1,
+            8,
+            batch,
+            max_q,
+            192,
+            3072,
+            192,
+            2048,
+            128,
+            127,
+            True,
+            True,
+            False,
+            192**-0.5,
+            32,
+            32,
+            950,
+            stream,
+        )
+
+    first_tail = make_args(32683, 1024, 32683)
+    second_tail = make_args(32636, 1023, 32636)
+    assert _static_compile_signature(first_tail) == _static_compile_signature(
+        second_tail
+    )
+
+    different_query_length = make_args(65536, 2048, 65536)
+    assert _static_compile_signature(first_tail) == _static_compile_signature(
+        different_query_length
+    )
+
+    different_batch = make_args(32683, 1024, 32683, batch=2)
+    assert _static_compile_signature(first_tail) == _static_compile_signature(
+        different_batch
+    )
+
+    different_dtype = make_args(32683, 1024, 32683, dtype=torch.float16)
+    assert _static_compile_signature(first_tail) != _static_compile_signature(
+        different_dtype
+    )
+
+
 def test_short_q_default_tile_selection(monkeypatch):
-    import aiter.ops.flydsl.fmha_kernels as fmha_kernels
+    from aiter.ops.flydsl import fmha_kernels
 
     selected = []
 
@@ -39,15 +103,15 @@ def test_short_q_default_tile_selection(monkeypatch):
     one = torch.ones(1, dtype=torch.float32)
     sinks = torch.zeros(16, dtype=torch.float32)
     out = torch.empty_like(q)
-    common = dict(
-        window_left=WINDOW_LEFT,
-        kv_last_page_lens=i32([64]),
-        q_descale=one,
-        k_descale=one,
-        v_descale=one,
-        sink_ptr=sinks,
-        out=out,
-    )
+    common = {
+        "window_left": WINDOW_LEFT,
+        "kv_last_page_lens": i32([64]),
+        "q_descale": one,
+        "k_descale": one,
+        "v_descale": one,
+        "sink_ptr": sinks,
+        "out": out,
+    }
 
     fmha_kernels.flydsl_paged_attention_swa_bf16(
         q, k, v, i32([0, 8]), i32([0, 1]), i32([0]), 8, 64, **common
@@ -85,49 +149,38 @@ requires_large_cache_test = pytest.mark.skipif(
 )
 
 
-def _make_case(head_dim=HEAD_DIM):
+def _make_case(head_dim=HEAD_DIM, q_lens=(4, 3), kv_lens=(4097, 2051)):
     torch.manual_seed(20260917)
-    q_lens = (4, 3)
-    kv_lens = (4097, 2051)
     num_q_heads, num_kv_heads = 16, 1
     page_counts = tuple((length + PAGE_SIZE - 1) // PAGE_SIZE for length in kv_lens)
     num_pages = sum(page_counts)
 
-    q = (
-        torch.randn(sum(q_lens), num_q_heads, head_dim, device="cuda") * 0.2
-    ).to(torch.bfloat16)
+    q = (torch.randn(sum(q_lens), num_q_heads, head_dim, device="cuda") * 0.2).to(
+        torch.bfloat16
+    )
     k_linear = (
-        torch.randn(
-            num_pages, PAGE_SIZE, num_kv_heads, head_dim, device="cuda"
-        )
-        * 0.2
+        torch.randn(num_pages, PAGE_SIZE, num_kv_heads, head_dim, device="cuda") * 0.2
     ).to(torch.bfloat16)
     v_linear = (
-        torch.randn(
-            num_pages, PAGE_SIZE, num_kv_heads, VALUE_HEAD_DIM, device="cuda"
-        )
+        torch.randn(num_pages, PAGE_SIZE, num_kv_heads, VALUE_HEAD_DIM, device="cuda")
         * 0.2
     ).to(torch.bfloat16)
     k = (
-        k_linear.view(
-            num_pages, PAGE_SIZE, num_kv_heads, head_dim // 8, 8
-        )
+        k_linear.view(num_pages, PAGE_SIZE, num_kv_heads, head_dim // 8, 8)
         .permute(0, 2, 3, 1, 4)
         .contiguous()
     )
     v = (
-        v_linear.view(
-            num_pages, PAGE_SIZE // 8, 8, num_kv_heads, VALUE_HEAD_DIM
-        )
+        v_linear.view(num_pages, PAGE_SIZE // 8, 8, num_kv_heads, VALUE_HEAD_DIM)
         .permute(0, 3, 1, 4, 2)
         .contiguous()
     )
 
     cu_seqlens_q = torch.tensor(
-        [0, q_lens[0], sum(q_lens)], device="cuda", dtype=torch.int32
+        [0, *itertools.accumulate(q_lens)], device="cuda", dtype=torch.int32
     )
     kv_indptr = torch.tensor(
-        [0, page_counts[0], num_pages], device="cuda", dtype=torch.int32
+        [0, *itertools.accumulate(page_counts)], device="cuda", dtype=torch.int32
     )
     kv_page_indices = torch.arange(num_pages, device="cuda", dtype=torch.int32)
     kv_last_page_lens = torch.tensor(
@@ -136,9 +189,7 @@ def _make_case(head_dim=HEAD_DIM):
         dtype=torch.int32,
     )
     one = torch.ones(1, device="cuda", dtype=torch.float32)
-    sinks = torch.linspace(
-        -0.4, 0.3, num_q_heads, device="cuda", dtype=torch.float32
-    )
+    sinks = torch.linspace(-0.4, 0.3, num_q_heads, device="cuda", dtype=torch.float32)
     out = torch.empty(
         sum(q_lens), num_q_heads, VALUE_HEAD_DIM, device="cuda", dtype=torch.bfloat16
     )
@@ -197,9 +248,9 @@ def _reference(case):
         )
         scores.masked_fill_(~visible.unsqueeze(0), float("-inf"))
         sink_scores = case["sinks"][:, None, None].expand(num_q_heads, q_len, 1)
-        probabilities = torch.softmax(
-            torch.cat((scores, sink_scores), dim=-1), dim=-1
-        )[..., :-1]
+        probabilities = torch.softmax(torch.cat((scores, sink_scores), dim=-1), dim=-1)[
+            ..., :-1
+        ]
         outputs.append(torch.einsum("hqk,khd->qhd", probabilities, v))
 
     return torch.cat(outputs)
@@ -223,6 +274,66 @@ def _run(case):
         sink_ptr=case["sinks"],
         out=case["out"],
     )
+
+
+def _run_op(op, case):
+    return op(
+        case["q"],
+        case["k"],
+        case["v"],
+        case["cu_seqlens_q"],
+        None,
+        case["kv_indptr"],
+        case["kv_page_indices"],
+        max(case["q_lens"]),
+        max(case["kv_lens"]),
+        True,
+        case["one"],
+        case["one"],
+        case["one"],
+        case["kv_last_page_lens"],
+        out=case["out"],
+        sink_ptr=case["sinks"],
+    )
+
+
+@requires_native_swa
+def test_compile_cache_reuses_runtime_query_dimensions(monkeypatch):
+    import aiter.ops.flydsl.kernels.mha_pa_swa_bf16 as swa
+
+    swa.PagedAttention.cache_clear()
+    compile_calls = []
+    real_compile = swa.flyc.compile
+
+    def counted_compile(*args, **kwargs):
+        compile_calls.append(args)
+        return real_compile(*args, **kwargs)
+
+    monkeypatch.setattr(swa.flyc, "compile", counted_compile)
+    op = swa.PagedAttention(
+        16,
+        1,
+        HEAD_DIM,
+        VALUE_HEAD_DIM,
+        PAGE_SIZE,
+        window_left=WINDOW_LEFT,
+        has_sink=True,
+    )
+
+    for query_len in (17, 23, 33):
+        case = _make_case(q_lens=(query_len,), kv_lens=(65,))
+        expected = _reference(case)
+        actual = _run_op(op, case)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
+
+    batch_two = _make_case(q_lens=(9, 8), kv_lens=(33, 32))
+    expected = _reference(batch_two)
+    actual = _run_op(op, batch_two)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
+
+    assert len(compile_calls) == 1
 
 
 @requires_native_swa
@@ -255,9 +366,7 @@ def test_page_relative_addressing_over_signed_int32_elements():
     # backing allocation contains more than 2**31 elements.
     num_pages = 262145
     num_q_heads, num_kv_heads = 16, 1
-    q = torch.randn(
-        1, num_q_heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
-    )
+    q = torch.randn(1, num_q_heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     k = torch.empty(
         num_pages,
         num_kv_heads,
@@ -283,12 +392,8 @@ def test_page_relative_addressing_over_signed_int32_elements():
 
     cu_seqlens_q = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
-    kv_page_indices = torch.tensor(
-        [num_pages - 1], device="cuda", dtype=torch.int32
-    )
-    kv_last_page_lens = torch.tensor(
-        [PAGE_SIZE], device="cuda", dtype=torch.int32
-    )
+    kv_page_indices = torch.tensor([num_pages - 1], device="cuda", dtype=torch.int32)
+    kv_last_page_lens = torch.tensor([PAGE_SIZE], device="cuda", dtype=torch.int32)
     one = torch.ones(1, device="cuda", dtype=torch.float32)
     sinks = torch.zeros(num_q_heads, device="cuda", dtype=torch.float32)
     out = torch.empty_like(q)
@@ -312,20 +417,16 @@ def test_page_relative_addressing_over_signed_int32_elements():
     )
     torch.cuda.synchronize()
 
-    k_linear = (
-        k[-1].permute(2, 0, 1, 3).reshape(PAGE_SIZE, num_kv_heads, HEAD_DIM)
-    )
+    k_linear = k[-1].permute(2, 0, 1, 3).reshape(PAGE_SIZE, num_kv_heads, HEAD_DIM)
     v_linear = (
-        v[-1]
-        .permute(1, 3, 0, 2)
-        .reshape(PAGE_SIZE, num_kv_heads, VALUE_HEAD_DIM)
+        v[-1].permute(1, 3, 0, 2).reshape(PAGE_SIZE, num_kv_heads, VALUE_HEAD_DIM)
     )
     k_linear = k_linear.float().repeat_interleave(num_q_heads, dim=1)
     v_linear = v_linear.float().repeat_interleave(num_q_heads, dim=1)
     scores = torch.einsum("qhd,khd->hqk", q.float(), k_linear) * HEAD_DIM**-0.5
     sink_scores = sinks[:, None, None]
-    probabilities = torch.softmax(
-        torch.cat((scores, sink_scores), dim=-1), dim=-1
-    )[..., :-1]
+    probabilities = torch.softmax(torch.cat((scores, sink_scores), dim=-1), dim=-1)[
+        ..., :-1
+    ]
     expected = torch.einsum("hqk,khd->qhd", probabilities, v_linear)
     torch.testing.assert_close(out.float(), expected, rtol=0.02, atol=0.02)
