@@ -179,3 +179,111 @@ def test_batch_prefill_qk192_v128(cache_dtype, layout, use_swa_sink):
     torch.testing.assert_close(
         output.float(), reference.float(), rtol=tolerance, atol=tolerance
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_batch_prefill_qk192_v128_bf16_vectorized_ragged_pages():
+    """Exercise the page-64 CK fallback with TBO-like child metadata."""
+    torch.manual_seed(20260922)
+    device = torch.device("cuda")
+    page_size = 64
+    query_lengths = [96, 128]
+    kv_lengths = [160, 256]
+    page_lists = [[5, 2, 7], [1, 6, 0, 4]]
+    num_q_heads = 16
+    num_kv_heads = 1
+    qk_head_dim = 192
+    value_head_dim = 128
+    vector_width = 8
+
+    q = (
+        torch.randn(
+            sum(query_lengths),
+            num_q_heads,
+            qk_head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.1
+    ).to(torch.bfloat16)
+    k_pages = (
+        torch.randn(
+            8,
+            page_size,
+            num_kv_heads,
+            qk_head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.1
+    ).to(torch.bfloat16)
+    v_pages = (
+        torch.randn(
+            8,
+            page_size,
+            num_kv_heads,
+            value_head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.1
+    ).to(torch.bfloat16)
+
+    k_kernel = _vectorize_k(k_pages, page_size, vector_width)
+    v_kernel = _vectorize_v(v_pages, page_size, vector_width)
+    cu_seqlens_q = torch.tensor(
+        [0, query_lengths[0], sum(query_lengths)],
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_indptr = torch.tensor([0, 3, 7], dtype=torch.int32, device=device)
+    kv_indices = torch.nn.functional.pad(
+        torch.tensor(page_lists[0] + page_lists[1], dtype=torch.int32),
+        (0, 256),
+    ).to(device)
+    kv_last_page_lens = torch.tensor([32, 64], dtype=torch.int32, device=device)
+
+    output = aiter.mha_batch_prefill_func(
+        q,
+        k_kernel,
+        v_kernel,
+        cu_seqlens_q,
+        kv_indptr,
+        kv_indices,
+        max_seqlen_q=max(query_lengths),
+        max_seqlen_k=max(kv_lengths),
+        causal=True,
+        kv_last_page_lens=kv_last_page_lens,
+    )
+    torch.cuda.synchronize()
+
+    references = []
+    q_start = 0
+    for query_length, kv_length, page_ids in zip(
+        query_lengths, kv_lengths, page_lists
+    ):
+        q_req = q[q_start : q_start + query_length].float()
+        k_req = torch.cat([k_pages[page] for page in page_ids], dim=0)[
+            :kv_length
+        ].float()
+        v_req = torch.cat([v_pages[page] for page in page_ids], dim=0)[
+            :kv_length
+        ].float()
+        k_req = k_req.expand(-1, num_q_heads, -1)
+        v_req = v_req.expand(-1, num_q_heads, -1)
+        logits = torch.einsum("qhd,khd->hqk", q_req, k_req) / math.sqrt(
+            qk_head_dim
+        )
+        rows = torch.arange(query_length, device=device).unsqueeze(1)
+        columns = torch.arange(kv_length, device=device).unsqueeze(0)
+        causal_mask = columns <= kv_length - query_length + rows
+        logits.masked_fill_(~causal_mask.unsqueeze(0), float("-inf"))
+        references.append(
+            torch.einsum("hqk,khd->qhd", torch.softmax(logits, dim=-1), v_req)
+        )
+        q_start += query_length
+
+    reference = torch.cat(references, dim=0)
+    assert output.shape == (sum(query_lengths), num_q_heads, value_head_dim)
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output.float(), reference, rtol=0.025, atol=0.025)

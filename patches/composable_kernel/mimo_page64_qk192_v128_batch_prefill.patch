@@ -1,0 +1,306 @@
+diff --git a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
+index b687cb976..663a6209e 100644
+--- a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
++++ b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
+@@ -5,6 +5,7 @@ import copy
+ from dataclasses import dataclass, field
+ import fnmatch
+ import itertools
++import os
+ from pathlib import Path
+ from typing import List, Optional, Tuple
+ 
+@@ -234,7 +235,7 @@ FMHA_FWD_API_PER_DTYPE = """    {F_if}(t.data_type.compare(\"{F_dtype}\") == 0){
+ {F_hdim_case}
+     }}
+ """
+-FMHA_FWD_API_PER_HDIM_CASE = """        {F_if} (t.hdim_q <= {F_hdim} && t.hdim_v <= {F_hdim_v}) {{
++FMHA_FWD_API_PER_HDIM_CASE = """        {F_if} ({F_hdim_check}) {{
+ {F_inner_dispatch}
+         }}
+ """
+@@ -469,18 +470,24 @@ class FmhaFwdApiPool:
+         # TODO: do we need to check duplication?
+         if trait.dtype not in self.pool.keys():
+             self.pool[trait.dtype] = dict()
+-        if trait.hdim not in self.pool[trait.dtype].keys():
+-            self.pool[trait.dtype][trait.hdim] = list()
++        # Keep the Q/K and V tile widths as separate dispatch axes.  A single
++        # Q/K bucket can contain both native V128 and padded V192 kernels; if
++        # they shared one outer branch, the first otherwise-compatible inner
++        # arm could select a V128 output tile for a V192 request.
++        head_dims = (trait.hdim, trait.bn1)
++        if head_dims not in self.pool[trait.dtype].keys():
++            self.pool[trait.dtype][head_dims] = list()
+ 
+-        self.pool[trait.dtype][trait.hdim].append(copy.copy(trait))
++        self.pool[trait.dtype][head_dims].append(copy.copy(trait))
+ 
+     @property
+     def api(self) -> str:
+         per_dtypes = str()
+         for i, dtype in enumerate(self.pool.keys()):
+             per_hdim_case = str()
+-            for j, hdim in enumerate(self.pool[dtype].keys()):
+-                traits = self.pool[dtype][hdim]
++            for j, head_dims in enumerate(self.pool[dtype].keys()):
++                hdim, hdim_v = head_dims
++                traits = self.pool[dtype][head_dims]
+                 inners = str()
+                 for k, trait in enumerate(traits):
+                     if_k = "if" if k == 0 else "else if"
+@@ -527,8 +534,22 @@ class FmhaFwdApiPool:
+                         F_kv_load_mode=KV_LOAD_MODE_ENUM_MAP[trait.use_global_load],
+                     )
+                 if_j = "if" if j == 0 else "else if"
++                hdim_check = f"t.hdim_q <= {hdim} && t.hdim_v <= {hdim_v}"
++                if int(hdim) == 192:
++                    # The MiMo specializations are deliberately exact. Put
++                    # both logical head dimensions and the cache contract in
++                    # the outer branch so unsupported D=192 variants fall
++                    # through to the padded D=256 compatibility bucket.
++                    hdim_check = (
++                        f"t.hdim_q == 192 && t.hdim_v == {hdim_v} && "
++                        "t.kv_memory_layout == "
++                        "ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT && "
++                        "t.kv_lookup_table == "
++                        "ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D && "
++                        "t.page_size == 64"
++                    )
+                 per_hdim_case = per_hdim_case + FMHA_FWD_API_PER_HDIM_CASE.format(
+-                    F_if=if_j, F_hdim=hdim, F_hdim_v=trait.bn1, F_inner_dispatch=inners
++                    F_if=if_j, F_hdim_check=hdim_check, F_inner_dispatch=inners
+                 )
+             if_i = "if" if i == 0 else "else if"
+             per_dtypes = per_dtypes + FMHA_FWD_API_PER_DTYPE.format(
+@@ -708,6 +729,143 @@ class FmhaFwdKernel:
+         )
+ 
+ 
++_MIMO_GFX950_D192_SEARCH_TILES = {
++    (32, 96),
++    (32, 128),
++    (32, 192),
++    (32, 256),
++    (32, 384),
++    (64, 128),
++    (64, 192),
++    (64, 256),
++    (64, 384),
++    (128, 128),
++    (192, 192),
++    (192, 384),
++}
++
++
++def _get_mimo_gfx950_d192_occupancy_override() -> int:
++    """Return the opt-in block-per-CU search value, or -1 for CK policy."""
++    value = os.getenv("AITER_MIMO_GFX950_D192_OCCUPANCY")
++    if value is None or value == "":
++        return -1
++    try:
++        occupancy = int(value)
++    except ValueError as error:
++        raise ValueError(
++            "AITER_MIMO_GFX950_D192_OCCUPANCY must be one of 1, 2, or 3"
++        ) from error
++    if occupancy not in (1, 2, 3):
++        raise ValueError(
++            "AITER_MIMO_GFX950_D192_OCCUPANCY must be one of 1, 2, or 3; "
++            f"got {value!r}"
++        )
++    return occupancy
++
++
++def _make_mimo_gfx950_d192_v128_tile(
++    m0: int, n0: int, occupancy: int = -1
++) -> FmhaFwdTileSize:
++    """Build one CDNA4 MiMo Q/K192-V/O128 tile for tuning."""
++    # CDNA4 uses 32x32x32 FP8 warp GEMMs. M0 is an integer number of M warps;
++    # N0 remains a pipeline tile/loop extent.  Q/K consume 192 elements while
++    # the PV GEMM and output epilogue operate on the physical V/O width 128.
++    m_warps = m0 // 32
++    return FmhaFwdTileSize(
++        m0,
++        n0,
++        32,
++        128,
++        32,
++        192,
++        m_warps,
++        1,
++        1,
++        m_warps,
++        1,
++        1,
++        32,
++        32,
++        32,
++        32,
++        32,
++        32,
++        occupancy,
++    )
++
++
++def _get_mimo_gfx950_d192_tile_override() -> Optional[FmhaFwdTileSize]:
++    """Return one opt-in Q/K192-V128 tile without changing default dispatch."""
++    value = os.getenv("AITER_MIMO_GFX950_D192_TILE")
++    if not value:
++        return None
++    try:
++        m0, n0 = (int(part) for part in value.lower().split("x", maxsplit=1))
++    except (TypeError, ValueError) as error:
++        raise ValueError(
++            "AITER_MIMO_GFX950_D192_TILE must use MxN form, for example 64x96"
++        ) from error
++    if (m0, n0) not in _MIMO_GFX950_D192_SEARCH_TILES:
++        supported = ", ".join(
++            f"{tile_m}x{tile_n}"
++            for tile_m, tile_n in sorted(_MIMO_GFX950_D192_SEARCH_TILES)
++        )
++        raise ValueError(
++            f"Unsupported gfx950 D192 search tile {value!r}; choose one of: {supported}"
++        )
++    return _make_mimo_gfx950_d192_v128_tile(
++        m0, n0, _get_mimo_gfx950_d192_occupancy_override()
++    )
++
++
++def _get_single_mimo_target(targets: Optional[List[str]]) -> Optional[str]:
++    """Return the explicit MiMo target used by AITER's runtime JIT recipe."""
++    if targets is None or len(targets) != 1:
++        return None
++    target = targets[0].split(":", maxsplit=1)[0]
++    if target.startswith("gfx950"):
++        return "gfx950"
++    if target.startswith("gfx942"):
++        return "gfx942"
++    return None
++
++
++def _get_mimo_d192_tiles(
++    dtype: str, target: Optional[str]
++) -> List[FmhaFwdTileSize]:
++    """Return target-specific page-64 Q/K192 tile families.
++
++    FP8 has a primary per-tensor tile with kN0 > 64 so both buffer-load and
++    large-cache global-load variants are emitted.  The final FP8 tile preserves
++    the already-qualified padded-V192 route.  BF16 uses native V128 and falls
++    back to the D256 page-64 family for padded V192.
++    """
++    if target is None:
++        return []
++    if dtype == "bf16":
++        return [
++            FmhaFwdTileSize(128, 128, 32, 128, 32, 192,  4, 1, 1,  4, 1, 1,  32, 32, 16,  32, 32, 16,  -1),
++        ]  # fmt: skip
++    if dtype != "fp8bf16":
++        return []
++
++    override = _get_mimo_gfx950_d192_tile_override()
++    if target == "gfx950":
++        primary = override or _make_mimo_gfx950_d192_v128_tile(
++            128, 128, _get_mimo_gfx950_d192_occupancy_override()
++        )
++        padded = FmhaFwdTileSize(64, 128, 32, 192, 32, 192,  2, 1, 1,  2, 1, 1,  32, 32, 32,  32, 32, 32,  -1)
++    else:
++        # V128's vectorized V-load distribution supports at most four FP8
++        # warps on gfx942 (kABKLane=2, N2=32).  The padded V192 tile can use
++        # six warps, but carrying that shape over makes N0 zero at compile
++        # time, so native V128 uses the closest legal 128x96 geometry.
++        primary = FmhaFwdTileSize(128, 96, 32, 128, 32, 192,  4, 1, 1,  4, 1, 1,  32, 32, 32,  32, 32, 32,  -1)
++        padded = FmhaFwdTileSize(192, 96, 32, 192, 32, 192,  6, 1, 1,  6, 1, 1,  32, 32, 32,  32, 32, 32,  -1)
++    return [primary, padded]
++
++
+ class KernelComponentFactory:
+     @staticmethod
+     def get_hdim_tile_size_dict(dtype: str) -> Optional[dict]:
+@@ -818,6 +976,18 @@ def get_fwd_blobs(
+     has_non_gfx9 = targets is not None and any(
+         not t.startswith("gfx9") for t in targets
+     )
++    mimo_target = _get_single_mimo_target(targets)
++    is_gfx950 = mimo_target == "gfx950"
++    gfx950_d192_override = _get_mimo_gfx950_d192_tile_override()
++    gfx950_d192_occupancy = _get_mimo_gfx950_d192_occupancy_override()
++    if gfx950_d192_override is not None and not is_gfx950:
++        raise ValueError(
++            "AITER_MIMO_GFX950_D192_TILE is valid only when targeting gfx950"
++        )
++    if gfx950_d192_occupancy != -1 and not is_gfx950:
++        raise ValueError(
++            "AITER_MIMO_GFX950_D192_OCCUPANCY is valid only when targeting gfx950"
++        )
+     # TODO: we don't support tuning yet, so pick up one value for vlayout/pipeline/pad
+     #       support this in future
+ 
+@@ -831,11 +1001,25 @@ def get_fwd_blobs(
+         d = CustomFactory.get_hdim_tile_size_dict(dtype)
+         if d is None:
+             continue
++        mimo_tiles = _get_mimo_d192_tiles(dtype, mimo_target)
++        if mimo_tiles:
++            # Insertion order keeps the exact D192/V128 and D192/V192 arms
++            # ahead of the generic D256 compatibility route.
++            d = dict(d)
++            d[192] = mimo_tiles
++            d = dict(sorted(d.items()))
+         # for hdim_str, mode, mask, bias, lse in itertools.product(d.keys(), MODE_MAP.keys(), MASK_MAP.keys(), ["t", "f"], ["t", "f"]):
+         for (hdim, tiles), mode in itertools.product(d.items(), MODE_MAP.keys()):
+             # batch_prefill pipeline requires group mode (static_assert in pipeline problem)
+             if mode != "group":
+                 continue
++            # Candidate builds use a private JIT directory and emit only the
++            # requested MiMo FP8 specialization. This keeps a tile search
++            # bounded and cannot alter the production JIT module.
++            if gfx950_d192_override is not None and is_gfx950 and not (
++                dtype == "fp8bf16" and hdim == 192
++            ):
++                continue
+             for tile, pipeline in itertools.product(
+                 tiles, CustomFactory.get_pipelines(dtype, hdim, receipt, mask_impl)
+             ):
+@@ -858,12 +1042,39 @@ def get_fwd_blobs(
+                 ):
+                     continue
+ 
+-                # Generate kernels for both page_size=16 and page_size=1024
+-                for page_size in SUPPORTED_PAGE_SIZE:
++                # Keep the tuned head-192 specialization exact: page-64,
++                # vectorized SGLang cache only.  Other page/layout/table
++                # combinations continue to use the padded head-256 kernels.
++                # Besides avoiding a broad JIT-matrix expansion, the tuned
++                # tile is not compile-valid for page-64 LINEAR_LAYOUT.
++                page_sizes = SUPPORTED_PAGE_SIZE
++                if hdim == 192:
++                    if (
++                        pipeline.F_kv_memory_layout != "vectorized"
++                        or pipeline.F_kv_lookup_table != "sglang"
++                    ):
++                        continue
++                    page_sizes = [64]
++                elif (
++                    mimo_target is not None
++                    and dtype in ("bf16", "fp8bf16")
++                    and hdim == 256
++                    and pipeline.F_kv_memory_layout == "vectorized"
++                    and pipeline.F_kv_lookup_table == "sglang"
++                ):
++                    # Retain the padded-D256 page-64 comparator/rollback family
++                    # beside each target's D192 tiles. Generate both buffer-load
++                    # and (below) >2 GiB global-load variants for the contract.
++                    page_sizes = [*SUPPORTED_PAGE_SIZE, 64]
++                for page_size in page_sizes:
+                     if page_size == 1 and pipeline.F_kv_memory_layout != "linear":
+                         continue
+                     # kv_blockscale requires page_size >= kN0 (tile.F_bn0)
+                     # This ensures all tokens in a main loop iteration belong to the same page
++                    # The tuned page-64 MiMo tiles intentionally use kN0 > 64
++                    # to retain the large-cache global-load path, so per-page
++                    # block scaling remains on CK's existing larger-page
++                    # families until cross-page scale reload is implemented.
+                     if pipeline.F_qscale == "kv_blockscale" and page_size < tile.F_bn0:
+                         continue
+                     k = FmhaFwdKernel(

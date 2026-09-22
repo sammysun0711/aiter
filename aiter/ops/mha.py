@@ -1610,6 +1610,17 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_nsink"
         filter_fwd += "_nsink*"
+    # The page-64 Q/K192-V128 specialization lives in CK code generation rather
+    # than in this Python wrapper. Give that contract its own module name so an
+    # existing generic batch-prefill .so cannot hide a newly applied CK patch.
+    if (
+        q.size(-1) == 192
+        and k.dim() == 5
+        and v.dim() == 5
+        and k.size(-2) == 64
+        and v.size(-2) == 128
+    ):
+        md_name += "_page64_qk192_v128"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         f"--targets {get_gfx()} "
