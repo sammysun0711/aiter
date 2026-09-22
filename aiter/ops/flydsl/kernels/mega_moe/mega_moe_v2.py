@@ -3,6 +3,7 @@
 """MegaMoE v2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
 import os
+from copy import copy
 from dataclasses import replace
 
 import flydsl.expr as fx
@@ -95,6 +96,48 @@ class MegaMoEV2:
         self._build_fused_stage2()
         if os.environ.get("AITER_MEGA_MOE_PRELOAD", "0") == "1":
             self.preload_aot_bundles()
+
+    def rebind_weights(self, w1, w1_scale, w2, w2_scale):
+        """Bind another layer's weights while reusing communication workspaces."""
+        tensors = {
+            "w1": w1,
+            "w1_scale": w1_scale,
+            "w2": w2,
+            "w2_scale": w2_scale,
+        }
+        for name, tensor in tensors.items():
+            if not tensor.is_cuda:
+                raise ValueError(f"{name} must be a CUDA tensor")
+            if tensor.device != self.dev:
+                raise ValueError(
+                    f"{name} must be on {self.dev}, got {tensor.device}"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+
+        expected_numel = {
+            "w1": self.epr * 2 * self.inter_dim * self.model_dim // 2,
+            "w1_scale": self.epr * 2 * self.inter_dim * self.model_dim // 32,
+            "w2": self.epr * self.model_dim * self.inter_dim // 2,
+            "w2_scale": self.epr * self.model_dim * self.inter_dim // 32,
+        }
+        for name, tensor in tensors.items():
+            if tensor.numel() != expected_numel[name]:
+                raise ValueError(
+                    f"{name} has {tensor.numel()} elements; expected "
+                    f"{expected_numel[name]} for this MegaMoE geometry"
+                )
+
+        self._s1_w1 = w1.view(torch.uint8)
+        self._s1_w1_scale = w1_scale.view(torch.uint8)
+        self.w2 = w2
+        self.w2_scale = w2_scale
+
+    def fork_with_weights(self, w1, w1_scale, w2, w2_scale):
+        """Create a graph-safe layer view that shares this instance's workspaces."""
+        layer_view = copy(self)
+        layer_view.rebind_weights(w1, w1_scale, w2, w2_scale)
+        return layer_view
 
     def preload_aot_bundles(self):
         """Load the paired Stage1 and Stage2 production bundles."""

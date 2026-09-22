@@ -30,6 +30,13 @@ NETWORKS = {
         "topk": 8,
         "swiglu_limit": 0.0,
     },
+    "mimo_v2_5_pro": {
+        "model_dim": 6144,
+        "inter_dim": 2048,
+        "experts": 384,
+        "topk": 8,
+        "swiglu_limit": 0.0,
+    },
     "v4_pro": {
         "model_dim": 7168,
         "inter_dim": 3072,
@@ -367,6 +374,66 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     dist.all_reduce(graph_replay_exact, op=dist.ReduceOp.MIN)
     if not int(graph_replay_exact.item()):
         raise AssertionError(f"bs={tokens} CUDA Graph replay changed the output")
+    chain_depth = int(args.graph_chain_depth)
+    if chain_depth > 1:
+        chain_state = {}
+
+        def graph_chain():
+            for _ in range(chain_depth):
+                chain_state["output"] = moe(x, weights, ids)
+
+        chain_ms = _time_graph(graph_chain, device, args.iters)
+        chain_output = chain_state["output"][:tokens]
+        chain_exact = torch.tensor(
+            int(torch.equal(chain_output, eager_output)),
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(chain_exact, op=dist.ReduceOp.MIN)
+        if not int(chain_exact.item()):
+            raise AssertionError(
+                f"bs={tokens} depth={chain_depth} CUDA Graph replay changed the output"
+            )
+        if rank == 0:
+            print(
+                f"[MEGA-V2-CHAIN] bs={tokens} depth={chain_depth} "
+                f"graph_replay=PASS e2e={chain_ms[0]:.4f}/{chain_ms[1]:.4f}ms mean/max",
+                flush=True,
+            )
+    if args.graph_weight_views:
+        w1_a = moe._s1_w1
+        w1_scale_a = moe._s1_w1_scale
+        w2_a = moe.w2
+        w2_scale_a = moe.w2_scale
+        w2_b = torch.zeros_like(w2_a.view(torch.uint8)).view(w2_a.dtype)
+        output_a = torch.empty_like(eager_output)
+        output_b = torch.empty_like(eager_output)
+
+        view_a = moe.fork_with_weights(w1_a, w1_scale_a, w2_a, w2_scale_a)
+        view_b = moe.fork_with_weights(w1_a, w1_scale_a, w2_b, w2_scale_a)
+
+        def graph_weight_views():
+            output_a.copy_(view_a(x, weights, ids)[:tokens])
+            output_b.copy_(view_b(x, weights, ids)[:tokens])
+
+        views_ms = _time_graph(graph_weight_views, device, args.iters)
+        views_exact = torch.tensor(
+            int(torch.equal(output_a, eager_output) and torch.count_nonzero(output_b) == 0),
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(views_exact, op=dist.ReduceOp.MIN)
+        moe.rebind_weights(w1_a, w1_scale_a, w2_a, w2_scale_a)
+        if not int(views_exact.item()):
+            raise AssertionError(
+                f"bs={tokens} CUDA Graph replay did not preserve layer-view weight pointers"
+            )
+        if rank == 0:
+            print(
+                f"[MEGA-V2-WEIGHT-VIEWS] bs={tokens} graph_replay=PASS "
+                f"e2e={views_ms[0]:.4f}/{views_ms[1]:.4f}ms mean/max",
+                flush=True,
+            )
     sbm = int(moe._s1_active_tile_m)
     gemm2_bm = int(moe._g2_active_block_m)
     p2p_quant = moe._active_config.p2p_quant
@@ -449,6 +516,8 @@ def main():
     parser.add_argument("--config-tokens", type=int, default=0)
     parser.add_argument("--unify-fields", default="")
     parser.add_argument("--burst-depth", type=int, default=0)
+    parser.add_argument("--graph-chain-depth", type=int, default=1)
+    parser.add_argument("--graph-weight-views", action="store_true")
     parser.add_argument("--force-fanout-boundary", action="store_true")
     parser.add_argument("--inject-invalid-route", action="store_true")
     parser.add_argument("--force-padding-boundary", action="store_true")
@@ -552,6 +621,7 @@ def main():
                     fanout_masks=fanout_masks,
                     **network,
                 )
+                shared_moe.rebind_weights(w1, w1_scale, w2, w2_scale)
             moe = shared_moe
             _install_config_policy(moe, config_tokens, args.unify_fields)
             if rank_tokens:
