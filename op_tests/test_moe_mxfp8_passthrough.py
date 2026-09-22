@@ -47,6 +47,7 @@ from aiter.ops.opus.moe_stage2_a8w4 import (
     stage2_launch_config,
 )
 from aiter.ops.quant import (
+    dynamic_per_group_scaled_quant,
     mxfp4_moe_sort_fwd,
     per_1x32_f4_quant,
     per_1x32_f8_scale_f8_quant,
@@ -199,13 +200,14 @@ def test_ep_config_key_supports_legacy_and_routed_only_topk():
     )
 
 
+@pytest.mark.parametrize("token", [32768, 131072])
 @pytest.mark.parametrize("local_experts", [24, 48])
-def test_mimo_production_capacity_selects_persistent_stage1(local_experts):
-    """Both target EP topologies must select the M131072 persistent pair."""
+def test_mimo_production_capacity_selects_persistent_pair(token, local_experts):
+    """Both target EP topologies and production tiers use the persistent pair."""
 
     get_2stage_cfgs.cache_clear()
     metadata = get_2stage_cfgs(
-        131072,
+        token,
         6144,
         2048,
         local_experts,
@@ -240,8 +242,10 @@ def test_mimo_production_capacity_selects_persistent_stage1(local_experts):
         pytest.param(4096, 24, False, id="ep16-m4k-normal"),
         pytest.param(8192, 24, True, id="ep16-m8k-persistent"),
         pytest.param(16384, 24, True, id="ep16-m16k-persistent"),
+        pytest.param(32768, 24, True, id="ep16-m32k-persistent"),
         pytest.param(8192, 48, False, id="ep8-m8k-normal"),
         pytest.param(16384, 48, False, id="ep8-m16k-normal"),
+        pytest.param(32768, 48, True, id="ep8-m32k-persistent"),
     ],
 )
 def test_mimo_sparse_stage1_persistence_policy(tokens, local_experts, persistent):
@@ -271,6 +275,58 @@ def test_mimo_sparse_stage1_persistence_policy(tokens, local_experts, persistent
     assert ("_persist" in kernel_name) is persistent
 
 
+def test_routed_only_ep_passes_safe_atomic_capacity(monkeypatch):
+    import importlib
+
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    captured = {}
+
+    def fake_stage2(**kwargs):
+        captured.update(kwargs)
+        return kwargs["out"]
+
+    monkeypatch.setattr(
+        fused_moe_module._get_flydsl_moe_kernels(),
+        "flydsl_moe_stage2",
+        fake_stage2,
+    )
+    token_num, topk, model_dim = 64, 8, 128
+    out = torch.empty((token_num, model_dim))
+    fused_moe_module._flydsl_stage2_wrapper(
+        inter_states=torch.empty((token_num, topk, 32)),
+        w1=torch.empty(0),
+        w2=torch.empty(0),
+        sorted_token_ids=torch.empty(0, dtype=torch.int32),
+        sorted_expert_ids=torch.empty(0, dtype=torch.int32),
+        num_valid_ids=torch.empty(0, dtype=torch.int32),
+        out=out,
+        topk=topk,
+        kernelName="flydsl_moe2_afp8_wfp4_bf16_t64x256x256_atomic",
+        expert_mask=torch.empty(384, dtype=torch.int32),
+        topk_ids=torch.empty((token_num, topk), dtype=torch.int32),
+        ep_has_fake_route=False,
+    )
+
+    assert captured["atomic_token_capacity"] == token_num // topk
+
+    captured.clear()
+    fused_moe_module._flydsl_stage2_wrapper(
+        inter_states=torch.empty((token_num, topk, 32)),
+        w1=torch.empty(0),
+        w2=torch.empty(0),
+        sorted_token_ids=torch.empty(0, dtype=torch.int32),
+        sorted_expert_ids=torch.empty(0, dtype=torch.int32),
+        num_valid_ids=torch.empty(0, dtype=torch.int32),
+        out=out,
+        topk=topk,
+        kernelName="flydsl_moe2_afp8_wfp4_bf16_t64x256x256_atomic",
+        expert_mask=torch.empty(384, dtype=torch.int32),
+        topk_ids=torch.empty((token_num, topk), dtype=torch.int32),
+        ep_has_fake_route=True,
+    )
+    assert captured["atomic_token_capacity"] is None
+
+
 def test_routed_only_ep_topk_reaches_fused_moe():
     """The public API must accept an EP mask without requiring a fake route."""
     x, w1, w2, kwargs = _build(8)
@@ -288,6 +344,99 @@ def test_routed_only_ep_topk_reaches_fused_moe():
     )
 
     torch.testing.assert_close(routed_only, reference, atol=1.0, rtol=0.05)
+
+
+def test_ep_a8w4_quantizes_only_num_local_tokens(monkeypatch):
+    """The padded graph capacity must not drive stage-1 input quantization."""
+    import importlib
+
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    original_quant = fused_moe_module.fused_dynamic_mxfp8_quant_moe_sort
+    captured_num_rows = []
+
+    def capture_num_rows(*args, **kwargs):
+        captured_num_rows.append(kwargs.get("num_rows"))
+        return original_quant(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_dynamic_mxfp8_quant_moe_sort",
+        capture_num_rows,
+    )
+
+    tokens, valid_tokens = 16, 8
+    x, w1, w2, kwargs = _build(tokens)
+    kwargs["activation"] = ActivationType.Silu
+    num_local_tokens = torch.tensor([valid_tokens], dtype=torch.int32, device=x.device)
+    expert_mask = torch.ones(EXPERTS, dtype=torch.int32, device=x.device)
+
+    padded = fused_moe(
+        x,
+        w1,
+        w2,
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
+        ep_has_fake_route=False,
+        **kwargs,
+    )
+
+    assert captured_num_rows == [num_local_tokens, num_local_tokens]
+    assert torch.isfinite(padded[:valid_tokens]).all()
+
+    def force_full_quant(*args, **kwargs):
+        kwargs["num_rows"] = None
+        return original_quant(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_dynamic_mxfp8_quant_moe_sort",
+        force_full_quant,
+    )
+    full_quant = fused_moe(
+        x,
+        w1,
+        w2,
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
+        ep_has_fake_route=False,
+        **kwargs,
+    )
+    torch.testing.assert_close(
+        padded[:valid_tokens], full_quant[:valid_tokens], atol=0, rtol=0
+    )
+
+
+def test_device_row_limited_mxfp8_quant_graph_replay():
+    """Persistent row-limited quantization must track the replay-time row count."""
+    torch.manual_seed(13)
+    capacity, cols = 8192, 512
+    x = torch.randn((capacity, cols), dtype=torch.bfloat16, device="cuda") / 8
+    full_out = torch.empty((capacity, cols), dtype=dtypes.fp8, device="cuda")
+    full_scale = torch.empty(
+        (capacity, cols // 32), dtype=dtypes.fp8_e8m0, device="cuda"
+    )
+    dynamic_per_group_scaled_quant(full_out, x, full_scale, 32, False)
+
+    out = torch.empty_like(full_out)
+    scale = torch.empty_like(full_scale)
+    num_rows = torch.tensor([257], dtype=torch.int32, device="cuda")
+    dynamic_per_group_scaled_quant(
+        out, x, scale, 32, False, num_rows=num_rows, num_rows_factor=1
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dynamic_per_group_scaled_quant(
+            out, x, scale, 32, False, num_rows=num_rows, num_rows_factor=1
+        )
+
+    for live_rows in (257, 1025):
+        num_rows.fill_(live_rows)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out[:live_rows], full_out[:live_rows])
+        assert torch.equal(scale[:live_rows], full_scale[:live_rows])
 
 
 def _mimo_opus_metadata(tokens, output_dtype):

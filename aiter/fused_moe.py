@@ -1982,6 +1982,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    ep_has_fake_route=True,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -2009,6 +2010,16 @@ def _flydsl_stage2_wrapper(
             f"sort_block_m={effective_sort_block_m}. Select a kernel with "
             f"_sbm{int(block_m)}."
         )
+    atomic_token_capacity = None
+    if (
+        expert_mask is not None
+        and not ep_has_fake_route
+        and topk > 0
+        and out.shape[0] % topk == 0
+    ):
+        # MORI routed-only input reserves global_tokens * topk rows, while a
+        # destination rank can receive each source token at most once.
+        atomic_token_capacity = max(1, out.shape[0] // topk)
     return moe_kernels.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
@@ -2039,6 +2050,7 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        atomic_token_capacity=atomic_token_capacity,
     )
 
 
@@ -4019,6 +4031,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
+                num_rows=num_local_tokens,
                 sorted_weights=sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
             )
@@ -4175,6 +4188,7 @@ def fused_moe_2stages(
     ):
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
+        extra_stage2_args["ep_has_fake_route"] = ep_has_fake_route
     if not doweight_stage1 and _flydsl_stage2_fp8_enabled():
         # FP8 route-output reduction applies the route weights after GEMM2.
         stage2_keywords = getattr(metadata.stage2, "keywords", None) or {}
@@ -4263,6 +4277,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
+                num_rows=num_local_tokens,
                 sorted_weights=sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
             )
