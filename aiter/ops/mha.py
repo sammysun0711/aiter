@@ -2972,6 +2972,9 @@ def _flash_attn_varlen_forward(
         # fmha v3 varlen is hand-written gfx9 ASM; non-gfx9 must fall back to
         # ck-tile (mha_varlen_fwd, the else branch below).
         ret = get_gfx() in ("gfx942", "gfx950")
+        # Keep sink-bearing short SWA sequences on a sink-capable backend even
+        # when the window restriction above simplifies to full attention.
+        ret = ret and (sink_ptr is None)
         ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
