@@ -359,6 +359,86 @@ def test_fmoe_ep(
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
 
 
+def test_fmoe_ep_routed_only(
+    dtype,
+    token,
+    model_dim,
+    inter_dim,
+    E,
+    topk,
+    ep=8,
+):
+    """Run a real EP kernel with exactly ``topk`` routed columns.
+
+    Unlike the legacy EP fixture above, this matches dispatchers such as MORI:
+    ``topk_ids`` has no shared-expert columns and no always-masked fake column.
+    """
+
+    if E % ep != 0:
+        raise ValueError(f"expert count {E} must be divisible by EP size {ep}")
+    if topk > E:
+        raise ValueError(f"topk {topk} cannot exceed expert count {E}")
+
+    torch.manual_seed(0)
+    ep_id = ep - 1
+    local_E = E // ep
+    local_start = ep_id * local_E
+    local_end = local_start + local_E
+
+    expert_mask = torch.zeros((E,), dtype=dtypes.i32, device="cuda")
+    expert_mask[local_start:local_end] = 1
+
+    hidden_states = torch.randn((token, model_dim), dtype=dtype, device="cuda")
+    w1 = (
+        torch.randn((local_E, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
+        / 10
+    )
+    w2 = torch.randn((local_E, model_dim, inter_dim), dtype=dtype, device="cuda") / 10
+    score = torch.rand((token, E), dtype=dtype, device="cuda")
+    # Scores in [0, 1) let the forced routes survive top-k deterministically.
+    # Boosting every local expert instead would select only local routes when
+    # local_E >= topk and would never exercise the remote-expert mask.
+    score[:, local_start] = 2
+    if ep > 1 and topk > 1:
+        score[:, 0] = 3  # ep_id is the last rank, so expert 0 is remote.
+    topk_weights, topk_ids = fused_topk(hidden_states, score, topk, True)
+
+    assert topk_ids.shape == (token, topk)
+    assert expert_mask.shape == (E,)
+    assert torch.all(topk_ids >= 0)
+    assert torch.all(topk_ids < E)
+    local_routes = (topk_ids >= local_start) & (topk_ids < local_end)
+    assert torch.all(local_routes.any(dim=-1))
+    if ep > 1 and topk > 1:
+        assert torch.all((~local_routes).any(dim=-1))
+
+    reference, _ = torch_moe_test(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        expert_mask=expert_mask,
+    )
+
+    w1_shuffled = shuffle_weight(w1, layout=(16, 16))
+    w2_shuffled = shuffle_weight(w2, layout=(16, 16))
+    output, _ = run_perftest(
+        fused_moe,
+        hidden_states,
+        w1_shuffled,
+        w2_shuffled,
+        topk_weights,
+        topk_ids,
+        expert_mask=expert_mask,
+        quant_type=QuantType.No,
+        activation=ActivationType.Silu,
+        doweight_stage1=False,
+        ep_has_fake_route=False,
+    )
+    torch.testing.assert_close(reference, output, rtol=2e-2, atol=5e-2)
+
+
 # ---------------------------------------------------------------------------
 # EP end-to-end with per_1x32 mxfp4 (a8w4 / a4w4) via fused_moe
 # ---------------------------------------------------------------------------
@@ -555,6 +635,7 @@ parser.add_argument(
     default=[
         "test_fmoe_16_bit",
         "g1u1_no_quant",
+        "g1u1_no_quant_routed_only",
         "g1u1_int8quant",
         "g1u1_fp8quant",
         "g1u0_int8smoothquant",
@@ -567,6 +648,7 @@ parser.add_argument(
     e.g.: -t g1u1_int8quant
           or -t test_fmoe_16_bit
           or -t g1u1_no_quant
+          or -t g1u1_no_quant_routed_only (exactly top-k routed columns)
           or -t g1u1_int8quant
           or -t g1u1_fp8quant
           or -t g1u0_int8smoothquant (only runs on gfx942)
@@ -674,6 +756,21 @@ for test in args.test:
                                 quant="No",
                                 use_g1u1=True,
                                 shared_E=2,
+                                ep=ep,
+                            )
+    elif test == "g1u1_no_quant_routed_only":
+        for dtype in args.dtype:
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
+                        for ep in args.expert_parallelism:
+                            test_fmoe_ep_routed_only(
+                                dtype,
+                                m,
+                                hdim,
+                                idim,
+                                args.expert,
+                                args.topk,
                                 ep=ep,
                             )
     elif test == "g1u1_int8quant":

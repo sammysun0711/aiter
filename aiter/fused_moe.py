@@ -268,7 +268,14 @@ def fused_moe(
     splitk=0,
     swiglu_limit=0.0,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    ep_has_fake_route: bool = True,
 ):
+    """Run MoE, preserving the legacy EP tuning-key convention by default.
+
+    Set ``ep_has_fake_route=False`` when EP inputs contain routed columns only,
+    as with MORI. This flag controls the top-k used for configuration lookup;
+    it does not remove columns or change the supplied routes and weights.
+    """
     if not block_size_M:
         block_size_M = -1
     return fused_moe_(
@@ -296,6 +303,7 @@ def fused_moe(
         bias2=bias2,
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
+        ep_has_fake_route=ep_has_fake_route,
     )
 
 
@@ -326,6 +334,7 @@ def fused_moe_fake(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    ep_has_fake_route: bool = True,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -363,6 +372,7 @@ def fused_moe_(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    ep_has_fake_route: bool = True,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -433,6 +443,7 @@ def fused_moe_(
         isShuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        ep_has_fake_route=ep_has_fake_route,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -541,6 +552,7 @@ def fused_moe_(
             swiglu_limit=swiglu_limit,
             gate_mode=gate_mode,
             expert_mask=expert_mask,
+            ep_has_fake_route=ep_has_fake_route,
         )
 
 
@@ -986,6 +998,7 @@ def get_2stage_cfgs(
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
+    ep_has_fake_route=True,
 ):
     gate_mode = GateMode(gate_mode)
     _INDEX_COLS = [
@@ -1077,10 +1090,9 @@ def get_2stage_cfgs(
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
+    # Legacy EP callers append one always-masked fake route. Newer callers can
+    # explicitly report that their top-k tensor contains routed entries only.
+    topk -= int(is_ep and ep_has_fake_route)
     keys = (
         cu_num,
         token,
@@ -1770,6 +1782,7 @@ def fused_moe_2stages(
     swiglu_limit=0.0,
     gate_mode=GateMode.SEPARATED.value,
     expert_mask=None,
+    ep_has_fake_route=True,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -1798,6 +1811,7 @@ def fused_moe_2stages(
         is_shuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        ep_has_fake_route=ep_has_fake_route,
     )
     stage1_uses_transposed_scale = quant_type == QuantType.per_1x128 and (
         metadata.stage1.func is asm_stage1
