@@ -32,6 +32,7 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+_USE_FLYDSL_MOE_EP_DECODE_FP8_BLOCK128_GFX950 = os.environ.get("AITER_FLYDSL_MOE_EP_DECODE_FP8_BLOCK128_GFX950", "0") == "1"
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -239,6 +240,48 @@ def get_inter_dim(w1_shape, w2_shape):
     return E, model_dim, inter_dim
 
 
+def _try_flydsl_ep_decode_fp8_block128_gfx950(
+    hidden_states, w1, w2, topk_weight, topk_ids, expert_mask,
+    activation, quant_type, doweight_stage1, w1_scale, w2_scale,
+    a1_scale, a1_scale_is_transposed, a2_scale, num_local_tokens,
+    dtype, hidden_pad, intermediate_pad, bias1, bias2, swiglu_limit,
+    gate_mode, num_tokens_before_dispatch,
+):
+    if not _USE_FLYDSL_MOE_EP_DECODE_FP8_BLOCK128_GFX950:
+        return None
+    activation = ActivationType(activation)
+    quant_type = quant_remap.get(QuantType(quant_type), QuantType(quant_type))
+    gate_mode = GateMode(gate_mode)
+    dtype = hidden_states.dtype if dtype is None else dtype
+    if not (
+        hidden_states.is_cuda and get_gfx() == "gfx950"
+        and (num_tokens_before_dispatch is None or num_tokens_before_dispatch >= 4)
+        and expert_mask is not None and num_local_tokens is not None
+        and quant_type == QuantType.per_1x128 and activation == ActivationType.Silu
+        and dtype == dtypes.bf16
+        and hidden_states.dtype == dtypes.fp8 and w1.dtype == dtypes.fp8 and w2.dtype == dtypes.fp8
+        and (getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False))
+        and hidden_states.ndim == 2 and w1.ndim == 3 and w2.ndim == 3
+        and w1.shape[1] == 2 * w2.shape[2]
+        and not a1_scale_is_transposed and a1_scale is not None
+        and w1_scale is not None and w2_scale is not None and a2_scale is None
+        and not doweight_stage1 and not hidden_pad and not intermediate_pad
+        and bias1 is None and bias2 is None and not swiglu_limit
+        and gate_mode == GateMode.SEPARATED and hidden_states.shape[0] <= 2048
+    ):
+        return None
+    from aiter.ops.flydsl.moe_ep_decode_fp8_block128_gfx950 import (
+        fused_moe_ep_decode_fp8_block128_gfx950, is_supported_ep_decode_fp8_block128_gfx950_input,
+    )
+    args = (hidden_states, w1, w2, topk_ids, topk_weight, a1_scale,
+            w1_scale, w2_scale, expert_mask, num_local_tokens)
+    if not is_supported_ep_decode_fp8_block128_gfx950_input(
+        *args, num_tokens_before_dispatch=num_tokens_before_dispatch
+    ):
+        return None
+    return fused_moe_ep_decode_fp8_block128_gfx950(*args, num_tokens_before_dispatch=num_tokens_before_dispatch)
+
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -269,12 +312,15 @@ def fused_moe(
     swiglu_limit=0.0,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
     ep_has_fake_route: bool = True,
+    num_tokens_before_dispatch: Optional[int] = None,
 ):
     """Run MoE, preserving the legacy EP tuning-key convention by default.
 
     Set ``ep_has_fake_route=False`` when EP inputs contain routed columns only,
     as with MORI. This flag controls the top-k used for configuration lookup;
     it does not remove columns or change the supplied routes and weights.
+    ``num_tokens_before_dispatch`` is an optional per-rank workload hint for
+    opt-in EP kernels. GPU receive counts still bound the actual computation.
     """
     if not block_size_M:
         block_size_M = -1
@@ -304,6 +350,7 @@ def fused_moe(
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
         ep_has_fake_route=ep_has_fake_route,
+        num_tokens_before_dispatch=num_tokens_before_dispatch,
     )
 
 
@@ -335,6 +382,7 @@ def fused_moe_fake(
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
     ep_has_fake_route: bool = True,
+    num_tokens_before_dispatch: Optional[int] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -373,6 +421,7 @@ def fused_moe_(
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
     ep_has_fake_route: bool = True,
+    num_tokens_before_dispatch: Optional[int] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -401,6 +450,16 @@ def fused_moe_(
     ], f"Fused_moe unsupported out dtype: {dtype}"
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
+    if _USE_FLYDSL_MOE_EP_DECODE_FP8_BLOCK128_GFX950:
+        result = _try_flydsl_ep_decode_fp8_block128_gfx950(
+            hidden_states, w1, w2, topk_weight, topk_ids, expert_mask,
+            activation, quant_type, doweight_stage1, w1_scale, w2_scale,
+            a1_scale, a1_scale_is_transposed, a2_scale, num_local_tokens,
+            dtype, hidden_pad, intermediate_pad, bias1, bias2, swiglu_limit,
+            gate_mode, num_tokens_before_dispatch,
+        )
+        if result is not None:
+            return result
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
     # use FP8 as activation dtype to skip redundant re-quantization
