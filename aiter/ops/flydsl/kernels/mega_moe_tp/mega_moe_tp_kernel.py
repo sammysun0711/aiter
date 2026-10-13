@@ -93,6 +93,7 @@ def compile_mega_moe_tp(
     lbpf: bool = False,
     lbp: int = 0,
     profiling: bool = False,
+    dyn_p: int = 0,
 ):
     """Build the launcher of one (shape, variant) instance; LaunchCfg (host) picks them.
 

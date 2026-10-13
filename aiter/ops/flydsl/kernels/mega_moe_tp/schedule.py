@@ -435,43 +435,58 @@ def build_schedule(kc: KernelCtx) -> dict:
         lane = tid % i32(64)
         base = [i32(0), i32(0)]
         for rnd in range_constexpr(ceildiv(E, NT)):
-            j = tid + i32(rnd * NT)
-            live = j < nact
-            e = live.select(
-                lds_ld_i32(L, L_DYN + (i32(2 * NBW) + fx.min(j, i32(E - 1))) * i32(4)),
-                i32(0),
-            )
-            r = lds_ld_i32(L, L_DCNT + e * i32(4))
-            r = live.select(r, i32(0)) if offs else r
-            ce = fx.min(fx.max(ceildiv(r, i32(rch)), i32(1)), i32(255))
-            ce = live.select(ce, i32(0))
-            sums = [_wave_prefix(ce, 8)] + (
-                [_wave_prefix(r, TMAX.bit_length())] if offs else []
-            )
-            if lane == i32(0):
-                for q in range_constexpr(len(sums)):
-                    lds_st(L, L_WSUM + (w + i32(q * NW)) * i32(4), sums[q][1])
-            cbar(L, tid)
-            off = []
-            for q in range_constexpr(len(sums)):
-                o, total = base[q] + sums[q][0], i32(0)
-                for v in range_constexpr(NW):
-                    sv = lds_ld_i32(L, L_WSUM + i32((q * NW + v) * 4))
-                    o = o + (i32(v) < w).select(sv, i32(0))
-                    total = total + sv
-                off.append(o)
-                base[q] = base[q] + total
-            if const_expr(offs):  # noqa: SIM102
-                if live:
-                    lds_st(L, L_EOFF + e * i32(4), off[1])
-            for c_ in range(i32(0), ce, i32(1)):
-                c = i32(c_)
-                lds_st(
-                    L,
-                    L_DCH + (off[0] + c) * i32(4),
-                    e | (ce << i32(16)) | (c << i32(24)),
+            if const_expr(
+                not offs
+                and kc.a8
+                and not kc.ar
+                and kc.H == 6144
+                and I == 256
+                and E == 384
+                and TOPK == 8
+            ):
+                run = nact > i32(rnd * NT)
+            else:
+                run = fx.Boolean(True)
+            if run:
+                j = tid + i32(rnd * NT)
+                live = j < nact
+                e = live.select(
+                    lds_ld_i32(
+                        L, L_DYN + (i32(2 * NBW) + fx.min(j, i32(E - 1))) * i32(4)
+                    ),
+                    i32(0),
                 )
-            cbar(L, tid)
+                r = lds_ld_i32(L, L_DCNT + e * i32(4))
+                r = live.select(r, i32(0)) if offs else r
+                ce = fx.min(fx.max(ceildiv(r, i32(rch)), i32(1)), i32(255))
+                ce = live.select(ce, i32(0))
+                sums = [_wave_prefix(ce, 8)] + (
+                    [_wave_prefix(r, TMAX.bit_length())] if offs else []
+                )
+                if lane == i32(0):
+                    for q in range_constexpr(len(sums)):
+                        lds_st(L, L_WSUM + (w + i32(q * NW)) * i32(4), sums[q][1])
+                cbar(L, tid)
+                off = []
+                for q in range_constexpr(len(sums)):
+                    o, total = base[q] + sums[q][0], i32(0)
+                    for v in range_constexpr(NW):
+                        sv = lds_ld_i32(L, L_WSUM + i32((q * NW + v) * 4))
+                        o = o + (i32(v) < w).select(sv, i32(0))
+                        total = total + sv
+                    off.append(o)
+                    base[q] = base[q] + total
+                if const_expr(offs):  # noqa: SIM102
+                    if live:
+                        lds_st(L, L_EOFF + e * i32(4), off[1])
+                for c_ in range(i32(0), ce, i32(1)):
+                    c = i32(c_)
+                    lds_st(
+                        L,
+                        L_DCH + (off[0] + c) * i32(4),
+                        e | (ce << i32(16)) | (c << i32(24)),
+                    )
+                cbar(L, tid)
         if tid == i32(0):
             lds_st(L, L_CTL + C_NCH * 4, base[0])
         if const_expr(offs):

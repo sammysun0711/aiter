@@ -75,6 +75,7 @@ class LaunchCfg:
     tn: int = 0
     pf: bool = False
     lp: int = 0
+    dp: int = 0  # dynamic inter pieces: 0 chooses automatically
 
 
 # --- intra-node symmetric memory (hipIpc, via quick_allreduce_int4_ipc) ---------------
@@ -538,10 +539,24 @@ class MegaMoeTPEngine:
                     lp=lp if self.I // 128 % max(lp, 1) == 0 else 0,
                 )
             elif tot <= self.dyn_max:
+                mimo_decode = (
+                    self.a8
+                    and not self.ar
+                    and fp8
+                    and (self.tp, self.H, self.I, self.E, self.K, self.activation)
+                    == (8, 6144, 256, 384, 8, "silu")
+                )
+                # MiMo A8W4 TP8: small per-expert row counts prefer MT=1.
+                # Above 128 tokens, one full-I unit avoids partial-route reads;
+                # LL route packets preserve overlap through 256 tokens.
                 cfg = LaunchCfg(
-                    self._fit_mt(1 if tot <= 32 else 2 if tot <= 64 else 3),
+                    self._fit_mt(
+                        1 if mimo_decode or tot <= 32 else 2 if tot <= 64 else 3
+                    ),
                     ll=tot <= 256 and fp8,
-                    llr=tot <= 128 and fp8,
+                    llr=(tot <= 128 or mimo_decode) and fp8,
+                    npp=2 if mimo_decode else 1,
+                    dp=1 if mimo_decode and tot > 128 else 0,
                     ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
                 )
             else:
@@ -596,6 +611,7 @@ class MegaMoeTPEngine:
                 lbpf=cfg.pf,
                 lbp=cfg.lp,
                 profiling=self.profiling,
+                dyn_p=cfg.dp,
             )
             self._launchers[self._key(cfg)] = fn
         return fn

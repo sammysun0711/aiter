@@ -265,6 +265,7 @@ def kernel_config(
     lbpf: bool = False,
     lbp: int = 0,
     profiling: bool = False,
+    dyn_p: int = 0,
 ):
     """The derived compile-time values of one compile_mega_moe_tp instance."""
     if swiglu_limit is None:
@@ -290,9 +291,12 @@ def kernel_config(
     VPL = ceildiv(CW // 8, 64)
     SCAN_IT = ceildiv(min(TMAX, DYN_MAX) * TOPK // 4, NT)
     SCAN_G = 16
-    NPC = 1 if lb else KS2
+    NPC = 1 if lb else dyn_p if dyn_p > 0 else KS2
     assert not (comm_bf16 and ll_rs)
     DYN_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]
+    assert dyn_p == 0 or dyn_p in DYN_PS
+    if dyn_p:
+        DYN_PS = [dyn_p]
     DLL = bool(ll_rs and ll_route)
     assert not DLL or route_fp8
     MLL = DLL and not ar
@@ -366,6 +370,7 @@ def kernel_config(
         + (f"_ad{ADEPTH}" if ADEPTH != ALOAD_DEPTH else "")
         + ("_pf" if LBPF else "")
         + ("_profile" if profiling else "")
+        + (f"_dp{dyn_p}" if dyn_p else "")
     )
     const_expr = fx.const_expr
     layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"
