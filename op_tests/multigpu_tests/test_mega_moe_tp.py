@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Fused TP MegaMoE layer (a4w4, MXFP4, gfx950) vs torch: accuracy + perf sweep, feature
+"""Fused TP MegaMoE layer (A4W4 / A8W4, MXFP4 weights, gfx950) vs torch: accuracy + perf sweep, feature
 cases and SpRsNorm, each ending in a markdown summary table::
 
     torchrun --nproc_per_node=4 op_tests/multigpu_tests/test_mega_moe_tp.py \\
@@ -32,6 +32,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_tp.sp_rs_norm import SpRsNorm
 from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
 from aiter.ops.flydsl.moe_common import DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA
+from aiter.ops.quant import per_1x32_f8_scale_f8_quant
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
@@ -55,6 +56,7 @@ class ModelShape:
     experts: int
     topk: int
     act: aiter.ActivationType
+    act_dtype: str = "fp4"
 
 
 MODELS = {
@@ -63,6 +65,9 @@ MODELS = {
     "dsv4": ModelShape("dsv4", 7168, 3072, 384, 6, aiter.ActivationType.Silu),
     "kimi3": ModelShape("kimi3", 3584, 3072, 896, 16, aiter.ActivationType.Situv2),
     "m3": ModelShape("m3", 6144, 3072, 129, 5, aiter.ActivationType.Swiglu),
+    # MiMo-V2.5-Pro-FP4-DFlash/config.json: H=6144, routed I=2048,
+    # E=384, top-k=8; TP8 gives local I=256. Activations are MXFP8.
+    "mimo": ModelShape("mimo", 6144, 2048, 384, 8, aiter.ActivationType.Silu, "fp8"),
 }
 
 
@@ -177,17 +182,26 @@ def route(rows, shape: ModelShape, kind: str, gen: torch.Generator, device):
 
 
 @torch.no_grad()
-def torch_partial(shape, wt: Weights, x, w, ids):
+def quant_activation(shape, x):
+    """Reference quantization: E8M0 group-32 scales for both activation formats."""
+    if shape.act_dtype == "fp8":
+        return per_1x32_f8_scale_f8_quant(
+            x, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+    return aiter.get_torch_quant(QUANT_TYPE)(x, quant_dtype=FP4)
+
+
+@torch.no_grad()
+def torch_partial(shape, wt: Weights, x, w, ids, intermediate_dtype=dtypes.bf16):
     beta = situ(shape) or (1.0, 1.0)
-    quant = aiter.get_torch_quant(QUANT_TYPE)
-    a1, a1s = quant(x, quant_dtype=FP4)
+    a1, a1s = quant_activation(shape, x)
     out1 = torch_moe_stage1(
         a1,
         wt.w1_ref,
         wt.w2_ref,
         w,
         ids,
-        dtype=dtypes.bf16,
+        dtype=intermediate_dtype,
         activation=shape.act,
         quant_type=QUANT_TYPE,
         a1_scale=a1s,
@@ -198,7 +212,7 @@ def torch_partial(shape, wt: Weights, x, w, ids):
         situ_beta=beta[0],
         situ_linear_beta=beta[1],
     )
-    a2, a2s = quant(out1, quant_dtype=FP4)
+    a2, a2s = quant_activation(shape, out1)
     return torch_moe_stage2(
         a2.view(x.shape[0], shape.topk, -1),
         wt.w1_ref,
@@ -223,7 +237,9 @@ class Case:
     ids_all: torch.Tensor | None = None
 
 
-def make_case(shape, wt, ctx, mode, tokens, kind, seed, mask=0.0) -> Case:
+def make_case(
+    shape, wt, ctx, mode, tokens, kind, seed, mask=0.0, intermediate_dtype=dtypes.bf16
+) -> Case:
     m = tokens // ctx.world
     if mode == "ag_rs":
         gen = torch.Generator(device=ctx.device).manual_seed(seed + 7919 * ctx.rank)
@@ -258,12 +274,14 @@ def make_case(shape, wt, ctx, mode, tokens, kind, seed, mask=0.0) -> Case:
             g = [torch.empty_like(t) for _ in range(ctx.world)]
             dist.all_gather(g, t)
             parts.append(torch.cat(g))
-        full = torch_partial(shape, wt, *parts)
+        full = torch_partial(shape, wt, *parts, intermediate_dtype=intermediate_dtype)
         dist.all_reduce(full)
         ref = full[ctx.rank * m : (ctx.rank + 1) * m]
         ids_all = parts[2]
     else:
-        ref = torch_partial(shape, wt, x, w_ref, ids_ref)
+        ref = torch_partial(
+            shape, wt, x, w_ref, ids_ref, intermediate_dtype=intermediate_dtype
+        )
         dist.all_reduce(ref)
         ids_all = ids_ref
     return Case(x.contiguous(), w, ids, ref, ids_all)
@@ -291,6 +309,7 @@ def new_layer(
         comm_mode=mode,
         comm_dtype=comm_dtype,
         ar_gather=ar_gather,
+        act_dtype=shape.act_dtype,
         **kw,
     )
     return MegaMoeTP(
@@ -328,7 +347,10 @@ def check(y, c: Case, rtol, what="fused vs torch"):
 def case_varying_m(shape, wt, ctx, S, mode):
     layer = new_layer(shape, wt, ctx, mode, S.max_local)
     worst = 0.0
-    for m in (8, 1, 32, 1, min(64, S.max_local), 8):
+    limit = (
+        min(S.max_local, 256 // ctx.world) if shape.act_dtype == "fp8" else S.max_local
+    )
+    for m in (8, 1, 32, 1, min(64, limit), 8):
         c = make_case(shape, wt, ctx, mode, m * ctx.world, "random", SEED + m)
         worst = max(worst, check(call(layer, c).clone(), c, RTOL["fp8"], f"m={m}"))
     return worst
@@ -366,9 +388,21 @@ def case_out(shape, wt, ctx, S, mode):
 
 
 def case_graph(shape, wt, ctx, S, mode):
+    if shape.act_dtype == "fp8":
+        # Cover the one-piece optimized schedule as well as the <=128 path,
+        # including changing routing in both directions between graph replays.
+        counts = sorted({8, 16 * ctx.world, 248, 256})
+        for count in (m for m in counts if m <= 256 and m % ctx.world == 0):
+            _case_graph_at_tokens(shape, wt, ctx, S, mode, count)
+    else:
+        _case_graph_at_tokens(shape, wt, ctx, S, mode, 16 * ctx.world)
+
+
+def _case_graph_at_tokens(shape, wt, ctx, S, mode, tokens):
     layer = new_layer(shape, wt, ctx, mode, S.max_local)
     cases = [
-        make_case(shape, wt, ctx, mode, 16 * ctx.world, "random", s) for s in (3, 4, 5)
+        make_case(shape, wt, ctx, mode, tokens, route, seed)
+        for route, seed in (("random", 3), ("hot", 4), ("balanced", 5))
     ]
     eager = [call(layer, c).clone() for c in cases]
     c = Case(cases[0].x.clone(), cases[0].w.clone(), cases[0].ids.clone(), None)
@@ -409,8 +443,21 @@ def case_dynamic(shape, wt, ctx, S, mode, lb):
         shape, wt, ctx, mode, S.max_local, **(kw if lb else {"lb_min": 0})
     )
     worst = 0.0
-    tokens = sorted({ctx.world, 3 * ctx.world, 33 * ctx.world, S.max_tokens})
-    for t in (t for t in tokens if t <= S.max_local * ctx.world):
+    tokens = sorted(
+        {
+            ctx.world,
+            3 * ctx.world,
+            33 * ctx.world,
+            S.max_tokens,
+            *([136, 248, 256] if shape.act_dtype == "fp8" else []),
+        }
+    )
+    limit = (
+        min(S.max_local * ctx.world, 256)
+        if shape.act_dtype == "fp8"
+        else S.max_local * ctx.world
+    )
+    for t in (t for t in tokens if t <= limit):
         for kind in ("random", "subset"):
             c = make_case(shape, wt, ctx, mode, t, kind, SEED + 3 * t)
             y = call(layer, c).clone()
@@ -569,6 +616,11 @@ def case_validation(shape, wt, ctx, S):
         lambda: new_layer(shape, wt, ctx, "ag_rs", 4096), "max_local_tokens=4096"
     )
     layer = new_layer(shape, wt, ctx, "ag_rs", S.max_local)
+    if shape.act_dtype == "fp8":
+        expect_raise(
+            lambda: layer.launch_config(256 // ctx.world + 1),
+            "A8W4 above 256 global tokens",
+        )
     c = make_case(shape, wt, ctx, "ag_rs", 8 * ctx.world, "random", 5)
     x, w, ids = c.x, c.w, c.ids
     expect_raise(lambda: layer(x.float(), w, ids), "fp32 hidden states")
@@ -720,6 +772,7 @@ def test_mega_moe_tp(model: str, mode: str, tokens: int, route: str, seed: int):
         ret[f"{name} cfg"] = (
             f"mt{cfg.mt}{' lb' if cfg.lb else ''}{' ll' if cfg.ll else ''}"
         )
+        ret[f"{name} act"] = shape.act_dtype
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -862,7 +915,7 @@ def main() -> int:
     parser.add_argument(
         "--models",
         nargs="*",
-        default=["m3", "glm5"],
+        default=["m3", "glm5", "mimo"],
         choices=list(MODELS),
         help="Models.\n    e.g.: --models m3",
     )
@@ -905,6 +958,8 @@ def main() -> int:
     if bad:
         raise ValueError(f"tokens {bad} must be positive multiples of tp={ctx.world}")
     max_tokens = max(args.tokens)
+    if max_tokens > 256 and any(MODELS[m].act_dtype == "fp8" for m in args.models):
+        raise ValueError("MXFP8 activations support at most 256 global tokens")
     S = Session(ctx, max(max_tokens // ctx.world, 128), max_tokens, {}, {})
 
     rows = {"accuracy + perf": [], "feature cases": [], "SpRsNorm": []}
@@ -917,8 +972,14 @@ def main() -> int:
                 _run(test_mega_moe_tp, model, mode, tokens, route, seed)
             )
         for mode, case in itertools.product(args.modes, CASES):
+            if MODELS[model].act_dtype == "fp8" and case == "dynamic LB":
+                # A8W4 has no large-batch schedule; do not report an A4W4 test as A8W4.
+                continue
             rows["feature cases"].append(_run(test_mega_moe_tp_case, model, mode, case))
         for case in MODEL_CASES:
+            if MODELS[model].act_dtype == "fp8" and case == "fused tail":
+                # The fused tail requires the A4W4 large-batch schedule.
+                continue
             if case != "fused tail" or "ag_rs" in args.modes:
                 rows["feature cases"].append(
                     _run(test_mega_moe_tp_case, model, "ag_rs", case)
