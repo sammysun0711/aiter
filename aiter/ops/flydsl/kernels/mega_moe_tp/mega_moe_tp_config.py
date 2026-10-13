@@ -74,6 +74,9 @@ CTRL_COLC = CTRL_LBR + 2 * N_XCD * LRDY_STRIDE
 CTRL_G1C = CTRL_COLC + 2 * NCK_MAX * LRDY_STRIDE
 CTRL_TNC = CTRL_G1C + 2 * NCHLB_MAX * G1C_STRIDE
 CTRL_INTS = CTRL_TNC + TN_MAX
+# Optional diagnostic timestamps, separate from all synchronization counters.
+PROFILE_SLOTS = 32
+PROFILE_BASE = ceildiv(CTRL_INTS * 4, 8) * 8
 # unit records (expert, i0, icnt, kind); LB: kind = UNIT_G1X | piece << 8 | chunk << XQ_SHIFT
 # (a GEMM1 piece exporting its intermediate)
 UNIT_G1X = 3
@@ -261,6 +264,7 @@ def kernel_config(
     tn_gemma: bool = True,
     lbpf: bool = False,
     lbp: int = 0,
+    profiling: bool = False,
 ):
     """The derived compile-time values of one compile_mega_moe_tp instance."""
     if swiglu_limit is None:
@@ -361,6 +365,7 @@ def kernel_config(
         + ("_mtskip" if MTSKIP else "")
         + (f"_ad{ADEPTH}" if ADEPTH != ALOAD_DEPTH else "")
         + ("_pf" if LBPF else "")
+        + ("_profile" if profiling else "")
     )
     const_expr = fx.const_expr
     layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"

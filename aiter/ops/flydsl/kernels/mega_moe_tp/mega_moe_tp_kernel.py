@@ -24,6 +24,8 @@ from .common import (
     bf16x8_to_f32,
     bld,
     bst,
+    build_profile_stamp,
+    build_profile_value,
     fp8x4_pack,
     g_add_agent,
     g_ld_sys,
@@ -47,6 +49,8 @@ from .mega_moe_tp_config import (
     FLAG_TN,
     NT,
     NTT,
+    PROFILE_BASE,
+    PROFILE_SLOTS,
     TN_MAX,
     kernel_config,
 )
@@ -88,6 +92,7 @@ def compile_mega_moe_tp(
     tn_gemma: bool = True,
     lbpf: bool = False,
     lbp: int = 0,
+    profiling: bool = False,
 ):
     """Build the launcher of one (shape, variant) instance; LaunchCfg (host) picks them.
 
@@ -114,6 +119,9 @@ def compile_mega_moe_tp(
         rank into qall / sall; tn 2: the bf16 normed rows too (qall after the FP8 rows).
     """
     kc = kernel_config(**locals())
+    profile_stamp = build_profile_stamp(profiling, PROFILE_BASE, PROFILE_SLOTS)
+    kc.profile_stamp = profile_stamp
+    kc.profile_value = build_profile_value(profiling, PROFILE_BASE, PROFILE_SLOTS)
     kc.add(build_communication(kc))
     kc.add(build_gemm(kc))
     kc.add(build_schedule(kc))
@@ -306,23 +314,31 @@ def compile_mega_moe_tp(
     def roles(L, tid, a, epoch):
         if tid < i32(NT):
             compute_units(L, tid, a)
+            if tid == i32(0):
+                profile_stamp(a, tid, 6)
             comm_help(L, tid, a, epoch)
+            if tid == i32(0):
+                profile_stamp(a, tid, 7)
         else:
             if tid < i32(NT + 64):
                 ag_send(L, tid % i32(64), a)
+                profile_stamp(a, tid, 8)
                 if const_expr(DLL):
                     push_dll(L, tid, a)
                     comm_wave(L, tid, a, epoch)
                 else:
                     poll_loop(L, tid, a, epoch)
+                profile_stamp(a, tid, 9)
             elif tid < i32(NT + 128):
                 a_loader(L, tid, a)
+                profile_stamp(a, tid, 10)
                 if const_expr(LBPF):
                     lb_g2_prefetch(L, tid % i32(64), a)
                 if const_expr(DLL):
                     push_dll(L, tid, a, 1)
                     signal_loop(L, tid, a, epoch)
                 comm_help(L, tid, a, epoch)
+                profile_stamp(a, tid, 11)
             else:
                 if const_expr(DLL):
                     if tid < i32(NT + 192):
@@ -331,6 +347,8 @@ def compile_mega_moe_tp(
                     else:
                         push_dll(L, tid, a, 3)
                 comm_help(L, tid, a, epoch)
+                if tid == i32(NT + 192):
+                    profile_stamp(a, tid, 12)
 
     Shared = fx.struct(
         type(
@@ -386,6 +404,8 @@ def compile_mega_moe_tp(
         for j in range_constexpr(1, MAX_TP):
             mine = (rank == i32(j)).select(peers[j], mine)
         a.update(peer=peers, mine=fx.Int64(mine), ttot=tp * m)
+        if tid == i32(0):
+            profile_stamp(a, tid, 0)
         _dyn_zero(L, tid)
         init_lds(L, tid, a)
         gpu.barrier()
@@ -412,12 +432,16 @@ def compile_mega_moe_tp(
         gpu.barrier()
         a["ax"] = fx.Int64(mine) + off_x
         a["axs"] = fx.Int64(mine) + off_xs
+        if tid == i32(0):
+            profile_stamp(a, tid, 1)
         roles(L, tid, a, epoch)
         if const_expr(ar and not ARLL):
             wait_vm(0)
         if const_expr(TN):
             wait_vm(0)
         gpu.barrier()
+        if tid == i32(0):
+            profile_stamp(a, tid, 13)
         if const_expr(ar and not ARLL):
             yag_flush(L, tid, a)
             yag_wait(tid, a, epoch)
@@ -430,6 +454,8 @@ def compile_mega_moe_tp(
         if const_expr(lb):
             lb_finish(tid, a, L)
         finish(tid, a, epoch)
+        if tid == i32(0):
+            profile_stamp(a, tid, 14)
 
     kargs = list(inspect.signature(mega_moe_tp_kernel).parameters)
     mega_moe_tp_kernel = flyc.kernel(name=name, known_block_size=[NTT, 1, 1])(

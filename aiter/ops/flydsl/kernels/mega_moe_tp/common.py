@@ -382,6 +382,40 @@ def now():
     )
 
 
+def build_profile_stamp(enabled, base, slots):
+    """Per-CTA diagnostic clock samples; compiled away in normal kernels."""
+
+    @flyc.jit
+    def stamp(a, tid, slot):
+        if fx.const_expr(enabled):  # noqa: SIM102
+            if tid % i32(64) == i32(0):
+                offset = base + (fx.block_idx.x * i32(slots) + i32(slot)) * i32(8)
+                ptr = fx.inttoptr(
+                    fx.PointerType.get(T.i64, fx.AddressSpace.Global, 8),
+                    a["ctrl"] + fx.Int64(offset),
+                )
+                fx.ptr_store(now(), ptr)
+
+    return stamp
+
+
+def build_profile_value(enabled, base, slots):
+    """Store accumulated per-CTA diagnostics once, after the measured region."""
+
+    @flyc.jit
+    def store(a, tid, slot, value):
+        if fx.const_expr(enabled):  # noqa: SIM102
+            if tid == i32(0):
+                offset = base + (fx.block_idx.x * i32(slots) + i32(slot)) * i32(8)
+                ptr = fx.inttoptr(
+                    fx.PointerType.get(T.i64, fx.AddressSpace.Global, 8),
+                    a["ctrl"] + fx.Int64(offset),
+                )
+                fx.ptr_store(fx.Int64(value), ptr)
+
+    return store
+
+
 def before(cur, target):
     """cur has not reached target. Wrap-safe for int32 launch epochs (serial-number
     order: correct while every compared flag is within 2**31 launches of target)."""

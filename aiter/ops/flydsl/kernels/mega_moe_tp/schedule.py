@@ -31,6 +31,7 @@ from .common import (
     lds_ld_i32,
     lds_st,
     lds_st_rel,
+    now,
     rsrc,
     spin0,
     spin_lds_ge,
@@ -97,6 +98,11 @@ def build_schedule(kc: KernelCtx) -> dict:
     lb, lrdy_at, masked, meta_ll_wait = kc.get("lb lrdy_at masked meta_ll_wait")
     rch, report_chunk, spin_sys_ge = kc.get("rch report_chunk spin_sys_ge")
     unit_fields, zero_masked = kc.get("unit_fields zero_masked")
+    profile_stamp = kc.profile_stamp
+    profile_value = kc.profile_value
+
+    def profile_clock():
+        return now() if kc.profiling else fx.Int64(0)
 
     @flyc.jit
     def gemm2_dispatch(L, tid, a, expert, ks0, icnt, r0, rows, signal):
@@ -122,18 +128,27 @@ def build_schedule(kc: KernelCtx) -> dict:
             spin_sys_ge(ctrl_at(a, i32(CTRL_XF) + x), a["epoch"])
 
     def unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig):
+        t0 = profile_clock()
         gemm1(L, tid, a, expert, i0, icnt // i32(128))
+        t1 = profile_clock()
         gemm2_dispatch(L, tid, a, expert, i0 // i32(128), icnt, r0, rows, sig)
+        t2 = profile_clock()
+        return t1 - t0, t2 - t1
 
     @flyc.jit
     def compute_units(L, tid, a):
         lane = tid % i32(64)
         w = tid // i32(64)
+        scan_ticks, g1_ticks, g2_ticks = fx.Int64(0), fx.Int64(0), fx.Int64(0)
+        if tid == i32(0):
+            profile_stamp(a, tid, 2)
         if const_expr(MLL):
             meta_ll_wait(tid, a)
         elif const_expr(not ar):
             ag_wait_meta(a, tid, a["epoch"])
         _stale_dropped(tid, a)
+        if tid == i32(0):
+            profile_stamp(a, tid, 3)
         if const_expr(ar and not DLL):
             zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
         cbar(L, tid)
@@ -145,7 +160,11 @@ def build_schedule(kc: KernelCtx) -> dict:
         if const_expr(lb):
             lb_plan(L, tid, a)
         else:
+            if tid == i32(0):
+                profile_stamp(a, tid, 4)
             dyn_plan(L, tid, a)
+            if tid == i32(0):
+                profile_stamp(a, tid, 5)
         ub = lds_ld_i32(L, L_CTL + C_UNIT * 4)
         ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
         if ub == ue:
@@ -159,7 +178,9 @@ def build_schedule(kc: KernelCtx) -> dict:
                 cc = expert.shrui(i32(24))
                 ce = expert.shrui(i32(16)) & i32(0xFF)
                 expert = expert & i32(0xFFFF)
+                scan0 = profile_clock()
                 R = gather_routes_chunk(L, tid, a, expert, cc, ce)
+                scan_ticks = scan_ticks + profile_clock() - scan0
             if tid == i32(0):
                 lds_st(L, L_CTL + C_UROWS * 4, R)
                 lds_st_rel(L, L_CTL + C_USEQ * 4, u - ub + i32(1))
@@ -172,7 +193,8 @@ def build_schedule(kc: KernelCtx) -> dict:
                     lb_g1_tile(L, tid, a, expert, i0, icnt, rows)
                 else:
                     sig = (u == ue - i32(1)) & (r0 + i32(RG) >= R)
-                    unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig)
+                    g1, g2 = unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig)
+                    g1_ticks, g2_ticks = g1_ticks + g1, g2_ticks + g2
                 cbar(L, tid)
             if const_expr(lb):  # noqa: SIM102
                 if tid == i32(0):
@@ -184,6 +206,10 @@ def build_schedule(kc: KernelCtx) -> dict:
         if const_expr(DLL):  # noqa: SIM102
             if tid == i32(0):
                 lds_st_rel(L, L_CTL + C_CDONE * 4, i32(1))
+        profile_value(a, tid, 16, scan_ticks)
+        profile_value(a, tid, 17, g1_ticks)
+        profile_value(a, tid, 18, g2_ticks)
+        profile_value(a, tid, 19, ue - ub)
 
     @flyc.jit
     def dyn_plan(L, tid, a):

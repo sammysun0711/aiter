@@ -30,6 +30,8 @@ from .mega_moe_tp_config import (
     NCHLB_MAX,
     NCTA_MAX,
     NMETA_CAP,
+    PROFILE_BASE,
+    PROFILE_SLOTS,
     TN_MAX,
     gemm2_chunk_groups,
     gemm2_group_step,
@@ -389,7 +391,13 @@ class MegaMoeTPEngine:
         self.tn_gemma = bool(tail_gemma)
         arena.commit()
         self.arena = arena
-        self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
+        self.profiling = os.environ.get("AITER_MEGAMOE_TP_PROFILE", "0") == "1"
+        ctrl_bytes = (
+            PROFILE_BASE + self.n_cta * PROFILE_SLOTS * 8
+            if self.profiling
+            else CTRL_INTS * 4
+        )
+        self.ctrl = torch.zeros(ctrl_bytes // 4, dtype=torch.int32, device=self.device)
         self.routes = torch.zeros(
             (tot * topk + 1, H), dtype=torch.bfloat16, device=self.device
         )
@@ -587,6 +595,7 @@ class MegaMoeTPEngine:
                 tn_gemma=self.tn_gemma,
                 lbpf=cfg.pf,
                 lbp=cfg.lp,
+                profiling=self.profiling,
             )
             self._launchers[self._key(cfg)] = fn
         return fn
