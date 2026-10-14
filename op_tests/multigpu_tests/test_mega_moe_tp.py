@@ -19,7 +19,7 @@ import os
 import subprocess
 import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pandas as pd
 import torch
@@ -29,6 +29,7 @@ import aiter
 from aiter import dtypes
 from aiter.fused_moe import torch_moe_stage1, torch_moe_stage2
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.mega_moe_tp.mega_moe_tp_config import dynamic_token_limit
 from aiter.ops.flydsl.kernels.mega_moe_tp.sp_rs_norm import SpRsNorm
 from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
 from aiter.ops.flydsl.moe_common import DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA
@@ -161,8 +162,16 @@ def build_weights(shape: ModelShape, ctx: Ctx, seed: int) -> Weights:
     )
 
 
-def route(rows, shape: ModelShape, kind: str, gen: torch.Generator, device):
+def route(
+    rows, shape: ModelShape, kind: str, gen: torch.Generator, device, token_offset=0
+):
     E, K = shape.experts, shape.topk
+    if kind == "periodic":
+        tokens = torch.arange(rows, device=device) + token_offset
+        ids = torch.arange(K, device=device)[None, :].expand(rows, -1)
+        ids = ids + torch.where(tokens[:, None] % 7 == 0, E - K, 0)
+        w = torch.rand((rows, K), generator=gen, device=device) + 0.1
+        return (w / w.sum(1, keepdim=True)).float(), ids.to(torch.int32).contiguous()
     if kind == "balanced":
         start = int(torch.randint(0, E, (1,), device=device, generator=gen))
         ids = (start + torch.arange(rows * K, device=device)) % E
@@ -246,7 +255,7 @@ def make_case(
         x = torch.randn(
             (m, shape.model_dim), dtype=dtypes.bf16, device=ctx.device, generator=gen
         )
-        w, ids = route(m, shape, kind, gen, ctx.device)
+        w, ids = route(m, shape, kind, gen, ctx.device, token_offset=ctx.rank * m)
     else:
         gen = torch.Generator(device=ctx.device).manual_seed(seed)
         x = torch.randn(
@@ -344,13 +353,31 @@ def check(y, c: Case, rtol, what="fused vs torch"):
     return e
 
 
+def activation_token_limit(shape, ctx, mode):
+    return dynamic_token_limit(
+        shape.model_dim,
+        shape.inter_dim // ctx.world,
+        shape.experts,
+        shape.topk,
+        ctx.world,
+        mode == "ar",
+        shape.act.name.lower(),
+        shape.act_dtype == "fp8",
+    )
+
+
 def case_varying_m(shape, wt, ctx, S, mode):
     layer = new_layer(shape, wt, ctx, mode, S.max_local)
     worst = 0.0
     limit = (
-        min(S.max_local, 256 // ctx.world) if shape.act_dtype == "fp8" else S.max_local
+        min(S.max_local, activation_token_limit(shape, ctx, mode) // ctx.world)
+        if shape.act_dtype == "fp8"
+        else S.max_local
     )
-    for m in (8, 1, 32, 1, min(64, limit), 8):
+    counts = [8, 1, 32, 1, min(64, limit), 8]
+    if shape.act_dtype == "fp8" and limit > 32:
+        counts += [limit, 32, min(64, limit), min(128, limit), limit]
+    for m in counts:
         c = make_case(shape, wt, ctx, mode, m * ctx.world, "random", SEED + m)
         worst = max(worst, check(call(layer, c).clone(), c, RTOL["fp8"], f"m={m}"))
     return worst
@@ -373,7 +400,11 @@ def case_layers(shape, wt, ctx, S, mode):
 
 def case_out(shape, wt, ctx, S, mode):
     layer = new_layer(shape, wt, ctx, mode, S.max_local)
-    tokens = 16 * ctx.world
+    tokens = (
+        min(S.max_tokens, activation_token_limit(shape, ctx, mode))
+        if shape.act_dtype == "fp8"
+        else 16 * ctx.world
+    )
     c1 = make_case(shape, wt, ctx, mode, tokens, "random", 1)
     c2 = make_case(shape, wt, ctx, mode, tokens, "random", 2)
     out = torch.empty_like(c1.ref, dtype=dtypes.bf16)
@@ -391,20 +422,25 @@ def case_graph(shape, wt, ctx, S, mode):
     if shape.act_dtype == "fp8":
         # Cover the one-piece optimized schedule as well as the <=128 path,
         # including changing routing in both directions between graph replays.
-        counts = sorted({8, 16 * ctx.world, 248, 256})
-        for count in (m for m in counts if m <= 256 and m % ctx.world == 0):
+        limit = min(S.max_local * ctx.world, activation_token_limit(shape, ctx, mode))
+        counts = sorted({8, 16 * ctx.world, 248, 256, 512, 1024, 2048})
+        for count in (m for m in counts if m <= limit and m % ctx.world == 0):
             _case_graph_at_tokens(shape, wt, ctx, S, mode, count)
+            if count > 256:
+                _case_graph_at_tokens(shape, wt, ctx, S, mode, count, comm_dtype="bf16")
     else:
         _case_graph_at_tokens(shape, wt, ctx, S, mode, 16 * ctx.world)
 
 
-def _case_graph_at_tokens(shape, wt, ctx, S, mode, tokens):
-    layer = new_layer(shape, wt, ctx, mode, S.max_local)
+def _case_graph_at_tokens(shape, wt, ctx, S, mode, tokens, comm_dtype="fp8"):
+    layer = new_layer(shape, wt, ctx, mode, S.max_local, comm_dtype=comm_dtype)
     cases = [
         make_case(shape, wt, ctx, mode, tokens, route, seed)
-        for route, seed in (("random", 3), ("hot", 4), ("balanced", 5))
+        for route, seed in (("random", 3), ("hot", 4), ("balanced", 5), ("periodic", 6))
     ]
     eager = [call(layer, c).clone() for c in cases]
+    for y, case in zip(eager, cases):
+        check(y, case, RTOL[comm_dtype], "graph input eager reference")
     c = Case(cases[0].x.clone(), cases[0].w.clone(), cases[0].ids.clone(), None)
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
@@ -449,16 +485,20 @@ def case_dynamic(shape, wt, ctx, S, mode, lb):
             3 * ctx.world,
             33 * ctx.world,
             S.max_tokens,
-            *([136, 248, 256] if shape.act_dtype == "fp8" else []),
+            *(
+                [136, 248, 256, 264, 512, 520, 1024, 1032, 2048]
+                if shape.act_dtype == "fp8"
+                else []
+            ),
         }
     )
     limit = (
-        min(S.max_local * ctx.world, 256)
+        min(S.max_local * ctx.world, activation_token_limit(shape, ctx, mode))
         if shape.act_dtype == "fp8"
         else S.max_local * ctx.world
     )
     for t in (t for t in tokens if t <= limit):
-        for kind in ("random", "subset"):
+        for kind in ("random", "subset", "periodic"):
             c = make_case(shape, wt, ctx, mode, t, kind, SEED + 3 * t)
             y = call(layer, c).clone()
             worst = max(worst, check(y, c, RTOL["fp8"], f"M={t} {kind}"))
@@ -582,9 +622,14 @@ def check_sp_rs_norm(op, inputs, out, res_out):
 
 def case_masked(shape, wt, ctx, S, mode):
     layer = new_layer(shape, wt, ctx, mode, S.max_local)
-    c = make_case(shape, wt, ctx, mode, 16 * ctx.world, "random", 11, mask=0.2)
+    tokens = (
+        min(S.max_tokens, activation_token_limit(shape, ctx, mode))
+        if shape.act_dtype == "fp8"
+        else 16 * ctx.world
+    )
+    c = make_case(shape, wt, ctx, mode, tokens, "random", 11, mask=0.2)
     e = check(call(layer, c).clone(), c, RTOL["fp8"], "masked ids")
-    c2 = make_case(shape, wt, ctx, mode, 16 * ctx.world, "random", 12)
+    c2 = make_case(shape, wt, ctx, mode, tokens, "random", 12)
     check(call(layer, c2).clone(), c2, RTOL["fp8"], "next clean call")
     return e
 
@@ -611,16 +656,78 @@ def expect_raise(fn, what, errors=(ValueError, TypeError)):
         raise CaseFailure(f"{what} was accepted (expected a host-side error)")
 
 
+def case_reset_weights(shape, wt, ctx, S, mode):
+    layer = new_layer(shape, wt, ctx, mode, S.max_local)
+    tokens = (
+        min(S.max_tokens, activation_token_limit(shape, ctx, mode))
+        if shape.act_dtype == "fp8"
+        else S.max_tokens
+    )
+    c = make_case(shape, wt, ctx, mode, tokens, "random", 17)
+    worst = check(call(layer, c).clone(), c, RTOL["fp8"])
+    layer.reset()
+    worst = max(worst, check(call(layer, c).clone(), c, RTOL["fp8"], "after reset"))
+    # Exact x2 power-of-two down-weight scales exercise rebinding to distinct
+    # pointers and known changed outputs, without regenerating all weights.
+    w2s = wt.w2_scale.clone()
+    w2s.view(torch.uint8).add_(1)
+    layer.set_weights(w1=wt.w1, w1_scale=wt.w1_scale, w2=wt.w2, w2_scale=w2s)
+    c2 = replace(c, ref=c.ref * 2)
+    worst = max(
+        worst, check(call(layer, c2).clone(), c2, RTOL["fp8"], "rebound weights")
+    )
+    layer.set_weights(w1=wt.w1, w1_scale=wt.w1_scale, w2=wt.w2, w2_scale=wt.w2_scale)
+    worst = max(
+        worst, check(call(layer, c).clone(), c, RTOL["fp8"], "restored weights")
+    )
+    return worst
+
+
+def case_periodic_capacity(shape, wt, ctx, S, mode):
+    if shape.act_dtype != "fp8" or mode != "ag_rs" or S.max_tokens < 2048:
+        return "requires MiMo ag_rs M2048"
+    layer = new_layer(shape, wt, ctx, mode, S.max_local, lb_min=0)
+    c = make_case(shape, wt, ctx, mode, 2048, "periodic", 18)
+    # Force RG48: 293 routes of each periodic expert all land in modulo chunk0.
+    layer.engine._cfgs[256] = replace(layer.launch_config(256), mt=3)
+    return check(call(layer, c).clone(), c, RTOL["fp8"], "293-row modulo chunk")
+
+
+def case_noncontiguous(shape, wt, ctx, S, mode):
+    tokens = (
+        min(S.max_tokens, activation_token_limit(shape, ctx, mode))
+        if shape.act_dtype == "fp8"
+        else S.max_tokens
+    )
+    c = make_case(shape, wt, ctx, mode, tokens, "random", 19)
+    layer = new_layer(shape, wt, ctx, mode, S.max_local)
+
+    def strided(t):
+        storage = torch.empty(
+            (*t.shape[:-1], t.shape[-1] * 2), device=t.device, dtype=t.dtype
+        )
+        view = storage[..., ::2]
+        view.copy_(t)
+        return view
+
+    c = replace(c, x=strided(c.x), w=strided(c.w), ids=strided(c.ids))
+    return check(call(layer, c).clone(), c, RTOL["fp8"], "noncontiguous input/routing")
+
+
 def case_validation(shape, wt, ctx, S):
     expect_raise(
         lambda: new_layer(shape, wt, ctx, "ag_rs", 4096), "max_local_tokens=4096"
     )
     layer = new_layer(shape, wt, ctx, "ag_rs", S.max_local)
     if shape.act_dtype == "fp8":
+        limit = activation_token_limit(shape, ctx, "ag_rs")
         expect_raise(
-            lambda: layer.launch_config(256 // ctx.world + 1),
-            "A8W4 above 256 global tokens",
+            lambda: layer.launch_config(limit // ctx.world + 1),
+            f"A8W4 above {limit} global tokens",
         )
+        if ctx.world == 8:
+            replicated = new_layer(shape, wt, ctx, "ar", 32)
+            expect_raise(lambda: replicated.launch_config(33), "A8W4 ar above M256")
     c = make_case(shape, wt, ctx, "ag_rs", 8 * ctx.world, "random", 5)
     x, w, ids = c.x, c.w, c.ids
     expect_raise(lambda: layer(x.float(), w, ids), "fp32 hidden states")
@@ -790,6 +897,9 @@ CASES = {
     "dynamic LB": lambda *a: case_dynamic(*a, lb=True),
     "masked ids": case_masked,
     "m=0": case_empty,
+    "reset / weights": case_reset_weights,
+    "periodic capacity": case_periodic_capacity,
+    "noncontiguous": case_noncontiguous,
 }
 # model-level cases (fused tail: ag_rs only; the others build their own layers)
 MODEL_CASES = {
@@ -939,7 +1049,7 @@ def main() -> int:
         "--routes",
         nargs="*",
         default=["balanced", "random", "hot"],
-        choices=["balanced", "random", "hot", "subset"],
+        choices=["balanced", "random", "hot", "subset", "periodic"],
         help="Routing distributions.\n    e.g.: -r random",
     )
     parser.add_argument(
@@ -958,8 +1068,12 @@ def main() -> int:
     if bad:
         raise ValueError(f"tokens {bad} must be positive multiples of tp={ctx.world}")
     max_tokens = max(args.tokens)
-    if max_tokens > 256 and any(MODELS[m].act_dtype == "fp8" for m in args.models):
-        raise ValueError("MXFP8 activations support at most 256 global tokens")
+    for model, mode in itertools.product(args.models, args.modes):
+        shape = MODELS[model]
+        if shape.act_dtype == "fp8" and max_tokens > activation_token_limit(
+            shape, ctx, mode
+        ):
+            raise ValueError(f"{model} {mode}: MXFP8 tokens exceed supported limit")
     S = Session(ctx, max(max_tokens // ctx.world, 128), max_tokens, {}, {})
 
     rows = {"accuracy + perf": [], "feature cases": [], "SpRsNorm": []}
@@ -972,8 +1086,12 @@ def main() -> int:
                 _run(test_mega_moe_tp, model, mode, tokens, route, seed)
             )
         for mode, case in itertools.product(args.modes, CASES):
-            if MODELS[model].act_dtype == "fp8" and case == "dynamic LB":
-                # A8W4 has no large-batch schedule; do not report an A4W4 test as A8W4.
+            if (
+                MODELS[model].act_dtype == "fp8"
+                and case == "dynamic LB"
+                and activation_token_limit(MODELS[model], ctx, mode) <= 256
+            ):
+                # LB extension is confined to the qualified MiMo TP8 ag_rs shape.
                 continue
             rows["feature cases"].append(_run(test_mega_moe_tp_case, model, mode, case))
         for case in MODEL_CASES:

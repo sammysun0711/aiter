@@ -327,11 +327,21 @@ def bench_decode(tokens, route, seed, comm_dtype, backend):
             seed,
             intermediate_dtype=dtypes.fp32,
         ).ref
-    layer = support.new_layer(shape, wt, ctx, "ag_rs", 32, comm_dtype=comm_dtype)
+    max_tokens = max(args.tokens)
+    max_local = max_tokens // ctx.world
+    layer = support.new_layer(
+        shape,
+        wt,
+        ctx,
+        "ag_rs",
+        max_local,
+        comm_dtype=comm_dtype,
+        **({"lb_min": args.lb_min} if args.lb_min is not None else {}),
+    )
     layer.prepare([tokens // ctx.world])
     if "mega" in args.implementations:
         candidates["mega"] = lambda layer=layer: layer(c.x, c.w, c.ids)
-    support.S = support.Session(ctx, 32, 256, {}, {})
+    support.S = support.Session(ctx, max_local, max_tokens, {}, {})
     flops, nbytes = support._work(shape, wt, c, tokens)
     ret = {"gfx": get_gfx(), "act_dtype": "fp8", "wire": "fp8_e8m0_1x32"}
     if split is not None:
@@ -354,6 +364,8 @@ def bench_decode(tokens, route, seed, comm_dtype, backend):
         replay_e, _ = check(replay, eager, f"{name} replay", 0.01)
         if name == "mega":
             layer.check_errors()
+            if not ctx.all_ok(torch.equal(eager, replay)):
+                raise AssertionError("Mega graph replay differs from eager")
         ret.update(
             {
                 f"{name} us": us,
@@ -456,13 +468,16 @@ def main():
     p.add_argument("--graph-calls", type=int, default=10)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--rounds", type=int, default=3)
+    p.add_argument(
+        "--lb-min", type=int, help="Override MiMo LB crossover (0 forces dynamic)"
+    )
     p.add_argument("--output-dir", type=Path, required=True)
     args = p.parse_args()
     rank, world, local = (
         int(os.environ[k]) for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK")
     )
-    if any(t <= 0 or t > 256 or t % world for t in args.tokens):
-        p.error("tokens must be positive multiples of TP and at most 256")
+    if world != 8 or any(t <= 0 or t > 2048 or t % world for t in args.tokens):
+        p.error("requires TP8 and positive global token multiples of 8, at most 2048")
     torch.cuda.set_device(local)
     init_dist_env(world, rank, local_rank=local)
     ctx = SimpleNamespace(rank=rank, world=world, device=torch.device("cuda", local))
