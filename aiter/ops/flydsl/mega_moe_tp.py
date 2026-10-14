@@ -32,6 +32,11 @@ Contract:
 * The symmetric memory uses hipIpc handles; in containers on the host network ROCm 7.1
   needs ``HSA_ENABLE_IPC_MODE_LEGACY=1``.
 
+MiMo TP8 ``ag_rs`` A8W4 supports up to 2048 global tokens: dynamic through
+512, then FP8 large-batch scheduling. ``lb_min=0`` forces extended dynamic.
+Other FP8-activation shapes/modes retain the 256-token limit. The fused tail
+is not supported with FP8 activations.
+
 Schedules (planned in the kernel from the routing): up to 256 global tokens the dynamic
 one, from ``lb_min`` (default 256) global tokens up the large-batch (LB) one; its row tile
 is 16 * ``lb_mt`` rows (``"T1:N1,...,N"``: up to Ti tokens Ni), 16 * ``lb_mt_small`` up to

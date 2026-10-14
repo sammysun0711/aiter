@@ -319,7 +319,8 @@ def kernel_config(
     # routing-meta flag slots per rank: one per sending CTA (64 lanes x 4 routes each)
     NMETA = max(32, 1 << (ceildiv(TMAX // tp * TOPK, 256) - 1).bit_length())
     assert NMETA <= NMETA_CAP, "m * topk > 64 * NMETA_CAP"
-    assert not lb or (not ll_rs and not a8 and rch == RG)
+    assert not lb or (not ll_rs and rch == RG)
+    assert not (lb and a8) or dyn_limit > DYN_MAX
     assert not lb or nch <= NCHLB_MAX
     LBQ = lbq if lb else 1
     assert NCK % LBQ == 0
@@ -352,6 +353,7 @@ def kernel_config(
     AUX_RT = AUX_SYS if lb else AUX_SC1
     ADEPTH = min(ALOAD_DEPTH, NAB - 1) if lb and NAB > 3 else ALOAD_DEPTH
     LBPF = bool(lb and c["B1_FITS"] and lbpf)
+    IB = I if a8 else I // 2
     MTSKIP = lb and MT >= 4
     name = (
         f"mega_moe_tp_fused_h{H}_i{I}_e{E}_k{TOPK}_mt{MT}_t{TMAX}_{act}"

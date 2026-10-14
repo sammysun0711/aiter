@@ -100,6 +100,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     unit_fields, zero_masked = kc.get("unit_fields zero_masked")
     profile_stamp = kc.profile_stamp
     profile_value = kc.profile_value
+    IB = kc.IB
 
     def profile_clock():
         return now() if kc.profiling else fx.Int64(0)
@@ -326,7 +327,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             lb_lbr_wait(a, bank, i32(x))
 
     def lb_lists(a):
-        base = fx.Int64(a["xg"]) + fx.Int64(TMAX * TOPK * (I // 2 + I // 32))
+        base = fx.Int64(a["xg"]) + fx.Int64(TMAX * TOPK * (IB + I // 32))
         return rsrc(base), rsrc(base + fx.Int64(TMAX * TOPK * 4))
 
     def lb_bank(L):
@@ -776,7 +777,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                 lds_st(L, wt0 + r * i32(4), fx.Int32(wv))
         wait_lgkm0()
         rx, rxs = xg_rs(a)
-        u16 = I // 2 // 16
+        u16 = IB // 16
         nq = fx.max(R * i32(u16), i32(1))
         NQ = ceildiv(RG * u16, 64)
         for b0 in range_constexpr(0, NQ, 8):
@@ -787,7 +788,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                 c = q - row * i32(u16)
                 rix = lds_ld_i32(L, rix0 + row * i32(4))
                 dq.append(
-                    (row, c, bld(rx, rix * i32(I // 2) + c * i32(16), 0, V4I, AUX_SYS))
+                    (row, c, bld(rx, rix * i32(IB) + c * i32(16), 0, V4I, AUX_SYS))
                 )
             for row, c, dv in dq:
                 lds_st(L, ib0 + row * i32(SI_STRIDE) + c * i32(16), dv, 16)
@@ -863,7 +864,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     def lb_import(L, tid, a, rows):
         ag_stage_free(L, tid % i32(64), a)
         cbar(L, tid)
-        u16 = I // 2 // 16
+        u16 = IB // 16
         rx, rxs = xg_rs(a)
         nq = fx.max(rows * i32(u16), i32(1))
         ns = fx.max(rows * i32(I // 128), i32(1))
@@ -873,9 +874,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             row = q // i32(u16)
             c = q - row * i32(u16)
             rix = lds_ld_i32(L, L_RIX + row * i32(4))
-            dq.append(
-                (row, c, bld(rx, rix * i32(I // 2) + c * i32(16), 0, V4I, AUX_SYS))
-            )
+            dq.append((row, c, bld(rx, rix * i32(IB) + c * i32(16), 0, V4I, AUX_SYS)))
         for k in range_constexpr(ceildiv(RG * (I // 128), NT)):
             q = fx.min(tid + i32(k * NT), ns - i32(1))
             row = q // i32(I // 128)
@@ -899,12 +898,12 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     def xg_rs(a):
         rx = rsrc(a["xg"])
-        rxs = rsrc(fx.Int64(a["xg"]) + fx.Int64(a["ttot"] * i32(TOPK * (I // 2))))
+        rxs = rsrc(fx.Int64(a["xg"]) + fx.Int64(a["ttot"] * i32(TOPK * IB)))
         return rx, rxs
 
     @flyc.jit
     def xq_export(L, tid, a, i0, icnt, r0, rows):
-        u16 = icnt // i32(32)
+        u16 = icnt // i32(16 if kc.a8 else 32)
         rx, rxs = xg_rs(a)
         for q_ in range(tid, rows * u16, i32(NT)):
             q = i32(q_)
@@ -912,7 +911,13 @@ def build_schedule(kc: KernelCtx) -> dict:
             c = q - row * u16
             rix = lds_ld_i32(L, L_RIX + (r0 + row) * i32(4))
             v = lds_ld(L, i32(L_INTER) + row * i32(SI_STRIDE) + c * i32(16), V4I, 16)
-            bst(v, rx, rix * i32(I // 2) + i0 // i32(2) + c * i32(16), 0, AUX_SYS)
+            bst(
+                v,
+                rx,
+                rix * i32(IB) + i0 // i32(1 if kc.a8 else 2) + c * i32(16),
+                0,
+                AUX_SYS,
+            )
         nsd = icnt // i32(128)
         for q_ in range(tid, rows * nsd, i32(NT)):
             q = i32(q_)

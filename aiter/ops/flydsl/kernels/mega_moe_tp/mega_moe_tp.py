@@ -348,6 +348,24 @@ class MegaMoeTPEngine:
         self.dyn_limit = dynamic_token_limit(
             self.H, self.I, self.E, self.K, self.tp, self.ar, activation, self.a8
         )
+        self.a8_lb = self.a8 and self.dyn_limit > DYN_MAX
+        if self.a8_lb:
+            # MiMo: dynamic through M512; wider LB tiles amortize the GEMMs above
+            # that. Explicit parameters/environment overrides remain available.
+            self.lb_min = int(
+                _lb_param(lb.get("min"), "AITER_MEGAMOE_TP_LB_MIN", "513")
+            )
+            if self.lb_min < 0:
+                raise ValueError("lb_min must be nonnegative")
+            if lb.get("mt") is None and "AITER_MEGAMOE_TP_LB_MT" not in os.environ:
+                self.lb_mt, self.lb_mt_table = 4, [(1024, 2)]
+            if (
+                lb.get("mt_small") is None
+                and "AITER_MEGAMOE_TP_LB_MT_SMALL" not in os.environ
+            ):
+                self.lb_mt_small = 2
+            if lb.get("q") is None and "AITER_MEGAMOE_TP_LB_Q" not in os.environ:
+                self.lb_q = 3
         self.situ = (float(situ_beta), float(situ_linear_beta))
         if swiglu_limit is None:
             swiglu_limit = 7.0 if activation == "swiglu" else float("inf")
@@ -419,7 +437,9 @@ class MegaMoeTPEngine:
             (extra + 1, H), dtype=torch.bfloat16, device=self.device
         )
         self.xg = torch.empty(
-            tot * topk * (inter_dim // 2 + inter_dim // 32 + 8),
+            tot
+            * topk
+            * ((inter_dim if self.a8 else inter_dim // 2) + inter_dim // 32 + 8),
             dtype=torch.uint8,
             device=self.device,
         )
@@ -447,7 +467,10 @@ class MegaMoeTPEngine:
             ("route rows", tot * K * 2 * H),
             ("gathered rows", self.tp * tot * H * 2),
             ("tail rows", tot * H * 3),
-            ("intermediate rows", tot * K * (self.I // 2 + self.I // 32 + 8)),
+            (
+                "intermediate rows",
+                tot * K * ((self.I if self.a8 else self.I // 2) + self.I // 32 + 8),
+            ),
         ):
             if n >= 1 << 31:
                 bad.append(f"{what} within 32-bit offsets")
@@ -541,11 +564,15 @@ class MegaMoeTPEngine:
                 lp = 0 if tot <= LB_PF_MAX else 3
                 cfg = LaunchCfg(
                     self._fit_mt(self.lb_mt_small if small else mt, lb=True),
-                    npp=self._fit_npp(2 if small else self.lb_npp),
+                    npp=self._fit_npp(2 if small or self.a8_lb else self.lb_npp),
                     ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
                     lb=True,
-                    pf=tot <= LB_PF_MAX,
-                    lp=lp if self.I // 128 % max(lp, 1) == 0 else 0,
+                    pf=tot <= LB_PF_MAX and not self.a8_lb,
+                    lp=(
+                        1
+                        if self.a8_lb
+                        else lp if self.I // 128 % max(lp, 1) == 0 else 0
+                    ),
                 )
             elif tot <= self.dyn_max:
                 mimo_decode = (
@@ -735,6 +762,7 @@ class MegaMoeTPEngine:
     def tail_ok(self, m: int) -> bool:
         return (
             self.mode == "ag_rs"
+            and not self.a8
             and 0 < m <= min(TN_MAX, self.mmax)
             and self.config(m).lb
         )
