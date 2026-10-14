@@ -22,6 +22,7 @@ from .common import (
 
 # tokens per launch (all ranks) up to which the host may pick the dynamic schedule
 DYN_MAX, NCTA_MAX, NCK_MAX, NCHA_MAX = 256, 256, 64, 64
+MIMO_A8_DYN_MAX = 2048
 # routing-meta flags per rank (one per sending CTA: m * topk <= 64 * NMETA_CAP)
 NMETA_CAP = 256
 # Flag arena (ints, written by peers, one writer each, values = launch epoch, compared
@@ -121,6 +122,12 @@ def gemm2_chunk_groups(H: int, I: int) -> int:
     return 2 if (H // 64 // NW) % 2 == 0 else 1
 
 
+def dynamic_token_limit(H, I, E, TOPK, tp, ar, act, a8):
+    """Only MiMo TP8 sequence-parallel A8 extends the common dynamic limit."""
+    mimo = a8 and not ar and (H, I, E, TOPK, tp, act) == (6144, 256, 384, 8, 8, "silu")
+    return MIMO_A8_DYN_MAX if mimo else DYN_MAX
+
+
 @functools.cache
 def mega_moe_tp_consts(
     H: int,
@@ -133,6 +140,7 @@ def mega_moe_tp_consts(
     nch: int = 0,
     a8: bool = False,
     lb: bool = False,
+    dyn_limit: int = DYN_MAX,
 ) -> dict:
     RG = MT * 16
     KS1 = H // 128
@@ -182,7 +190,8 @@ def mega_moe_tp_consts(
         max(RG * c["SI_STRIDE"], agr * (c["XB"] + H // 32) - RG * (I // 32))
     )
     c["L_INTERS"] = take(RG * (I // 32))
-    nrix = 256 if lb else min(TMAX, DYN_MAX)
+    nrix = 256 if lb else min(TMAX, dyn_limit)
+    c["NRIX"] = nrix
     c["L_RIX"] = take(nrix * 4)
     c["L_WT"] = take(nrix * 4)
     c["L_CTL"] = take(128 * 4)
@@ -266,6 +275,7 @@ def kernel_config(
     lbp: int = 0,
     profiling: bool = False,
     dyn_p: int = 0,
+    dyn_limit: int = DYN_MAX,
 ):
     """The derived compile-time values of one compile_mega_moe_tp instance."""
     if swiglu_limit is None:
@@ -273,7 +283,8 @@ def kernel_config(
     TN = tn in (1, 2)
     assert not TN or not ar
     nsk = NSK
-    c = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb)
+    assert 1 <= dyn_limit <= dynamic_token_limit(H, I, E, TOPK, tp, ar, act, a8)
+    c = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb, dyn_limit)
     RG, KS1, NCH, KS2, G2 = c["RG"], c["KS1"], c["NCH"], c["KS2"], c["G2"]
     CH1, CH2, SI_STRIDE = c["CH1"], c["CH2"], c["SI_STRIDE"]
     ACB, XB = c["ACB"], c["XB"]
@@ -289,7 +300,8 @@ def kernel_config(
     assert npp >= 1 and nsk % (npp * KCS) == 0 and (KS1 * npp) % nsk == 0
     assert 3 <= NAB <= 4
     VPL = ceildiv(CW // 8, 64)
-    SCAN_IT = ceildiv(min(TMAX, DYN_MAX) * TOPK // 4, NT)
+    NRIX = c["NRIX"]
+    SCAN_IT = ceildiv(min(TMAX, dyn_limit) * TOPK // 4, NT)
     SCAN_G = 16
     NPC = 1 if lb else dyn_p if dyn_p > 0 else KS2
     assert not (comm_bf16 and ll_rs)
@@ -371,6 +383,7 @@ def kernel_config(
         + ("_pf" if LBPF else "")
         + ("_profile" if profiling else "")
         + (f"_dp{dyn_p}" if dyn_p else "")
+        + (f"_dmax{dyn_limit}" if dyn_limit != DYN_MAX else "")
     )
     const_expr = fx.const_expr
     layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"

@@ -13,6 +13,8 @@ Contract:
   same order, with the same local token count (and, ar, the same input and routing).
   Layers of one shape may share an instance (``set_weights``): their forwards form one
   collective sequence.
+* Each token's top-k expert IDs are distinct (as produced by top-k selection).
+  Invalid/masked IDs are permitted, but repeated valid IDs are unsupported.
 * ``prepare(local_tokens)`` before CUDA graph capture: it compiles every launch config,
   runs each once and checks every rank's watchdog (reset + retry on a timeout).
 * The kernel is persistent (one CTA per CU, CTAs and ranks spin on each other): it

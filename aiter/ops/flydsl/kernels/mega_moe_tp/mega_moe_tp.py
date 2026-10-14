@@ -33,6 +33,7 @@ from .mega_moe_tp_config import (
     PROFILE_BASE,
     PROFILE_SLOTS,
     TN_MAX,
+    dynamic_token_limit,
     gemm2_chunk_groups,
     gemm2_group_step,
     mega_moe_tp_consts,
@@ -344,6 +345,9 @@ class MegaMoeTPEngine:
             device = torch.device(device.type, torch.cuda.current_device())
         self.device = device
         self.activation = activation
+        self.dyn_limit = dynamic_token_limit(
+            self.H, self.I, self.E, self.K, self.tp, self.ar, activation, self.a8
+        )
         self.situ = (float(situ_beta), float(situ_linear_beta))
         if swiglu_limit is None:
             swiglu_limit = 7.0 if activation == "swiglu" else float("inf")
@@ -406,7 +410,7 @@ class MegaMoeTPEngine:
             (tot if self.ar else self.mmax, H), dtype=torch.bfloat16, device=self.device
         )
 
-        self.dyn_max = min(tot, DYN_MAX)
+        self.dyn_max = min(tot, self.dyn_limit)
         # partial rows of the GEMM2 pieces past the first (dynamic schedule)
         extra = (inter_dim // 128 - 1) * self.dyn_max * topk
         if extra * H * 2 >= 1 << 31:
@@ -476,7 +480,7 @@ class MegaMoeTPEngine:
         rch = 16 * mt
         tot = (mmax or self.mmax) * self.tp
         if not lb:
-            tot = min(tot, DYN_MAX)
+            tot = min(tot, self.dyn_limit)
         return rch, self.E + ceildiv(tot * self.K, rch) + 1
 
     def _consts(self, mt: int, nab: int = 4, mmax: int = 0, lb: bool = False) -> dict:
@@ -492,6 +496,7 @@ class MegaMoeTPEngine:
             self._chunks(mt, mmax, lb)[1],
             self.a8,
             lb,
+            self.dyn_limit,
         )
 
     def _nab(self, mt: int, mmax: int = 0, lb: bool = False) -> int:
@@ -524,6 +529,10 @@ class MegaMoeTPEngine:
         cfg = self._cfgs.get(m)
         if cfg is None:
             tot = m * self.tp
+            if self.a8 and tot > self.dyn_limit:
+                raise ValueError(
+                    f'act_dtype="fp8": {tot} tokens are beyond the dynamic schedule'
+                )
             lb = bool(self.lb_min) and tot >= self.lb_min
             fp8 = not self.comm_bf16
             if lb:
@@ -546,17 +555,20 @@ class MegaMoeTPEngine:
                     and (self.tp, self.H, self.I, self.E, self.K, self.activation)
                     == (8, 6144, 256, 384, 8, "silu")
                 )
+                mimo_extended = self.dyn_limit > DYN_MAX and tot > DYN_MAX
                 # MiMo A8W4 TP8: small per-expert row counts prefer MT=1.
                 # Above 128 tokens, one full-I unit avoids partial-route reads;
                 # LL route packets preserve overlap through 256 tokens.
                 cfg = LaunchCfg(
                     self._fit_mt(
-                        1 if mimo_decode or tot <= 32 else 2 if tot <= 64 else 3
+                        1
+                        if mimo_decode or mimo_extended or tot <= 32
+                        else 2 if tot <= 64 else 3
                     ),
                     ll=tot <= 256 and fp8,
-                    llr=(tot <= 128 or mimo_decode) and fp8,
-                    npp=2 if mimo_decode else 1,
-                    dp=1 if mimo_decode and tot > 128 else 0,
+                    llr=tot <= 256 and (tot <= 128 or mimo_decode) and fp8,
+                    npp=2 if mimo_decode or mimo_extended else 1,
+                    dp=1 if (mimo_decode and tot > 128) or mimo_extended else 0,
                     ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
                 )
             else:
@@ -612,6 +624,7 @@ class MegaMoeTPEngine:
                 lbp=cfg.lp,
                 profiling=self.profiling,
                 dyn_p=cfg.dp,
+                dyn_limit=self.dyn_limit,
             )
             self._launchers[self._key(cfg)] = fn
         return fn

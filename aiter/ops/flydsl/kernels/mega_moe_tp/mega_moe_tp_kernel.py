@@ -45,6 +45,7 @@ from .mega_moe_tp_config import (
     C_EPOCH,
     C_TNL,
     CTRL_TNC,
+    DYN_MAX,
     ERR_YAG,
     FLAG_TN,
     NT,
@@ -94,6 +95,7 @@ def compile_mega_moe_tp(
     lbp: int = 0,
     profiling: bool = False,
     dyn_p: int = 0,
+    dyn_limit: int = DYN_MAX,
 ):
     """Build the launcher of one (shape, variant) instance; LaunchCfg (host) picks them.
 
