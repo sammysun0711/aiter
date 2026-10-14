@@ -158,14 +158,14 @@ def build_schedule(kc: KernelCtx) -> dict:
                 lds_st_rel(L, L_CTL + C_RLAND * 4, i32(1))
         if const_expr(not ar and not DLL):
             zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
+        if tid == i32(0):
+            profile_stamp(a, tid, 4)
         if const_expr(lb):
             lb_plan(L, tid, a)
         else:
-            if tid == i32(0):
-                profile_stamp(a, tid, 4)
             dyn_plan(L, tid, a)
-            if tid == i32(0):
-                profile_stamp(a, tid, 5)
+        if tid == i32(0):
+            profile_stamp(a, tid, 5)
         ub = lds_ld_i32(L, L_CTL + C_UNIT * 4)
         ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
         if ub == ue:
@@ -191,7 +191,9 @@ def build_schedule(kc: KernelCtx) -> dict:
                 r0 = i32(r0_)
                 rows = fx.min(R - r0, i32(RG))
                 if const_expr(lb):
+                    g10 = profile_clock()
                     lb_g1_tile(L, tid, a, expert, i0, icnt, rows)
+                    g1_ticks = g1_ticks + profile_clock() - g10
                 else:
                     sig = (u == ue - i32(1)) & (r0 + i32(RG) >= R)
                     g1, g2 = unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig)
@@ -200,10 +202,13 @@ def build_schedule(kc: KernelCtx) -> dict:
             if const_expr(lb):  # noqa: SIM102
                 if tid == i32(0):
                     g_add_agent(lb_g1c(a, kind.shrui(i32(XQ_SHIFT)), lb_bank(L)), 1)
+        g20 = profile_clock()
         if const_expr(LBPF):
             lb_g2_consume(L, tid, a)
         elif const_expr(lb):
             lb_g2_phase(L, tid, a)
+        if const_expr(lb):
+            g2_ticks = profile_clock() - g20
         if const_expr(DLL):  # noqa: SIM102
             if tid == i32(0):
                 lds_st_rel(L, L_CTL + C_CDONE * 4, i32(1))

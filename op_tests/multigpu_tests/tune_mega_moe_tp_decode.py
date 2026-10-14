@@ -45,12 +45,16 @@ def main():
     p.add_argument("--grid", type=int, nargs="+", default=[256])
     p.add_argument("--llr", nargs="+", choices=["auto", "off", "on"], default=["auto"])
     p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--schedule", choices=["auto", "dynamic", "lb"], default="auto")
+    p.add_argument("--lp", type=int, nargs="+", default=[1])
+    p.add_argument("--lb-q", type=int, nargs="+", default=[1])
+    p.add_argument("--prefetch", nargs="+", choices=["off", "on"], default=["off"])
     args = p.parse_args()
     rank, world, local = (
         int(os.environ[k]) for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK")
     )
-    if world != 8 or any(t <= 0 or t > 256 or t % world for t in args.tokens):
-        p.error("requires TP8 and 8-256 global tokens divisible by 8")
+    if world != 8 or any(t <= 0 or t > 2048 or t % world for t in args.tokens):
+        p.error("requires TP8 and 8-2048 global tokens divisible by 8")
     torch.cuda.set_device(local)
     init_dist_env(world, rank, local_rank=local)
     ctx = SimpleNamespace(rank=rank, world=world, device=torch.device("cuda", local))
@@ -67,15 +71,33 @@ def main():
     wt = support.build_weights(shape, ctx, 123)
     timing = SimpleNamespace(capture_warmup=20, graph_calls=10, rounds=3, iters=20)
     bench.STATE = SimpleNamespace(ctx=ctx, wt=wt, args=timing)
-    layer = support.new_layer(shape, wt, ctx, "ag_rs", 32)
+    layer = support.new_layer(
+        shape,
+        wt,
+        ctx,
+        "ag_rs",
+        max(args.tokens) // world,
+        **(
+            {"lb_min": 0 if args.schedule == "dynamic" else 1}
+            if args.schedule != "auto"
+            else {}
+        )
+    )
     rows = []
     try:
         for tokens, route in itertools.product(args.tokens, args.routes):
             c = support.make_case(shape, wt, ctx, "ag_rs", tokens, route, 123)
             local_tokens = tokens // world
             base = layer.launch_config(local_tokens)
-            for mt, npp, llr, dp, grid in itertools.product(
-                args.mt, args.npp, args.llr, args.dp, args.grid
+            for mt, npp, llr, dp, grid, lp, lbq, prefetch in itertools.product(
+                args.mt,
+                args.npp,
+                args.llr,
+                args.dp,
+                args.grid,
+                args.lp,
+                args.lb_q,
+                args.prefetch,
             ):
                 layer.engine.n_cta = grid
                 layer.engine._args = (None, None)
@@ -85,7 +107,14 @@ def main():
                     npp=npp,
                     llr=(tokens <= 128 and llr == "auto") or llr == "on",
                     dp=dp,
+                    lp=lp if base.lb else 0,
+                    pf=base.lb and prefetch == "on",
                 )
+                if layer.engine.lb_q != lbq:
+                    # lb_q is part of the compiled variant, not LaunchCfg.
+                    layer.engine._launchers.clear()
+                    layer.engine._armed.clear()
+                    layer.engine.lb_q = lbq
                 layer.engine._cfgs[local_tokens] = cfg
                 layer.prepare([local_tokens])
                 eager = support.call(layer, c).clone()
@@ -110,6 +139,10 @@ def main():
                     "max_us": high,
                     "rel_l2": err,
                     "graph_exact": same,
+                    "lb": cfg.lb,
+                    "lp": cfg.lp,
+                    "lb_q": lbq,
+                    "prefetch": prefetch,
                 }
                 rows.append(row)
                 if rank == 0:

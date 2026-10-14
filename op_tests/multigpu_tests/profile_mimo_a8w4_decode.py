@@ -70,13 +70,19 @@ def main():
         default=["random", "hot"],
     )
     p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument(
+        "--lb-min", type=int, help="Override MiMo LB crossover (0 forces dynamic)"
+    )
+    p.add_argument(
+        "--mega-only", action="store_true", help="Skip unqualified split configurations"
+    )
     args = p.parse_args()
     os.environ["AITER_MEGAMOE_TP_PROFILE"] = "1"
     rank, world, local = (
         int(os.environ[k]) for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK")
     )
-    if world != 8 or any(t <= 0 or t > 256 or t % world for t in args.tokens):
-        p.error("requires TP8 and 8-256 global tokens divisible by 8")
+    if world != 8 or any(t <= 0 or t > 2048 or t % world for t in args.tokens):
+        p.error("requires TP8 and 8-2048 global tokens divisible by 8")
     torch.cuda.set_device(local)
     init_dist_env(world, rank, local_rank=local)
     ctx = SimpleNamespace(rank=rank, world=world, device=torch.device("cuda", local))
@@ -96,10 +102,18 @@ def main():
     bench.STATE = SimpleNamespace(ctx=ctx, wt=wt, split_wt=split_wt, args=timing_args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summaries, split_rows = [], []
-    layer = support.new_layer(shape, wt, ctx, "ag_rs", 32)
+    layer = support.new_layer(
+        shape,
+        wt,
+        ctx,
+        "ag_rs",
+        max(args.tokens) // world,
+        **({"lb_min": args.lb_min} if args.lb_min is not None else {}),
+    )
     try:
         layer.prepare([t // world for t in args.tokens])
         for tokens, route in itertools.product(args.tokens, args.routes):
+            cfg = layer.launch_config(tokens // world)
             c = support.make_case(shape, wt, ctx, "ag_rs", tokens, route, 123)
             for _ in range(20):
                 layer(c.x, c.w, c.ids)
@@ -126,6 +140,10 @@ def main():
                     -1, PROFILE_SLOTS
                 )
                 for name, (a, b) in INTERVALS.items():
+                    if cfg.lb and name == "dynamic plan":
+                        name = "LB plan + route scatter"
+                    if cfg.lb and name == "compute units incl route scan":
+                        name = "LB G1 + export + G2 phase"
                     valid = (all_stamps[:, a] > 0) & (
                         all_stamps[:, b] >= all_stamps[:, a]
                     )
@@ -142,6 +160,7 @@ def main():
                                 "median_us": float(values.median()),
                                 "p90_us": float(values.quantile(0.9)),
                                 "max_us": float(values.max()),
+                                "schedule": "lb" if cfg.lb else "dynamic",
                             }
                         )
                 for name, slot in (
@@ -149,6 +168,10 @@ def main():
                     ("GEMM1 sum", 17),
                     ("GEMM2 sum", 18),
                 ):
+                    if cfg.lb and slot == 17:
+                        name = "LB GEMM1 + intermediate export sum"
+                    elif cfg.lb and slot == 18:
+                        name = "LB GEMM2 phase incl import/claim/waits"
                     values = all_stamps[:, slot].double() / 100
                     summaries.append(
                         {
@@ -159,6 +182,7 @@ def main():
                             "median_us": float(values.median()),
                             "p90_us": float(values.quantile(0.9)),
                             "max_us": float(values.max()),
+                            "schedule": "lb" if cfg.lb else "dynamic",
                         }
                     )
                 pd.DataFrame(summaries).to_csv(
@@ -166,6 +190,8 @@ def main():
                 )
             # Split isolated components preserve the same routing/quantization
             # and the selected installed config, with each dependency ready.
+            if args.mega_only:
+                continue
             split = bench.Split(shape, split_wt, tokens, bench.Collectives("custom"))
             w, ids = split.routes(c)
             sr = split.sort(w, ids)
