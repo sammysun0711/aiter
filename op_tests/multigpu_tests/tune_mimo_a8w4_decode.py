@@ -78,6 +78,8 @@ def tune_case(tokens, seed):
     a, scales = quant(x, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0)
     profiles = []
     for g1, bm in candidates():
+        if STATE.args.stage1 and g1 not in STATE.args.stage1:
+            continue
         # Atomic/BF16 output keeps the split comparator's FP8 activation error
         # separate from Mega's lossy output communication.
         g2s = [
@@ -86,6 +88,7 @@ def tune_case(tokens, seed):
             if inst.sort_block_m == bm
             and not inst.route_out_fp8
             and inst.supports_tuner_token(tokens)
+            and (not STATE.args.stage2 or inst.name in STATE.args.stage2)
         ]
         for inst in g2s:
             row = {
@@ -156,6 +159,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--tokens", nargs="+", type=int, default=[8, 32, 64, 128, 248, 256])
     p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument(
+        "--stage1", nargs="+", help="Restrict qualification to named GEMM1 candidates"
+    )
+    p.add_argument(
+        "--stage2", nargs="+", help="Restrict qualification to named GEMM2 candidates"
+    )
     args = p.parse_args()
     torch.cuda.set_device(0)
     ctx = SimpleNamespace(rank=0, world=8, device=torch.device("cuda", 0))
@@ -166,6 +175,7 @@ def main():
         out=args.output_dir,
         profiles=[],
         winners=[],
+        args=args,
     )
     STATE.split_wt = bench.split_weights(STATE.wt, 384)
     rows = [tune_case(m, 123) for m in args.tokens]
