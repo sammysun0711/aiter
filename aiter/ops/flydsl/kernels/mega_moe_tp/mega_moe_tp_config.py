@@ -22,6 +22,7 @@ from .common import (
 
 # tokens per launch (all ranks) up to which the host may pick the dynamic schedule
 DYN_MAX, NCTA_MAX, NCK_MAX, NCHA_MAX = 256, 256, 64, 64
+MIMO_A8_DYN_MAX = 2048
 # routing-meta flags per rank (one per sending CTA: m * topk <= 64 * NMETA_CAP)
 NMETA_CAP = 256
 # Flag arena (ints, written by peers, one writer each, values = launch epoch, compared
@@ -74,6 +75,9 @@ CTRL_COLC = CTRL_LBR + 2 * N_XCD * LRDY_STRIDE
 CTRL_G1C = CTRL_COLC + 2 * NCK_MAX * LRDY_STRIDE
 CTRL_TNC = CTRL_G1C + 2 * NCHLB_MAX * G1C_STRIDE
 CTRL_INTS = CTRL_TNC + TN_MAX
+# Optional diagnostic timestamps, separate from all synchronization counters.
+PROFILE_SLOTS = 32
+PROFILE_BASE = ceildiv(CTRL_INTS * 4, 8) * 8
 # unit records (expert, i0, icnt, kind); LB: kind = UNIT_G1X | piece << 8 | chunk << XQ_SHIFT
 # (a GEMM1 piece exporting its intermediate)
 UNIT_G1X = 3
@@ -118,6 +122,12 @@ def gemm2_chunk_groups(H: int, I: int) -> int:
     return 2 if (H // 64 // NW) % 2 == 0 else 1
 
 
+def dynamic_token_limit(H, I, E, TOPK, tp, ar, act, a8):
+    """Only MiMo TP8 sequence-parallel A8 extends the common dynamic limit."""
+    mimo = a8 and not ar and (H, I, E, TOPK, tp, act) == (6144, 256, 384, 8, 8, "silu")
+    return MIMO_A8_DYN_MAX if mimo else DYN_MAX
+
+
 @functools.cache
 def mega_moe_tp_consts(
     H: int,
@@ -130,6 +140,7 @@ def mega_moe_tp_consts(
     nch: int = 0,
     a8: bool = False,
     lb: bool = False,
+    dyn_limit: int = DYN_MAX,
 ) -> dict:
     RG = MT * 16
     KS1 = H // 128
@@ -179,7 +190,8 @@ def mega_moe_tp_consts(
         max(RG * c["SI_STRIDE"], agr * (c["XB"] + H // 32) - RG * (I // 32))
     )
     c["L_INTERS"] = take(RG * (I // 32))
-    nrix = 256 if lb else min(TMAX, DYN_MAX)
+    nrix = 256 if lb else min(TMAX, dyn_limit)
+    c["NRIX"] = nrix
     c["L_RIX"] = take(nrix * 4)
     c["L_WT"] = take(nrix * 4)
     c["L_CTL"] = take(128 * 4)
@@ -261,6 +273,9 @@ def kernel_config(
     tn_gemma: bool = True,
     lbpf: bool = False,
     lbp: int = 0,
+    profiling: bool = False,
+    dyn_p: int = 0,
+    dyn_limit: int = DYN_MAX,
 ):
     """The derived compile-time values of one compile_mega_moe_tp instance."""
     if swiglu_limit is None:
@@ -268,7 +283,8 @@ def kernel_config(
     TN = tn in (1, 2)
     assert not TN or not ar
     nsk = NSK
-    c = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb)
+    assert 1 <= dyn_limit <= dynamic_token_limit(H, I, E, TOPK, tp, ar, act, a8)
+    c = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb, dyn_limit)
     RG, KS1, NCH, KS2, G2 = c["RG"], c["KS1"], c["NCH"], c["KS2"], c["G2"]
     CH1, CH2, SI_STRIDE = c["CH1"], c["CH2"], c["SI_STRIDE"]
     ACB, XB = c["ACB"], c["XB"]
@@ -284,11 +300,15 @@ def kernel_config(
     assert npp >= 1 and nsk % (npp * KCS) == 0 and (KS1 * npp) % nsk == 0
     assert 3 <= NAB <= 4
     VPL = ceildiv(CW // 8, 64)
-    SCAN_IT = ceildiv(min(TMAX, DYN_MAX) * TOPK // 4, NT)
+    NRIX = c["NRIX"]
+    SCAN_IT = ceildiv(min(TMAX, dyn_limit) * TOPK // 4, NT)
     SCAN_G = 16
-    NPC = 1 if lb else KS2
+    NPC = 1 if lb else dyn_p if dyn_p > 0 else KS2
     assert not (comm_bf16 and ll_rs)
     DYN_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]
+    assert dyn_p == 0 or dyn_p in DYN_PS
+    if dyn_p:
+        DYN_PS = [dyn_p]
     DLL = bool(ll_rs and ll_route)
     assert not DLL or route_fp8
     MLL = DLL and not ar
@@ -299,7 +319,8 @@ def kernel_config(
     # routing-meta flag slots per rank: one per sending CTA (64 lanes x 4 routes each)
     NMETA = max(32, 1 << (ceildiv(TMAX // tp * TOPK, 256) - 1).bit_length())
     assert NMETA <= NMETA_CAP, "m * topk > 64 * NMETA_CAP"
-    assert not lb or (not ll_rs and not a8 and rch == RG)
+    assert not lb or (not ll_rs and rch == RG)
+    assert not (lb and a8) or dyn_limit > DYN_MAX
     assert not lb or nch <= NCHLB_MAX
     LBQ = lbq if lb else 1
     assert NCK % LBQ == 0
@@ -332,6 +353,7 @@ def kernel_config(
     AUX_RT = AUX_SYS if lb else AUX_SC1
     ADEPTH = min(ALOAD_DEPTH, NAB - 1) if lb and NAB > 3 else ALOAD_DEPTH
     LBPF = bool(lb and c["B1_FITS"] and lbpf)
+    IB = I if a8 else I // 2
     MTSKIP = lb and MT >= 4
     name = (
         f"mega_moe_tp_fused_h{H}_i{I}_e{E}_k{TOPK}_mt{MT}_t{TMAX}_{act}"
@@ -361,6 +383,9 @@ def kernel_config(
         + ("_mtskip" if MTSKIP else "")
         + (f"_ad{ADEPTH}" if ADEPTH != ALOAD_DEPTH else "")
         + ("_pf" if LBPF else "")
+        + ("_profile" if profiling else "")
+        + (f"_dp{dyn_p}" if dyn_p else "")
+        + (f"_dmax{dyn_limit}" if dyn_limit != DYN_MAX else "")
     )
     const_expr = fx.const_expr
     layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"

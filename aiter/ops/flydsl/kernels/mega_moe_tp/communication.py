@@ -127,6 +127,7 @@ def build_communication(kc: KernelCtx) -> dict:
     L_INTER, L_INTERS, L_RIX, L_WT, MLL = kc.get("L_INTER L_INTERS L_RIX L_WT MLL")
     MT, NBW, NCH, NCK, NMETA, NPC, NV = kc.get("MT NBW NCH NCK NMETA NPC NV")
     RG, SCAN_G, SCAN_IT, SI_STRIDE = kc.get("RG SCAN_G SCAN_IT SI_STRIDE")
+    NRIX = kc.NRIX
     TMAX, TN, TOPK, TPC, VPL, XB, XLPR = kc.get("TMAX TN TOPK TPC VPL XB XLPR")
     a8, act, agr, ar, comm_bf16 = kc.get("a8 act agr ar comm_bf16")
     const_expr, lb, ll_rs, route_fp8 = kc.get("const_expr lb ll_rs route_fp8")
@@ -264,7 +265,7 @@ def build_communication(kc: KernelCtx) -> dict:
             else:
                 inv = fx.Float32(1.0) / ce.to(fx.Float32)
                 _gather_scan(L, tid, a, expert, key, (cc, ce, inv))
-        return fx.min(lds_ld_i32(L, L_CTL + C_CNT * 4), i32(TMAX))
+        return fx.min(lds_ld_i32(L, L_CTL + C_CNT * 4), i32(NRIX))
 
     def _in_chunk(idx, chunk):
         if chunk is None:
@@ -315,7 +316,7 @@ def build_communication(kc: KernelCtx) -> dict:
                 base = _wave_claim(L, tid, run)
                 for hit, pos, idx, wv in hits:
                     slot = base + pos
-                    if hit & (slot < i32(TMAX)):
+                    if hit & (slot < i32(NRIX)):
                         lds_st(L, L_RIX + slot * i32(4), idx)
                         lds_st(L, L_WT + slot * i32(4), fx.Int32(wv))
             for idx_ in range(n4 * i32(4) + tid, n, i32(NT)):
@@ -382,7 +383,7 @@ def build_communication(kc: KernelCtx) -> dict:
     def _gather_one(L, idx, hit, wv):
         if hit:
             slot = lds_atomic_add(L, L_CTL + C_CNT * 4, 1)
-            if slot < i32(TMAX):
+            if slot < i32(NRIX):
                 lds_st(L, L_RIX + slot * i32(4), idx)
                 lds_st(L, L_WT + slot * i32(4), wv)
 

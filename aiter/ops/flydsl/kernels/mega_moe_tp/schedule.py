@@ -31,6 +31,7 @@ from .common import (
     lds_ld_i32,
     lds_st,
     lds_st_rel,
+    now,
     rsrc,
     spin0,
     spin_lds_ge,
@@ -97,6 +98,12 @@ def build_schedule(kc: KernelCtx) -> dict:
     lb, lrdy_at, masked, meta_ll_wait = kc.get("lb lrdy_at masked meta_ll_wait")
     rch, report_chunk, spin_sys_ge = kc.get("rch report_chunk spin_sys_ge")
     unit_fields, zero_masked = kc.get("unit_fields zero_masked")
+    profile_stamp = kc.profile_stamp
+    profile_value = kc.profile_value
+    IB = kc.IB
+
+    def profile_clock():
+        return now() if kc.profiling else fx.Int64(0)
 
     @flyc.jit
     def gemm2_dispatch(L, tid, a, expert, ks0, icnt, r0, rows, signal):
@@ -122,18 +129,27 @@ def build_schedule(kc: KernelCtx) -> dict:
             spin_sys_ge(ctrl_at(a, i32(CTRL_XF) + x), a["epoch"])
 
     def unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig):
+        t0 = profile_clock()
         gemm1(L, tid, a, expert, i0, icnt // i32(128))
+        t1 = profile_clock()
         gemm2_dispatch(L, tid, a, expert, i0 // i32(128), icnt, r0, rows, sig)
+        t2 = profile_clock()
+        return t1 - t0, t2 - t1
 
     @flyc.jit
     def compute_units(L, tid, a):
         lane = tid % i32(64)
         w = tid // i32(64)
+        scan_ticks, g1_ticks, g2_ticks = fx.Int64(0), fx.Int64(0), fx.Int64(0)
+        if tid == i32(0):
+            profile_stamp(a, tid, 2)
         if const_expr(MLL):
             meta_ll_wait(tid, a)
         elif const_expr(not ar):
             ag_wait_meta(a, tid, a["epoch"])
         _stale_dropped(tid, a)
+        if tid == i32(0):
+            profile_stamp(a, tid, 3)
         if const_expr(ar and not DLL):
             zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
         cbar(L, tid)
@@ -142,10 +158,14 @@ def build_schedule(kc: KernelCtx) -> dict:
                 lds_st_rel(L, L_CTL + C_RLAND * 4, i32(1))
         if const_expr(not ar and not DLL):
             zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
+        if tid == i32(0):
+            profile_stamp(a, tid, 4)
         if const_expr(lb):
             lb_plan(L, tid, a)
         else:
             dyn_plan(L, tid, a)
+        if tid == i32(0):
+            profile_stamp(a, tid, 5)
         ub = lds_ld_i32(L, L_CTL + C_UNIT * 4)
         ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
         if ub == ue:
@@ -159,7 +179,9 @@ def build_schedule(kc: KernelCtx) -> dict:
                 cc = expert.shrui(i32(24))
                 ce = expert.shrui(i32(16)) & i32(0xFF)
                 expert = expert & i32(0xFFFF)
+                scan0 = profile_clock()
                 R = gather_routes_chunk(L, tid, a, expert, cc, ce)
+                scan_ticks = scan_ticks + profile_clock() - scan0
             if tid == i32(0):
                 lds_st(L, L_CTL + C_UROWS * 4, R)
                 lds_st_rel(L, L_CTL + C_USEQ * 4, u - ub + i32(1))
@@ -169,21 +191,31 @@ def build_schedule(kc: KernelCtx) -> dict:
                 r0 = i32(r0_)
                 rows = fx.min(R - r0, i32(RG))
                 if const_expr(lb):
+                    g10 = profile_clock()
                     lb_g1_tile(L, tid, a, expert, i0, icnt, rows)
+                    g1_ticks = g1_ticks + profile_clock() - g10
                 else:
                     sig = (u == ue - i32(1)) & (r0 + i32(RG) >= R)
-                    unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig)
+                    g1, g2 = unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig)
+                    g1_ticks, g2_ticks = g1_ticks + g1, g2_ticks + g2
                 cbar(L, tid)
             if const_expr(lb):  # noqa: SIM102
                 if tid == i32(0):
                     g_add_agent(lb_g1c(a, kind.shrui(i32(XQ_SHIFT)), lb_bank(L)), 1)
+        g20 = profile_clock()
         if const_expr(LBPF):
             lb_g2_consume(L, tid, a)
         elif const_expr(lb):
             lb_g2_phase(L, tid, a)
+        if const_expr(lb):
+            g2_ticks = profile_clock() - g20
         if const_expr(DLL):  # noqa: SIM102
             if tid == i32(0):
                 lds_st_rel(L, L_CTL + C_CDONE * 4, i32(1))
+        profile_value(a, tid, 16, scan_ticks)
+        profile_value(a, tid, 17, g1_ticks)
+        profile_value(a, tid, 18, g2_ticks)
+        profile_value(a, tid, 19, ue - ub)
 
     @flyc.jit
     def dyn_plan(L, tid, a):
@@ -300,7 +332,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             lb_lbr_wait(a, bank, i32(x))
 
     def lb_lists(a):
-        base = fx.Int64(a["xg"]) + fx.Int64(TMAX * TOPK * (I // 2 + I // 32))
+        base = fx.Int64(a["xg"]) + fx.Int64(TMAX * TOPK * (IB + I // 32))
         return rsrc(base), rsrc(base + fx.Int64(TMAX * TOPK * 4))
 
     def lb_bank(L):
@@ -409,43 +441,58 @@ def build_schedule(kc: KernelCtx) -> dict:
         lane = tid % i32(64)
         base = [i32(0), i32(0)]
         for rnd in range_constexpr(ceildiv(E, NT)):
-            j = tid + i32(rnd * NT)
-            live = j < nact
-            e = live.select(
-                lds_ld_i32(L, L_DYN + (i32(2 * NBW) + fx.min(j, i32(E - 1))) * i32(4)),
-                i32(0),
-            )
-            r = lds_ld_i32(L, L_DCNT + e * i32(4))
-            r = live.select(r, i32(0)) if offs else r
-            ce = fx.min(fx.max(ceildiv(r, i32(rch)), i32(1)), i32(255))
-            ce = live.select(ce, i32(0))
-            sums = [_wave_prefix(ce, 8)] + (
-                [_wave_prefix(r, TMAX.bit_length())] if offs else []
-            )
-            if lane == i32(0):
-                for q in range_constexpr(len(sums)):
-                    lds_st(L, L_WSUM + (w + i32(q * NW)) * i32(4), sums[q][1])
-            cbar(L, tid)
-            off = []
-            for q in range_constexpr(len(sums)):
-                o, total = base[q] + sums[q][0], i32(0)
-                for v in range_constexpr(NW):
-                    sv = lds_ld_i32(L, L_WSUM + i32((q * NW + v) * 4))
-                    o = o + (i32(v) < w).select(sv, i32(0))
-                    total = total + sv
-                off.append(o)
-                base[q] = base[q] + total
-            if const_expr(offs):  # noqa: SIM102
-                if live:
-                    lds_st(L, L_EOFF + e * i32(4), off[1])
-            for c_ in range(i32(0), ce, i32(1)):
-                c = i32(c_)
-                lds_st(
-                    L,
-                    L_DCH + (off[0] + c) * i32(4),
-                    e | (ce << i32(16)) | (c << i32(24)),
+            if const_expr(
+                not offs
+                and kc.a8
+                and not kc.ar
+                and kc.H == 6144
+                and I == 256
+                and E == 384
+                and TOPK == 8
+            ):
+                run = nact > i32(rnd * NT)
+            else:
+                run = fx.Boolean(True)
+            if run:
+                j = tid + i32(rnd * NT)
+                live = j < nact
+                e = live.select(
+                    lds_ld_i32(
+                        L, L_DYN + (i32(2 * NBW) + fx.min(j, i32(E - 1))) * i32(4)
+                    ),
+                    i32(0),
                 )
-            cbar(L, tid)
+                r = lds_ld_i32(L, L_DCNT + e * i32(4))
+                r = live.select(r, i32(0)) if offs else r
+                ce = fx.min(fx.max(ceildiv(r, i32(rch)), i32(1)), i32(255))
+                ce = live.select(ce, i32(0))
+                sums = [_wave_prefix(ce, 8)] + (
+                    [_wave_prefix(r, TMAX.bit_length())] if offs else []
+                )
+                if lane == i32(0):
+                    for q in range_constexpr(len(sums)):
+                        lds_st(L, L_WSUM + (w + i32(q * NW)) * i32(4), sums[q][1])
+                cbar(L, tid)
+                off = []
+                for q in range_constexpr(len(sums)):
+                    o, total = base[q] + sums[q][0], i32(0)
+                    for v in range_constexpr(NW):
+                        sv = lds_ld_i32(L, L_WSUM + i32((q * NW + v) * 4))
+                        o = o + (i32(v) < w).select(sv, i32(0))
+                        total = total + sv
+                    off.append(o)
+                    base[q] = base[q] + total
+                if const_expr(offs):  # noqa: SIM102
+                    if live:
+                        lds_st(L, L_EOFF + e * i32(4), off[1])
+                for c_ in range(i32(0), ce, i32(1)):
+                    c = i32(c_)
+                    lds_st(
+                        L,
+                        L_DCH + (off[0] + c) * i32(4),
+                        e | (ce << i32(16)) | (c << i32(24)),
+                    )
+                cbar(L, tid)
         if tid == i32(0):
             lds_st(L, L_CTL + C_NCH * 4, base[0])
         if const_expr(offs):
@@ -735,7 +782,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                 lds_st(L, wt0 + r * i32(4), fx.Int32(wv))
         wait_lgkm0()
         rx, rxs = xg_rs(a)
-        u16 = I // 2 // 16
+        u16 = IB // 16
         nq = fx.max(R * i32(u16), i32(1))
         NQ = ceildiv(RG * u16, 64)
         for b0 in range_constexpr(0, NQ, 8):
@@ -746,7 +793,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                 c = q - row * i32(u16)
                 rix = lds_ld_i32(L, rix0 + row * i32(4))
                 dq.append(
-                    (row, c, bld(rx, rix * i32(I // 2) + c * i32(16), 0, V4I, AUX_SYS))
+                    (row, c, bld(rx, rix * i32(IB) + c * i32(16), 0, V4I, AUX_SYS))
                 )
             for row, c, dv in dq:
                 lds_st(L, ib0 + row * i32(SI_STRIDE) + c * i32(16), dv, 16)
@@ -822,7 +869,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     def lb_import(L, tid, a, rows):
         ag_stage_free(L, tid % i32(64), a)
         cbar(L, tid)
-        u16 = I // 2 // 16
+        u16 = IB // 16
         rx, rxs = xg_rs(a)
         nq = fx.max(rows * i32(u16), i32(1))
         ns = fx.max(rows * i32(I // 128), i32(1))
@@ -832,9 +879,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             row = q // i32(u16)
             c = q - row * i32(u16)
             rix = lds_ld_i32(L, L_RIX + row * i32(4))
-            dq.append(
-                (row, c, bld(rx, rix * i32(I // 2) + c * i32(16), 0, V4I, AUX_SYS))
-            )
+            dq.append((row, c, bld(rx, rix * i32(IB) + c * i32(16), 0, V4I, AUX_SYS)))
         for k in range_constexpr(ceildiv(RG * (I // 128), NT)):
             q = fx.min(tid + i32(k * NT), ns - i32(1))
             row = q // i32(I // 128)
@@ -858,12 +903,12 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     def xg_rs(a):
         rx = rsrc(a["xg"])
-        rxs = rsrc(fx.Int64(a["xg"]) + fx.Int64(a["ttot"] * i32(TOPK * (I // 2))))
+        rxs = rsrc(fx.Int64(a["xg"]) + fx.Int64(a["ttot"] * i32(TOPK * IB)))
         return rx, rxs
 
     @flyc.jit
     def xq_export(L, tid, a, i0, icnt, r0, rows):
-        u16 = icnt // i32(32)
+        u16 = icnt // i32(16 if kc.a8 else 32)
         rx, rxs = xg_rs(a)
         for q_ in range(tid, rows * u16, i32(NT)):
             q = i32(q_)
@@ -871,7 +916,13 @@ def build_schedule(kc: KernelCtx) -> dict:
             c = q - row * u16
             rix = lds_ld_i32(L, L_RIX + (r0 + row) * i32(4))
             v = lds_ld(L, i32(L_INTER) + row * i32(SI_STRIDE) + c * i32(16), V4I, 16)
-            bst(v, rx, rix * i32(I // 2) + i0 // i32(2) + c * i32(16), 0, AUX_SYS)
+            bst(
+                v,
+                rx,
+                rix * i32(IB) + i0 // i32(1 if kc.a8 else 2) + c * i32(16),
+                0,
+                AUX_SYS,
+            )
         nsd = icnt // i32(128)
         for q_ in range(tid, rows * nsd, i32(NT)):
             q = i32(q_)
