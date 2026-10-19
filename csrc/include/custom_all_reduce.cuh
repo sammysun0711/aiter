@@ -3245,6 +3245,10 @@ class CustomAllreduce
                    int block_limit = 16)
     {
 #endif
+        if(size == 0)
+        {
+            return;
+        }
         auto d = 16 / sizeof(T);
     if(size % d != 0)
         throw std::runtime_error("custom allreduce currently requires input length to be multiple "
@@ -3414,6 +3418,10 @@ class CustomAllreduce
 template <typename T>
 void dispatchReduceScatter(hipStream_t stream, T* input, T* output, int size)
 {
+    if(size == 0)
+    {
+        return;
+    }
     RankData* ptrs = get_buffer_RD(stream, input);
     auto d         = 16 / sizeof(T);
     int range      = size / (world_size_ * d);
@@ -3442,6 +3450,10 @@ template <typename T>
 void dispatchAllGather(
     hipStream_t stream, T* input, T* output, int size, int last_dim_size, int gather_dim)
 {
+    if(size == 0)
+    {
+        return;
+    }
     RankData* ptrs = get_buffer_RD(stream, input);
     auto d         = 16 / sizeof(T);
     dim3 block(512);
@@ -3535,6 +3547,10 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
+    if(size == 0)
+    {
+        return;
+    }
     if(size % d != 0)
     {
         throw std::runtime_error("custom allreduce currently requires input length to be multiple "
