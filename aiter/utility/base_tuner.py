@@ -233,6 +233,12 @@ class TunerCommon:
             default=defaults.get("min_improvement_pct", 3.0),
             help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
+        self.parser.add_argument(
+            "--a8w4-gfx942",
+            action="store_true",
+            help="Also enumerate the lossy gfx942 A8W4 kernels alongside a16w4. "
+                "Output must go to a non-auto-merged table (e.g. model_configs/lossy/).",
+        )
 
     def parse_args(self):
         args = self.parser.parse_args()
