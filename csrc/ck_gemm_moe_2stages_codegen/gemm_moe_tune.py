@@ -3496,6 +3496,87 @@ class FmoeTuner(TunerCommon):
             a_dtype_str, b_dtype_str, out_dtype_str
         )
 
+        filter_names = [
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_w2_xcd1",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x256_atomic_bnt2",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x256_atomic_bnt2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x256_w3_xcd4_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x128_atomic_persist",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x128_atomic_bnt2_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x192x128_w2_bnt0",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x128_atomic_bnt2_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w2_bnt0_xcd4_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x128_atomic_bnt2_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_w3_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_w2_xcd4",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x128_atomic_bnt2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_bnt0_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x256x128_atomic",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x128_w4_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x256_kw4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x128_atomic_bnt2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_bnt0_xcd1_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x32x256_xcd1_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_xcd1",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x128_atomic",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x256_w4_bnt0",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x128_w4_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w2_xcd1_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x256_atomic_bnt2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x256_atomic_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x256_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w4_bnt0_xcd4_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_bnt0_kw4",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x128_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_w4_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x256x128_bnt0_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x192x256_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x256_w4_bnt0_xcd1_kw4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x192x128_w2_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x192x128_bnt0_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x64x256_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_w4_bnt0",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x128x256_w2_xcd1",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x256_atomic_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x256_w2_xcd1_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x256_atomic_persist",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x128_atomic",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x256_xcd4",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x256_atomic_xcd4_persist",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x256_atomic",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x64x256_xcd4_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w2_bnt0_kw4",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x128_atomic_bnt2_xcd4",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x256_atomic_bnt2_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w3_bnt0_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x128_atomic_bnt2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w3_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x128x128_xcd4",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x128_atomic_xcd4",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x128_atomic_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x128_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w4_bnt0_xcd1_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x128_atomic_xcd4_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x64x256_xcd1_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x128x256_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w3_bnt0_xcd1_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_w4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x256_w2_xcd1_kw4",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x128_w4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x256_w3_xcd1_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x128_atomic",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x128_atomic_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_bnt0",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x64x128_w4_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w2_bnt0_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x256_atomic_bnt2_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_bnt0_xcd4_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w4_xcd1_kw2",            
+        ]
+        flydsl_s1_kernels = {k:v for k,v in flydsl_s1_kernels.items() if k in filter_names}
+        flydsl_s2_kernels = {k:v for k,v in flydsl_s2_kernels.items() if k in filter_names}
+
         for blockM in blockMs:
             # 16 included: a16w4/a8w4 emit t16 names, s1_tile_m drops the rest.
             if blockM not in [16, 32, 64, 128] or not use_g1u1:
@@ -4560,9 +4641,18 @@ class FmoeTuner(TunerCommon):
             # kernel weight layout match (else outputs are uncorrelated).
             # Source of truth: aiter/fused_moe.py q_dtype_a selection.
             eff_q_dtype_a = q_dtype_a
+            # gfx942 Silu: fused_moe runs a16w4 (bf16 activation) and the
+            # FlyDSL gfx942 backend (incl. a8w4) expects SEPARATED gate/up W1.
+            gfx942_mxfp4 = (
+                q_type == QuantType.per_1x32
+                and q_dtype_w == dtypes.fp4x2
+                and get_gfx_runtime() == "gfx942"
+            )
             if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
                 if act_type == ActivationType.Swiglu:
                     eff_q_dtype_a = dtypes.bf16 if token < 256 else dtypes.fp4x2
+                elif gfx942_mxfp4:
+                    eff_q_dtype_a = dtypes.bf16
                 else:
                     eff_q_dtype_a = dtypes.fp4x2
             shape_str = (
@@ -4673,8 +4763,9 @@ class FmoeTuner(TunerCommon):
                     # a16w4 / a8w4 (16-bit or fp8 activation, fp4 weight): the
                     # weight layout follows the *config* activation dtype, not the
                     # runtime-effective one (mirror op_tests/test_moe_2stage.py).
-                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
-                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+                    gate_up = not gfx942_mxfp4
+                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, gate_up)
+                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, gate_up)
                     w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
                     w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
                 elif (
@@ -4947,9 +5038,7 @@ class FmoeTuner(TunerCommon):
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
-            if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
-                print(f"{q_type} is not supported on {get_gfx()}")
-                return []
+
             if not use_g1u1:
                 print("no moe solution(g1u0) can tune for ", line)
                 continue

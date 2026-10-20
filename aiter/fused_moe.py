@@ -1215,6 +1215,8 @@ def _fused_moe_impl(
                 q_dtype_a = dtypes.bf16
             else:
                 q_dtype_a = dtypes.fp8
+        elif activation == ActivationType.Silu and get_gfx() == "gfx942":
+            q_dtype_a = dtypes.bf16
         else:
             q_dtype_a = dtypes.fp4x2
 
@@ -4062,7 +4064,7 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and (
-                activation in (ActivationType.Swiglu, ActivationType.Situv2)
+                activation in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Silu)
                 or gate_mode == GateMode.INTERLEAVE
             )
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
@@ -4331,7 +4333,7 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation in (ActivationType.Swiglu, ActivationType.Situv2)
+            and activation in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Silu)
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
