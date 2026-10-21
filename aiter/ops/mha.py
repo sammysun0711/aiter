@@ -1621,6 +1621,37 @@ def cmdGenFunc_mha_batch_prefill(
         and v.size(-2) == 128
     ):
         md_name += "_page64_qk192_v128"
+    if (
+        get_gfx() == "gfx942"
+        and q.dtype == torch.bfloat16
+        and q.size(-1) == 192
+        and k.dim() == v.dim() == 3
+        and v.size(-1) == 128
+    ):
+        tile = os.environ.get("AITER_MIMO_GFX942_LINEAR_TILE", "128x64")
+        if tile not in {"generic", "64x64", "64x128", "128x64", "128x128"}:
+            raise ValueError("Unsupported AITER_MIMO_GFX942_LINEAR_TILE")
+        md_name += f"_linear_qk192_v128_{tile}"
+    if (
+        get_gfx() == "gfx942"
+        and q.dtype == dtypes.fp8
+        and q.size(-1) == 192
+        and k.dim() == v.dim() == 3
+        and v.size(-1) == 128
+        and kv_block_descale is None
+        and q_descale is not None
+        and k_descale is not None
+        and v_descale is not None
+    ):
+        tile = os.environ.get("AITER_MIMO_GFX942_FP8_LINEAR_TILE", "128x96")
+        if tile not in {
+            "generic", "64x64", "64x96", "64x128", "128x64", "128x96", "128x128"
+        }:
+            raise ValueError("Unsupported AITER_MIMO_GFX942_FP8_LINEAR_TILE")
+        md_name += f"_linear_qk192_v128_fp8_{tile}"
+    # CK global-load padding checks change generated device code. A distinct
+    # module name prevents older JIT binaries from hiding the bounds fix.
+    md_name += "_gload_bounds_v1"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         f"--targets {get_gfx()} "

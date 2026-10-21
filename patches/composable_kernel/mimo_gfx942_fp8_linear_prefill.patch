@@ -1,0 +1,68 @@
+diff --git a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
+--- a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
++++ b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
+@@ -865,6 +865,29 @@
+     return None
+ 
+ 
++def _get_mimo_gfx942_fp8_linear_tile() -> FmhaFwdTileSize:
++    """Native FP8 Q/K192-V128 tiles, independent of the BF16 tuning."""
++    value = os.getenv("AITER_MIMO_GFX942_FP8_LINEAR_TILE", "128x96")
++    choices = {
++        "64x64": (64, 64),
++        "64x96": (64, 96),
++        "64x128": (64, 128),
++        "128x64": (128, 64),
++        "128x96": (128, 96),
++        "128x128": (128, 128),
++    }
++    if value not in choices:
++        raise ValueError(
++            f"AITER_MIMO_GFX942_FP8_LINEAR_TILE must be one of {sorted(choices)}"
++        )
++    m0, n0 = choices[value]
++    warps = m0 // 32
++    return FmhaFwdTileSize(
++        m0, n0, 32, 128, 32, 192, warps, 1, 1, warps, 1, 1,
++        32, 32, 32, 32, 32, 32, -1,
++    )
++
++
+ def _get_mimo_d192_tiles(
+     dtype: str, target: Optional[str]
+ ) -> List[FmhaFwdTileSize]:
+@@ -1076,7 +1099,7 @@
+                 ):
+                     continue
+ 
+-                # D192 covers page-64 vectorized KV and gfx942 BF16 page-1
++                # D192 covers page-64 vectorized KV and gfx942 BF16/FP8 page-1
+                 # LINEAR KV. Other contracts retain the D256 fallback. The
+                 # linear family has its own tile search and does not change
+                 # the existing page-64 tuning.
+@@ -1088,14 +1111,21 @@
+                         page_sizes = [64]
+                     elif (
+                         mimo_target == "gfx942"
+-                        and dtype == "bf16"
++                        and dtype in ("bf16", "fp8bf16")
+                         and tile.F_bn1 == 128
+                         and pipeline.F_kv_memory_layout == "linear"
+                     ):
+-                        if os.getenv("AITER_MIMO_GFX942_LINEAR_TILE") == "generic":
+-                            continue
+                         page_sizes = [1]
+-                        tile = _get_mimo_gfx942_bf16_linear_tile()
++                        if dtype == "bf16":
++                            if os.getenv("AITER_MIMO_GFX942_LINEAR_TILE") == "generic":
++                                continue
++                            tile = _get_mimo_gfx942_bf16_linear_tile()
++                        else:
++                            if pipeline.F_qscale != "pertensor":
++                                continue
++                            if os.getenv("AITER_MIMO_GFX942_FP8_LINEAR_TILE") == "generic":
++                                continue
++                            tile = _get_mimo_gfx942_fp8_linear_tile()
+                     else:
+                         continue
+                 elif (

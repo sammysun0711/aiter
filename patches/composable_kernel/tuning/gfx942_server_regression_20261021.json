@@ -1,0 +1,10 @@
+{
+  "Successful requests": "600",
+  "Benchmark duration (s)": "704.26",
+  "Total input tokens": "9830400",
+  "Total generated tokens": "600",
+  "Input token throughput (tok/s)": "13958.39",
+  "server_faults": 0,
+  "sglang_padding": false,
+  "server_log": "/root/workspace/sglang/evaluation/logs/dflash_ck_root_fix_20261021/server_tp8_aiter_dflash_accuracy.log"
+}

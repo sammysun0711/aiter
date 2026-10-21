@@ -1,0 +1,89 @@
+diff --git a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
+--- a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
++++ b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
+@@ -548,6 +548,19 @@
+                         "ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D && "
+                         "t.page_size == 64"
+                     )
++                    if any(
++                        t.kv_memory_layout == "linear" and t.page_size == 1
++                        for t in traits
++                    ):
++                        hdim_check = (
++                            f"t.hdim_q == 192 && t.hdim_v == {hdim_v} && "
++                            "t.kv_lookup_table == "
++                            "ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D && "
++                            "((t.kv_memory_layout == "
++                            "ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT && t.page_size == 64) || "
++                            "(t.kv_memory_layout == "
++                            "ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT && t.page_size == 1))"
++                        )
+                 per_hdim_case = per_hdim_case + FMHA_FWD_API_PER_HDIM_CASE.format(
+                     F_if=if_j, F_hdim_check=hdim_check, F_inner_dispatch=inners
+                 )
+@@ -816,6 +829,27 @@
+         )
+     return _make_mimo_gfx950_d192_v128_tile(
+         m0, n0, _get_mimo_gfx950_d192_occupancy_override()
++    )
++
++
++def _get_mimo_gfx942_bf16_linear_tile() -> FmhaFwdTileSize:
++    """Small, separately cached search space for MiMo's LINEAR SWA fallback."""
++    value = os.getenv("AITER_MIMO_GFX942_LINEAR_TILE", "128x64")
++    choices = {
++        "64x64": (64, 64),
++        "64x128": (64, 128),
++        "128x64": (128, 64),
++        "128x128": (128, 128),
++    }
++    if value not in choices:
++        raise ValueError(
++            f"AITER_MIMO_GFX942_LINEAR_TILE must be one of {sorted(choices)}"
++        )
++    m0, n0 = choices[value]
++    warps = m0 // 32
++    return FmhaFwdTileSize(
++        m0, n0, 32, 128, 32, 192, warps, 1, 1, warps, 1, 1,
++        32, 32, 16, 32, 32, 16, -1,
+     )
+ 
+ 
+@@ -1042,19 +1076,28 @@
+                 ):
+                     continue
+ 
+-                # Keep the tuned head-192 specialization exact: page-64,
+-                # vectorized SGLang cache only.  Other page/layout/table
+-                # combinations continue to use the padded head-256 kernels.
+-                # Besides avoiding a broad JIT-matrix expansion, the tuned
+-                # tile is not compile-valid for page-64 LINEAR_LAYOUT.
++                # D192 covers page-64 vectorized KV and gfx942 BF16 page-1
++                # LINEAR KV. Other contracts retain the D256 fallback. The
++                # linear family has its own tile search and does not change
++                # the existing page-64 tuning.
+                 page_sizes = SUPPORTED_PAGE_SIZE
+                 if hdim == 192:
+-                    if (
+-                        pipeline.F_kv_memory_layout != "vectorized"
+-                        or pipeline.F_kv_lookup_table != "sglang"
++                    if pipeline.F_kv_lookup_table != "sglang":
++                        continue
++                    if pipeline.F_kv_memory_layout == "vectorized":
++                        page_sizes = [64]
++                    elif (
++                        mimo_target == "gfx942"
++                        and dtype == "bf16"
++                        and tile.F_bn1 == 128
++                        and pipeline.F_kv_memory_layout == "linear"
+                     ):
++                        if os.getenv("AITER_MIMO_GFX942_LINEAR_TILE") == "generic":
++                            continue
++                        page_sizes = [1]
++                        tile = _get_mimo_gfx942_bf16_linear_tile()
++                    else:
+                         continue
+-                    page_sizes = [64]
+                 elif (
+                     mimo_target is not None
+                     and dtype in ("bf16", "fp8bf16")
