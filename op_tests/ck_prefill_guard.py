@@ -64,9 +64,11 @@ def guarded_tensor(shape, library, dtype=torch.bfloat16, load_mode="global"):
         raise ValueError(f"Unsupported load mode: {load_mode}")
     allocate = getattr(
         lib,
-        "allocate_guarded_hip"
-        if load_mode == "global"
-        else "allocate_guarded_hip_buffer",
+        (
+            "allocate_guarded_hip"
+            if load_mode == "global"
+            else "allocate_guarded_hip_buffer"
+        ),
     )
     allocate.argtypes = [C.c_size_t, C.c_int, C.POINTER(C.c_void_p)]
     allocate.restype = C.c_int
@@ -161,7 +163,7 @@ def make_case(
     return args, sink, k_ref, v_ref, scales
 
 
-def reference(q, k, v, q_lens, kv_lens, sink, window):
+def reference(q, k, v, q_lens, kv_lens, sink, window, logits_soft_cap=0.0):
     result = torch.empty(
         (*q.shape[:2], v.shape[-1]), device="cuda", dtype=torch.float32
     )
@@ -175,6 +177,8 @@ def reference(q, k, v, q_lens, kv_lens, sink, window):
             kc = k[k_offset + key_start : k_offset + key_stop].transpose(0, 1).float()
             vc = v[k_offset + key_start : k_offset + key_stop].transpose(0, 1).float()
             scores = qc @ kc.transpose(-1, -2) * q.shape[-1] ** -0.5
+            if logits_soft_cap > 0:
+                scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
             qp = (nk - nq + torch.arange(start, stop, device="cuda"))[:, None]
             kp = torch.arange(key_start, key_stop, device="cuda")[None]
             mask = kp <= qp
@@ -215,6 +219,7 @@ def main():
     parser.add_argument("--qk-dim", type=int, default=192)
     parser.add_argument("--v-dim", type=int, default=128)
     parser.add_argument("--window", type=int, default=128)
+    parser.add_argument("--logits-soft-cap", type=float, default=0.0)
     parser.add_argument("--permute", action="store_true")
     parser.add_argument("--cache-dtype", choices=["bf16", "fp8"], default="bf16")
     parser.add_argument("--load-mode", choices=["global", "buffer"], default="global")
@@ -235,11 +240,18 @@ def main():
         flush=True,
     )
     q_ref = args[0].float() * scales.get("q_descale", 1.0)
-    expected = reference(q_ref, k_ref, v_ref, ns.q_lens, ns.kv_lens, sink, ns.window)
+    expected = reference(
+        q_ref, k_ref, v_ref, ns.q_lens, ns.kv_lens, sink, ns.window, ns.logits_soft_cap
+    )
     # Reuse LDS across repeated launches, including mixed valid/padded lanes.
     for _ in range(3):
         actual = mha_batch_prefill_func(
-            *args, causal=True, window_size=(ns.window, -1), sink_ptr=sink, **scales
+            *args,
+            causal=True,
+            window_size=(ns.window, -1),
+            logits_soft_cap=ns.logits_soft_cap,
+            sink_ptr=sink,
+            **scales,
         )
         torch.cuda.synchronize()
         errors = check_accuracy(actual, expected, ns.cache_dtype)

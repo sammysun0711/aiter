@@ -313,7 +313,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.k_descale_ptr     = k_descale.has_value() ? k_descale.value().data_ptr() : nullptr;
     args.v_descale_ptr     = v_descale.has_value() ? v_descale.value().data_ptr() : nullptr;
     // sink_ptr is independent of sink_size: when provided, the kernel always reads
-    // it as per-head logit values for the virtual sink token (sink_value = *ptr / scale_s).
+    // it as final per-head logits for the virtual sink token, independent of Q/K descales.
     // When null, sink_value defaults to -inf (virtual token excluded from softmax).
     args.sink_ptr          = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
     args.bias_ptr          = bias_ptr;

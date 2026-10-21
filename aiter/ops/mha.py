@@ -1643,15 +1643,23 @@ def cmdGenFunc_mha_batch_prefill(
         and k_descale is not None
         and v_descale is not None
     ):
-        tile = os.environ.get("AITER_MIMO_GFX942_FP8_LINEAR_TILE", "128x96")
+        tile = os.environ.get("AITER_MIMO_GFX942_FP8_LINEAR_TILE", "64x64")
         if tile not in {
-            "generic", "64x64", "64x96", "64x128", "128x64", "128x96", "128x128"
+            "generic",
+            "64x64",
+            "64x96",
+            "64x128",
+            "128x64",
+            "128x96",
+            "128x128",
         }:
             raise ValueError("Unsupported AITER_MIMO_GFX942_FP8_LINEAR_TILE")
         md_name += f"_linear_qk192_v128_fp8_{tile}"
     # CK global-load padding checks change generated device code. A distinct
     # module name prevents older JIT binaries from hiding the bounds fix.
     md_name += "_gload_bounds_v1"
+    # FP8 sink logits must use the effective Q/K descale in the CK pipeline.
+    md_name += "_sink_descale_v1"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         f"--targets {get_gfx()} "

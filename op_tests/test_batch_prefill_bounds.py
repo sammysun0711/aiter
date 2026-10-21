@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""GLOBAL_LOAD_LDS must zero padded head lanes without touching guard pages."""
+"""Global and buffer loads must zero padded lanes without touching guard pages."""
 
 import os
 import subprocess
@@ -44,19 +44,30 @@ def guard_library(tmp_path_factory):
 
 
 @pytest.mark.parametrize(
-    "q_lens,kv_lens,qk_dim,v_dim,permute",
+    "q_lens,kv_lens,qk_dim,v_dim,permute,logits_soft_cap",
     [
-        ([3968], [16384], 192, 128, False),
-        ([129], [257], 192, 128, False),
-        ([64], [129], 160, 96, False),
-        ([33], [97], 96, 64, False),
-        ([7, 63, 129], [73, 192, 257], 192, 128, True),
+        ([3968], [16384], 192, 128, False, 0.0),
+        ([129], [257], 192, 128, False, 0.0),
+        # With no prefix, the first rows expose incorrect sink-logit scaling.
+        ([129], [129], 192, 128, False, 0.0),
+        ([129], [129], 192, 128, False, 0.5),
+        ([64], [129], 160, 96, False, 0.0),
+        ([33], [97], 96, 64, False, 0.0),
+        ([7, 63, 129], [73, 192, 257], 192, 128, True, 0.0),
     ],
 )
 @pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("load_mode", ["global", "buffer"])
-def test_global_load_padded_heads(
-    guard_library, q_lens, kv_lens, qk_dim, v_dim, permute, cache_dtype, load_mode
+def test_guarded_padded_heads(
+    guard_library,
+    q_lens,
+    kv_lens,
+    qk_dim,
+    v_dim,
+    permute,
+    logits_soft_cap,
+    cache_dtype,
+    load_mode,
 ):
     cmd = [
         sys.executable,
@@ -75,6 +86,8 @@ def test_global_load_padded_heads(
         cache_dtype,
         "--load-mode",
         load_mode,
+        "--logits-soft-cap",
+        str(logits_soft_cap),
     ]
     if permute:
         cmd.append("--permute")

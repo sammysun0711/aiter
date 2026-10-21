@@ -1,23 +1,25 @@
-# MiMo Composable Kernel patches
+# MiMo Composable Kernel batch-prefill patch
 
-These patches are based on CK commit
-`af9e1d1f1ae347c22feeb08fd2d42645075e0c5d`. Apply them in the order below.
+This directory contains one CK patch:
+`mimo_page64_qk192_v128_batch_prefill.patch`, based on CK commit
+`af9e1d1f1ae347c22feeb08fd2d42645075e0c5d`.
 
-1. `mimo_page64_qk192_v128_batch_prefill.patch`: existing native Q/K192,
-   V/output128 page-64 vectorized kernels for gfx942/gfx950 (BF16 and FP8).
-2. `batch_prefill_global_load_bounds.patch`: restore padding validity checks
-   for both global-to-register V loads and asynchronous global-to-LDS K loads.
-   Invalid K lanes receive zeros through a zero-length SRD transfer, preserving
-   the LDS layout and async-load ordering. This also protects generic D256
-   fallback kernels; the fix is not limited to MiMo's native specialization.
-3. `mimo_gfx942_bf16_linear_prefill.patch`: native BF16 Q/K192-V128 LINEAR
-   page-1 SGLang-table kernels on gfx942. This extends the existing codegen
-   patch; it keeps other layouts, dtypes, and head dimensions on their existing
-   dispatch paths. The selected tile is 128x64 with four waves.
+It includes all MiMo batch-prefill changes:
 
-The patch was adapted from `sammysun0711/aiter:mimo-opt`, commit
-`e89c25b8b461df14005dbf4e8ab5435597932cd8`.
+- Native Q/K192–V/output128 page-64 vectorized kernels for gfx942/gfx950
+  (BF16 and FP8), including the existing gfx950 tuning.
+- Native gfx942 LINEAR page-1 SGLang-table kernels, with measured defaults
+  BF16 128x64 and per-tensor FP8 64x64.
+- Global K/V padding bounds checks, including zero filling invalid
+  asynchronous K transfers. These also protect generic fallback kernels.
+- Virtual-sink normalization using the effective QK scale, including FP8
+  descales; transformed logits use the final sink directly.
 
+The combined patch changes three CK files and reproduces the GPU-qualified
+sources byte-for-byte. It replaces the component patch series.
+
+The original page-64 specialization was adapted from
+`sammysun0711/aiter:mimo-opt`, commit `e89c25b8b461df14005dbf4e8ab5435597932cd8`.
 
 ## Why the linear patch is needed
 
@@ -37,45 +39,79 @@ with unpadded K and V. No SGLang head-padding workaround is needed.
 A direct page-64 SWA integration could avoid gathering altogether, but that is
 separate from this fix and the linear-kernel tuning below.
 
+## FP8 sink correctness
+
+Runtime qualification also exposed a sink-logit error in the generic baseline
+and native FP8 kernels. CK divided the virtual sink by the base softmax scale,
+but subsequently multiplied it by the effective scale, including Q/K descales.
+This effectively moved nonzero sink logits toward zero. Prefix-attention
+checks could miss it because the sink carried little probability; Q=KV cases
+failed on the first causal rows, where there are few real keys.
+
+The patch normalizes the sink using the same effective scale as the QK
+accumulator. With soft-capped logits (or without fast exp2), it passes the final
+sink directly, matching the pipeline's transformed score units. The new
+no-prefix tests use distinct non-unit Q/K/V scales and positive and negative
+sink logits. They exercise both load modes and retain the original accuracy
+limits: FP8 atol/rtol 0.055 and relative L2 below 0.05; BF16 atol/rtol 0.02.
+
 ## Apply
 
 From the AITER root, starting with the clean pinned CK submodule:
 
 ```bash
 git submodule update --init 3rdparty/composable_kernel
-for patch in \
-  mimo_page64_qk192_v128_batch_prefill.patch \
-  batch_prefill_global_load_bounds.patch \
-  mimo_gfx942_bf16_linear_prefill.patch; do
-  git -C 3rdparty/composable_kernel apply --check < "patches/composable_kernel/$patch"
-  git -C 3rdparty/composable_kernel apply < "patches/composable_kernel/$patch"
-done
+git -C 3rdparty/composable_kernel apply --check \
+  < patches/composable_kernel/mimo_page64_qk192_v128_batch_prefill.patch
+git -C 3rdparty/composable_kernel apply \
+  < patches/composable_kernel/mimo_page64_qk192_v128_batch_prefill.patch
 ```
 
-If the page-64 patch is already applied, apply only patches 2 and 3. The native
-linear patch depends on patch 1. To remove patches, reverse this order.
+An already-patched checkout can use the reverse check below to confirm that
+the complete patch is present. The qualified working tree already contains
+these changes and needs no reapplication.
 
 The companion change in `aiter/ops/mha.py` gives generated modules the suffix
-`_gload_bounds_v1`, and the native linear module also includes its tile name.
+`_gload_bounds_v1_sink_descale_v1`, and native linear modules include their tile names.
 Old JIT shared objects therefore cannot hide a newly applied bounds fix or a
 different tile. Use the source patch and this Python companion together.
 
-## Correctness checks
+## Verify
 
 ```bash
-python3 -m pytest -q op_tests/test_batch_prefill_bounds.py
-python3 -m pytest -q \
-  'op_tests/test_batch_prefill_asymmetric.py::test_batch_prefill_qk192_v128[bf16-linear-True]' \
-  'op_tests/test_batch_prefill_asymmetric.py::test_batch_prefill_qk192_v128[bf16-vectorized-True]' \
-  op_tests/test_batch_prefill_asymmetric.py::test_batch_prefill_qk192_v128_bf16_vectorized_ragged_pages
+git -C 3rdparty/composable_kernel apply --reverse --check \
+  < patches/composable_kernel/mimo_page64_qk192_v128_batch_prefill.patch
+
+python3 -m pytest -q op_tests/test_mimo_fp8_linear_codegen.py
+python3 -m pytest -q op_tests/test_batch_prefill_bounds.py \
+  op_tests/test_batch_prefill_asymmetric.py
+AITER_MIMO_GFX942_LINEAR_TILE=generic AITER_MIMO_GFX942_FP8_LINEAR_TILE=generic \
+  python3 -m pytest -q op_tests/test_batch_prefill_bounds.py
 ```
 
 The bounds tests reserve unmapped guard pages immediately after K/V and force
-addresses that select `GLOBAL_LOAD_LDS`. They check the original failing shape,
-ragged tails, shuffled token indices, and other padded head widths against a
-sink-aware PyTorch reference. Each runs in a subprocess so GPU faults are
+addresses that select either `GLOBAL_LOAD_LDS` or `BUFFER_LOAD`. The 28 cases
+cover BF16/FP8, the original failing shape, ragged tails, shuffled token indices,
+and other padded head widths against a sink-aware PyTorch reference. No-prefix
+causal cases test sink normalization with and without logits soft capping.
+Each runs in a subprocess so GPU faults are
 reported as test failures and all HIP virtual mappings are released on exit.
 The helper needs ROCm headers/libraries and `g++`.
+
+Qualification on `quanta-ccs-aus-d05-03` passed **37/37** default GPU tests
+(28 guard cases plus nine existing API cases), **28/28** generic GPU tests and
+**9/9** CPU codegen tests. Full-causal FP8 with sinks passed in both load modes.
+Four profiler captures verify default D192/V128 64x64 and generic D256 dispatch
+with the requested global/buffer load enums. Test results, kernel symbols,
+source hashes and successful single-patch application/reversal checks are
+recorded in `tuning/gfx942_ck_qualification_20261021.json`.
+
+## Remove
+
+```bash
+git -C 3rdparty/composable_kernel apply --reverse \
+  < patches/composable_kernel/mimo_page64_qk192_v128_batch_prefill.patch
+```
 
 ## Tuning
 
@@ -101,9 +137,9 @@ done
 ```
 
 The benchmark validates every shape first, then reports the median of three
-100-ms CUDA-graph measurements. Guarded high addresses keep comparisons on the
-global-load path. `--padding-baseline` additionally measures Python K/V padding
-and copies with the selected kernel, if needed.
+100-ms CUDA-graph measurements. `--load-mode global` uses guarded high addresses;
+`--load-mode buffer` uses guarded low addresses. `--padding-baseline` additionally
+measures Python K/V padding and copies with the selected BF16 kernel, if needed.
 
 Results on MI325X / gfx942 (304 CUs), ROCm 7.2, BF16 SWA window 128, Q heads 16,
 KV heads 1, in microseconds:
@@ -137,24 +173,70 @@ Metrics and the local log path are recorded in
 `tuning/gfx942_server_regression_20261021.json`. This is the focused crash
 regression, not the complete long-context benchmark matrix.
 
-## FP8 LINEAR extension — GPU qualification pending
+## FP8 LINEAR tuning
 
-`mimo_gfx942_fp8_linear_prefill.patch` extends the three patches above with
-native gfx942 FP8 Q/K192–V128 LINEAR page-1 kernels. The contract is per-tensor
-Q/K/V descales, FP8 E4M3FNUZ inputs on gfx942, and BF16 output. BF16 and page-64
+The combined patch includes native gfx942 FP8 Q/K192–V128 LINEAR page-1
+kernels. The contract is per-tensor Q/K/V descales, FP8 E4M3FNUZ inputs on
+gfx942, and BF16 output. BF16 and page-64
 tuning retain their separate settings.
 
 `AITER_MIMO_GFX942_FP8_LINEAR_TILE` selects `64x64`, `64x96`, `64x128`,
 `128x64`, `128x96`, or `128x128`; `generic` selects the corrected D256 baseline.
-128x96 is the initial candidate, pending GPU measurements. The JIT module name
-includes this FP8 tile choice, independently of the BF16 tile setting.
+The measured default is **64x64**, with two waves. The JIT module name includes
+this FP8 tile choice, independently of the BF16 tile setting.
 
 All twelve native variants (six tiles, each with buffer and global loads)
-compile on gfx942, and nine CPU codegen checks pass. GPU accuracy and timing
-are pending while another workload holds the devices.
+passed runtime JIT and correctness checks on MI325X / gfx942, host
+`quanta-ccs-aus-d05-03`, PyTorch 2.9.1 / ROCm 7.2. Each tile and the corrected
+generic baseline passed all six benchmark workloads in both load modes:
+**84/84 cases**, with maximum absolute error 0.01975 and maximum relative L2
+error 2.52%. These measurements include the sink correction.
+
+Large-workload times in microseconds, median of three 100-ms graph runs:
+
+| FP8 tile | Global 32K / 64K | Global ragged 32K | Buffer 32K / 64K | Buffer ragged 32K |
+| --- | ---: | ---: | ---: | ---: |
+| generic | 509.09 | 507.97 | 473.10 | 479.28 |
+| **64x64** | **306.10** | **304.79** | **246.66** | **245.70** |
+| 64x96 | 385.08 | 382.38 | 287.58 | 285.41 |
+| 64x128 | 373.69 | 372.01 | 295.57 | 293.22 |
+| 128x64 | 343.28 | 341.69 | 312.28 | 309.41 |
+| 128x96 | 377.98 | 375.53 | 332.22 | 327.09 |
+| 128x128 | 336.47 | 334.20 | 301.02 | 293.34 |
+
+The ragged case uses Q `[3968,16384,12416]` and KV `[16384,16384,12416]`.
+64x64 minimizes time for all four large-workload comparisons: approximately
+40% less kernel time than generic with global loads and 48–49% less with buffer
+loads. It is not fastest on every small workload: for Q=512/KV=16384 with global
+loads, 64x64 takes 37.96 µs versus generic 34.18 µs and 128x128 32.08 µs. The
+default prioritizes MiMo's 32K prefill chunks; other tiles remain available.
+
+All per-case samples, accuracy metrics, patch hashes and environment details
+are in `tuning/gfx942_fp8_linear_20261021.json`. These are isolated kernel
+measurements. Full FP8 serving validation has not been run; the earlier BF16
+server regression above remains separate evidence.
 
 The benchmark accepts `--cache-dtype fp8` and `--load-mode global` or `buffer`.
 The guard helper supports both address bands, byte-accurate FP8 allocations,
 non-unit Q/K/V scales, ragged requests, and shuffled token indices. Accuracy is
 checked against dequantized FP8 inputs, with both elementwise tolerances and
 a relative L2 error limit of 5%.
+
+To reproduce the full FP8 sweep after building `guard.so` as above:
+
+```bash
+for mode in global buffer; do
+  for tile in generic 64x64 64x96 64x128 128x64 128x96 128x128; do
+    AITER_JIT_DIR=/tmp/aiter-ck-linear-tuning \
+    AITER_MIMO_GFX942_FP8_LINEAR_TILE="$tile" \
+      python3 op_tests/benchmark_mimo_ck_linear_prefill.py \
+        --library /tmp/ck-linear-results/guard.so --cache-dtype fp8 \
+        --load-mode "$mode" --window 128 \
+        --output "/tmp/ck-linear-results/fp8-$tile-$mode.json"
+  done
+done
+```
+
+Use normal asynchronous execution for timings (`HIP_LAUNCH_BLOCKING` unset).
+The benchmark preserves completed cases in its JSON output if a later case
+fails. Do not treat a partial file as a completed sweep.

@@ -64,9 +64,11 @@ def main():
         ]
         row = {
             "tile": os.getenv(
-                "AITER_MIMO_GFX942_FP8_LINEAR_TILE"
-                if ns.cache_dtype == "fp8"
-                else "AITER_MIMO_GFX942_LINEAR_TILE",
+                (
+                    "AITER_MIMO_GFX942_FP8_LINEAR_TILE"
+                    if ns.cache_dtype == "fp8"
+                    else "AITER_MIMO_GFX942_LINEAR_TILE"
+                ),
                 "default",
             ),
             "cache_dtype": ns.cache_dtype,
@@ -80,8 +82,9 @@ def main():
             **errors,
         }
         rows.append(row)
+        # Keep completed cases if a later candidate fails validation.
+        ns.output.write_text(json.dumps(rows, indent=2) + "\n")
         print(json.dumps(row), flush=True)
-    ns.output.write_text(json.dumps(rows, indent=2) + "\n")
 
 
 if __name__ == "__main__":
