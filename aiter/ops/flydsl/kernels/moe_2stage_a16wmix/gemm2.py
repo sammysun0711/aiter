@@ -592,13 +592,12 @@ def compile_gemm2_a16w4_port(
     _a_bytes = BM * KH_TILE_BYTES
     if _use_reduce:
         _lds_bytes = max(_a_bytes, BM * TILE_N * 2)
-    elif _fp8:
-        # The epilogue stages acc at LDS offset 0 after the K loop's final barrier,
-        # so the A tile and the f32 acc tile never coexist: max, not sum (gfx942 has
-        # 64 KiB; the sum overflows at bm128/tn128). bf16 keeps its historical sum.
-        _lds_bytes = max(_a_bytes, BM * TILE_N * 4)
     else:
-        _lds_bytes = _a_bytes + BM * TILE_N * 4
+        # The epilogue stages acc at LDS offset 0 only after the K loop's final barrier
+        # (the persistent loop re-barriers before the next tile's A store), so the A
+        # tile and the f32 acc tile never coexist: max, not sum. Halves LDS at
+        # bm64/tn128 (64 -> 32 KiB, 2 blocks/CU on gfx942) and makes bm64/tn256 fit.
+        _lds_bytes = max(_a_bytes, BM * TILE_N * 4)
 
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _ad_tag = "a8w4" if _fp8 else "a16w4"
