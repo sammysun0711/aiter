@@ -2359,7 +2359,6 @@ def _flydsl_moe_stage2_impl(
             _a8w4_args = dict(
                 a_dtype="fp8r",
                 a_scale=_a_scale,
-                b_exp=_a8w4_channel_exponents(w2, w2_scale),
                 flush_tiny=flush_tiny,
             )
         flydsl_a16w4_gemm2(

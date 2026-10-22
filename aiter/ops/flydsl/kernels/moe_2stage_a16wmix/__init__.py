@@ -222,7 +222,6 @@ def flydsl_a16w4_gemm2(
     epilog="atomic",
     a_dtype="bf16",
     a_scale=None,
-    b_exp=None,
     flush_tiny=False,
     stream=None,
 ):
@@ -235,8 +234,8 @@ def flydsl_a16w4_gemm2(
     modifier (0=cached, 2=nt), taken as-is (cached when unset).
 
     ``a_dtype="fp8r"`` (A8W4, gfx942): ``inter_sorted_bf16`` is instead the FP8-FNUZ
-    row-quantized intermediate, ``a_scale`` its [max_sorted] f32 row scale and ``b_exp``
-    the [E, D_HIDDEN] int32 ``a8w4.channel_exponents`` of W2.
+    row-quantized intermediate and ``a_scale`` its [max_sorted] f32 row scale; the
+    per-channel W2 exponent is derived in-kernel from ``w2_scale_u8``.
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
@@ -296,7 +295,7 @@ def flydsl_a16w4_gemm2(
         int(max_m_blocks),
         int(grid),
         flat_out.data_ptr(),
-        *((a_scale.data_ptr(), b_exp.data_ptr()) if a_dtype == "fp8r" else ()),
+        *((a_scale.data_ptr(),) if a_dtype == "fp8r" else ()),
         torch.cuda.current_stream() if stream is None else stream,
     )
     return flat_out
