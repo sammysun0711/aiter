@@ -550,7 +550,8 @@ class A8W4MoE:
         if c["port"]:
             if c["down_persist"] > 0:
                 grid2 = min(grid2, c["down_persist"])
-            # a16w4 port argument order; a_scale / b_exp are the two trailing fp8r args.
+            # a16w4 port argument order; gemm1 takes a_scale / b_exp as its two trailing
+            # fp8r args, gemm2 only a_scale (it derives the W2 exponent in-kernel).
             args1 = (a1.data_ptr(), p.w1.data_ptr(), p.s1.data_ptr(), se.data_ptr(), valid.data_ptr(),
                      si.data_ptr(), tokens, grid1, 0.0, 0.0, 0.0, 0.0, 0.0, mid.data_ptr(),
                      as1.data_ptr(), ex1.data_ptr(), stream)
@@ -560,7 +561,7 @@ class A8W4MoE:
                       if use_reduce else self.output)
             args2 = (a2.data_ptr(), p.w2.data_ptr(), p.s2.data_ptr(), se.data_ptr(), valid.data_ptr(),
                      si.data_ptr(), sw.data_ptr(), tokens, se.numel(), grid2, target.data_ptr(),
-                     as2.data_ptr(), ex2.data_ptr(), stream)
+                     as2.data_ptr(), stream)
             _run_compiled(self.g2, *args2)
             if use_reduce:
                 from ...moe_kernels import _run_moe_reduction

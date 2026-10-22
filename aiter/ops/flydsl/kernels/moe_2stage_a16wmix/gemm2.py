@@ -291,7 +291,6 @@ def _gemm2_body_a16w4(
     a_dtype="bf16",
     flush_tiny=False,
     arg_a_scale=None,
-    arg_b_exp=None,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
@@ -300,8 +299,9 @@ def _gemm2_body_a16w4(
 
     ``a_dtype="fp8r"`` (A8W4, gfx942): A is the FP8-FNUZ row-quantized intermediate
     (same sorted rows) + f32 per-sorted-row scale ``arg_a_scale``; W2 decodes to FP8
-    against ``arg_b_exp`` ([E, model_dim] int32). The accumulator is rescaled by
-    ``a_scale[row] * 2**(exp-132)`` before the routing weight / epilogue.
+    against each output channel's max e8m0 exponent, derived in-kernel from the W2
+    scales. The accumulator is rescaled by ``a_scale[row] * 2**(exp-132)`` before the
+    routing weight / epilogue.
     """
     _is_gfx942 = str(rocm_arch).startswith("gfx942")
     _fp8 = a_dtype == "fp8r"
@@ -375,12 +375,26 @@ def _gemm2_body_a16w4(
         for ni in range_constexpr(num_acc_n)
     ]
     if const_expr(_fp8):
-        # A8W4: per-output-channel max e8m0 exponent of this lane's W2 columns.
-        _exp_base = e * fx.Int32(N_OUT) + by_n + n_tile_base + lane_mod_16
-        exp_n = [
-            fx.Int32(_global_i32_at(arg_b_exp, _exp_base + fx.Int32(ni * 16)))
-            for ni in range_constexpr(num_acc_n)
-        ]
+        # A8W4: per-output-channel max e8m0 code over the whole K (= inter_dim) of this
+        # lane's W2 columns, derived here instead of a precomputed [E, N] table (no
+        # weight-keyed cache / extra kernel). A lane holds one 32-K group's scale per
+        # 128-K block (group lane_div_16); the 4 lanes of a column (xor 16 / 32) cover
+        # the rest. K is short (inter_dim), so this pre-pass is a few dword loads that
+        # the K loop re-reads from cache.
+        exp_n = []
+        for c in cols:
+            mx = None
+            for kt in range_constexpr(K_TILES_TOTAL):
+                sc = b_loader.load_scale(fx.Int32(kt * TILE_K), c)
+                for q in range_constexpr(k_unroll // 4):
+                    code = (fx.Float32(sc[q * 4]).bitcast(fx.Uint32) >> 23).to(
+                        fx.Int32
+                    )
+                    mx = code if mx is None else (code > mx).select(code, mx)
+            for off in (16, 32):
+                peer = mx.shuffle_xor(fx.Int32(off), fx.Int32(64))
+                mx = (peer > mx).select(peer, mx)
+            exp_n.append(mx)
 
     # ---- accumulators: accm[mi][ni] f32[4] (layout the atomic epilog expects) --
     acc_layout = fx.make_layout(4, 1)
@@ -537,9 +551,9 @@ def compile_gemm2_a16w4_port(
     per-XCD L2 locality (group = xcd_swizzle m-blocks).
 
     ``a_dtype="fp8r"`` = A8W4 (gfx942 only, LOSSY): A is the FP8-FNUZ row-quantized
-    intermediate, W2 must be mxfp4, and the kernel/launch take two extra pointers after
-    ``arg_out``: ``arg_a_scale`` ([sorted_size] f32) and ``arg_b_exp`` ([E, model_dim]
-    int32). bf16 kernels keep their exact signature.
+    intermediate, W2 must be mxfp4, and the kernel/launch take one extra pointer after
+    ``arg_out``: ``arg_a_scale`` ([sorted_size] f32). The per-channel W2 exponent is
+    derived in-kernel. bf16 kernels keep their exact signature.
     """
     assert a_dtype in (
         "bf16",
@@ -634,7 +648,6 @@ def compile_gemm2_a16w4_port(
         i32_max_m_blocks,
         arg_out,
         arg_a_scale,
-        arg_b_exp,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx_i32 = fx.Int32(gpu.thread_id("x"))
@@ -695,7 +708,6 @@ def compile_gemm2_a16w4_port(
                 a_dtype=a_dtype,
                 flush_tiny=flush_tiny,
                 arg_a_scale=arg_a_scale,
-                arg_b_exp=arg_b_exp,
             )
 
         if const_expr(persist):
@@ -728,7 +740,6 @@ def compile_gemm2_a16w4_port(
             i32_max_m_blocks: fx.Int32,
             arg_out: fx.Int64,
             arg_a_scale: fx.Int64,
-            arg_b_exp: fx.Int64,
         ):
             _gemm2_entry(
                 arg_a,
@@ -742,7 +753,6 @@ def compile_gemm2_a16w4_port(
                 i32_max_m_blocks,
                 arg_out,
                 arg_a_scale,
-                arg_b_exp,
             )
 
         @flyc.jit
@@ -759,7 +769,6 @@ def compile_gemm2_a16w4_port(
             i32_grid: fx.Int32,
             arg_out: fx.Int64,
             arg_a_scale: fx.Int64,
-            arg_b_exp: fx.Int64,
             stream: fx.Stream,
         ):
             grid_x = fx.Int64(i32_grid)
@@ -775,7 +784,6 @@ def compile_gemm2_a16w4_port(
                 i32_max_m_blocks,
                 arg_out,
                 arg_a_scale,
-                arg_b_exp,
                 value_attrs=(
                     {"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None
                 ),
@@ -807,7 +815,6 @@ def compile_gemm2_a16w4_port(
             i32_M,
             i32_max_m_blocks,
             arg_out,
-            None,
             None,
         )
 
