@@ -1635,7 +1635,10 @@ def fused_moe_1stage(
                     a1_scale is not None or quant_type == QuantType.No
                 ), "a1_scale must be provided for quantized input for fused_moe"
                 a1 = hidden_states
-                if quant_type == QuantType.per_1x128:
+                # The fused RMSNorm path already supplies column-major scales.
+                # Transposing these again scrambles scales across tokens and
+                # K groups in the one-stage prefill kernel.
+                if quant_type == QuantType.per_1x128 and not a1_scale_is_transposed:
                     if num_local_tokens is None:
                         scale_shape = a1_scale.shape
                         a1_scale = (
@@ -4907,6 +4910,22 @@ def ck_moe_stage1(
     dtype=None,
 ):
     token_num = hidden_states.shape[0]
+    if quant_type == QuantType.per_1x128 and splitk > 1 and not kernelName:
+        # CK's default blockscale GEMM uses up to 256 K elements per tile.
+        # KBatch=K/(splitk*KPerBlock) == 1 is its unsplit sentinel: it skips
+        # clearing the atomic output and uses the fused N stride even though
+        # the split-K specialization writes 2*N FP32 gate/up values. Avoid
+        # that case when the occupancy heuristic requests one tile per split.
+        k = hidden_states.shape[-1]
+        if k // splitk < 512:
+            splitk = next(
+                (
+                    candidate
+                    for candidate in range(splitk - 1, 1, -1)
+                    if k % (candidate * 256) == 0 and k // candidate >= 512
+                ),
+                0,
+            )
     is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
     if is_splitk:
         # CK kernel zeros this buffer via hipMemsetAsync when KBatch > 1

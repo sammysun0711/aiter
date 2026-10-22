@@ -92,6 +92,7 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
     ),
+    "mxfp4_to_fp8_128block": (".mxfp4_fp8", "mxfp4_to_fp8_128block"),
 }
 
 __all__ = [
@@ -118,6 +119,7 @@ __all__ = [
     "flydsl_qk_norm_rope_quant",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_supported",
+    "mxfp4_to_fp8_128block",
 ]
 
 
