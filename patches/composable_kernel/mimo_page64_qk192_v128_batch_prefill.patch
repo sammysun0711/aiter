@@ -1,5 +1,5 @@
 diff --git a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
-index b687cb976..663a6209e 100644
+index b687cb976124519f3e01623afa6cb598cabae887..48cca282c50bc6793ae9c5b8f9aa4e74ab63c775 100644
 --- a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
 +++ b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
 @@ -5,6 +5,7 @@ import copy
@@ -9,7 +9,7 @@ index b687cb976..663a6209e 100644
 +import os
  from pathlib import Path
  from typing import List, Optional, Tuple
- 
+
 @@ -234,7 +235,7 @@ FMHA_FWD_API_PER_DTYPE = """    {F_if}(t.data_type.compare(\"{F_dtype}\") == 0){
  {F_hdim_case}
      }}
@@ -32,10 +32,10 @@ index b687cb976..663a6209e 100644
 +        head_dims = (trait.hdim, trait.bn1)
 +        if head_dims not in self.pool[trait.dtype].keys():
 +            self.pool[trait.dtype][head_dims] = list()
- 
+
 -        self.pool[trait.dtype][trait.hdim].append(copy.copy(trait))
 +        self.pool[trait.dtype][head_dims].append(copy.copy(trait))
- 
+
      @property
      def api(self) -> str:
          per_dtypes = str()
@@ -49,7 +49,7 @@ index b687cb976..663a6209e 100644
                  inners = str()
                  for k, trait in enumerate(traits):
                      if_k = "if" if k == 0 else "else if"
-@@ -527,8 +534,22 @@ class FmhaFwdApiPool:
+@@ -527,8 +534,35 @@ class FmhaFwdApiPool:
                          F_kv_load_mode=KV_LOAD_MODE_ENUM_MAP[trait.use_global_load],
                      )
                  if_j = "if" if j == 0 else "else if"
@@ -67,16 +67,29 @@ index b687cb976..663a6209e 100644
 +                        "ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D && "
 +                        "t.page_size == 64"
 +                    )
++                    if any(
++                        t.kv_memory_layout == "linear" and t.page_size == 1
++                        for t in traits
++                    ):
++                        hdim_check = (
++                            f"t.hdim_q == 192 && t.hdim_v == {hdim_v} && "
++                            "t.kv_lookup_table == "
++                            "ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D && "
++                            "((t.kv_memory_layout == "
++                            "ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT && t.page_size == 64) || "
++                            "(t.kv_memory_layout == "
++                            "ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT && t.page_size == 1))"
++                        )
                  per_hdim_case = per_hdim_case + FMHA_FWD_API_PER_HDIM_CASE.format(
 -                    F_if=if_j, F_hdim=hdim, F_hdim_v=trait.bn1, F_inner_dispatch=inners
 +                    F_if=if_j, F_hdim_check=hdim_check, F_inner_dispatch=inners
                  )
              if_i = "if" if i == 0 else "else if"
              per_dtypes = per_dtypes + FMHA_FWD_API_PER_DTYPE.format(
-@@ -708,6 +729,143 @@ class FmhaFwdKernel:
+@@ -708,6 +742,159 @@ class FmhaFwdKernel:
          )
- 
- 
+
+
 +_MIMO_GFX950_D192_SEARCH_TILES = {
 +    (32, 96),
 +    (32, 128),
@@ -167,6 +180,14 @@ index b687cb976..663a6209e 100644
 +    )
 +
 +
++def _get_mimo_gfx942_bf16_linear_tile() -> FmhaFwdTileSize:
++    """Use the qualified 128x64 tile for MiMo's BF16 LINEAR fallback."""
++    return FmhaFwdTileSize(
++        128, 64, 32, 128, 32, 192, 4, 1, 1, 4, 1, 1,
++        32, 32, 16, 32, 32, 16, -1,
++    )
++
++
 +def _get_single_mimo_target(targets: Optional[List[str]]) -> Optional[str]:
 +    """Return the explicit MiMo target used by AITER's runtime JIT recipe."""
 +    if targets is None or len(targets) != 1:
@@ -177,6 +198,14 @@ index b687cb976..663a6209e 100644
 +    if target.startswith("gfx942"):
 +        return "gfx942"
 +    return None
++
++
++def _get_mimo_gfx942_fp8_linear_tile() -> FmhaFwdTileSize:
++    """Use the qualified 64x64 tile for MiMo's FP8 LINEAR fallback."""
++    return FmhaFwdTileSize(
++        64, 64, 32, 128, 32, 192, 2, 1, 1, 2, 1, 1,
++        32, 32, 32, 32, 32, 32, -1,
++    )
 +
 +
 +def _get_mimo_d192_tiles(
@@ -217,7 +246,7 @@ index b687cb976..663a6209e 100644
  class KernelComponentFactory:
      @staticmethod
      def get_hdim_tile_size_dict(dtype: str) -> Optional[dict]:
-@@ -818,6 +976,18 @@ def get_fwd_blobs(
+@@ -818,6 +1005,18 @@ def get_fwd_blobs(
      has_non_gfx9 = targets is not None and any(
          not t.startswith("gfx9") for t in targets
      )
@@ -235,8 +264,8 @@ index b687cb976..663a6209e 100644
 +        )
      # TODO: we don't support tuning yet, so pick up one value for vlayout/pipeline/pad
      #       support this in future
- 
-@@ -831,11 +1001,25 @@ def get_fwd_blobs(
+
+@@ -831,11 +1030,25 @@ def get_fwd_blobs(
          d = CustomFactory.get_hdim_tile_size_dict(dtype)
          if d is None:
              continue
@@ -262,25 +291,36 @@ index b687cb976..663a6209e 100644
              for tile, pipeline in itertools.product(
                  tiles, CustomFactory.get_pipelines(dtype, hdim, receipt, mask_impl)
              ):
-@@ -858,12 +1042,39 @@ def get_fwd_blobs(
+@@ -858,12 +1071,50 @@ def get_fwd_blobs(
                  ):
                      continue
- 
+
 -                # Generate kernels for both page_size=16 and page_size=1024
 -                for page_size in SUPPORTED_PAGE_SIZE:
-+                # Keep the tuned head-192 specialization exact: page-64,
-+                # vectorized SGLang cache only.  Other page/layout/table
-+                # combinations continue to use the padded head-256 kernels.
-+                # Besides avoiding a broad JIT-matrix expansion, the tuned
-+                # tile is not compile-valid for page-64 LINEAR_LAYOUT.
++                # D192 covers page-64 vectorized KV and gfx942 BF16/FP8 page-1
++                # LINEAR KV. Other contracts retain the D256 fallback. The
++                # linear family uses fixed tiles, independently of page-64.
 +                page_sizes = SUPPORTED_PAGE_SIZE
 +                if hdim == 192:
-+                    if (
-+                        pipeline.F_kv_memory_layout != "vectorized"
-+                        or pipeline.F_kv_lookup_table != "sglang"
-+                    ):
++                    if pipeline.F_kv_lookup_table != "sglang":
 +                        continue
-+                    page_sizes = [64]
++                    if pipeline.F_kv_memory_layout == "vectorized":
++                        page_sizes = [64]
++                    elif (
++                        mimo_target == "gfx942"
++                        and dtype in ("bf16", "fp8bf16")
++                        and tile.F_bn1 == 128
++                        and pipeline.F_kv_memory_layout == "linear"
++                    ):
++                        page_sizes = [1]
++                        if dtype == "bf16":
++                            tile = _get_mimo_gfx942_bf16_linear_tile()
++                        else:
++                            if pipeline.F_qscale != "pertensor":
++                                continue
++                            tile = _get_mimo_gfx942_fp8_linear_tile()
++                    else:
++                        continue
 +                elif (
 +                    mimo_target is not None
 +                    and dtype in ("bf16", "fp8bf16")
@@ -304,3 +344,91 @@ index b687cb976..663a6209e 100644
                      if pipeline.F_qscale == "kv_blockscale" and page_size < tile.F_bn0:
                          continue
                      k = FmhaFwdKernel(
+diff --git a/include/ck_tile/core/tensor/tile_scatter_gather.hpp b/include/ck_tile/core/tensor/tile_scatter_gather.hpp
+index 52817f9226f4d4d9f250f423e980a0a2e9502386..5c7fc9364f50278144c18b02ac64e537676b246e 100644
+--- a/include/ck_tile/core/tensor/tile_scatter_gather.hpp
++++ b/include/ck_tile/core/tensor/tile_scatter_gather.hpp
+@@ -523,8 +523,17 @@ struct tile_scatter_gather
+                             static_cast<long_index_t>(physical_page) * page_stride_elements_ +
+                             coord_offset + page_offset;
+                         const auto* addr = base_ptr + total_offset;
+-                        vector_t v;
+-                        __builtin_memcpy(&v, addr, sizeof(vector_t));
++                        bool is_valid = coordinate_has_valid_offset_assuming_top_index_is_valid(
++                            get_bottom_tensor_view().get_tensor_descriptor(),
++                            bottom_tensor_thread_coord);
++                        if constexpr(!std::is_same_v<ValidArray, std::nullptr_t>)
++                            is_valid &= valids_[idx_gather];
++                        // Flat loads have no SRD bounds checks. In particular,
++                        // padded V-head columns must contribute zero rather
++                        // than read the next row (or past the allocation).
++                        vector_t v{};
++                        if(is_valid)
++                            __builtin_memcpy(&v, addr, sizeof(vector_t));
+                         return v;
+                     }
+                     else if constexpr(std::is_same_v<ValidArray, std::nullptr_t>)
+@@ -763,7 +772,25 @@ struct tile_scatter_gather
+                     const auto* addr = base_ptr + total_offset;
+                     // global_load_lds takes a byte address; addr (const DataType*)
+                     // converts implicitly to const void*, no explicit cast needed.
+-                    async_global_load_lds_dwordxn<vector_size>(smem, addr, pre_nop_);
++                    bool is_valid = coordinate_has_valid_offset_assuming_top_index_is_valid(
++                        get_bottom_tensor_view().get_tensor_descriptor(),
++                        bottom_tensor_thread_coord);
++                    if constexpr(!std::is_same_v<ValidArray, std::nullptr_t>)
++                        is_valid &= valids_[idx_gather];
++                    if(is_valid)
++                    {
++                        async_global_load_lds_dwordxn<vector_size>(smem, addr, pre_nop_);
++                    }
++                    else
++                    {
++                        // Skipping a load leaves stale LDS data. A zero-length
++                        // SRD issues the same async LDS transfer but guarantees
++                        // hardware zero fill, even for a KV allocation >2 GiB.
++                        // Its LDS layout and aligned M0 match the global path.
++                        const auto zero_resource = make_wave_buffer_resource(nullptr, 0);
++                        amd_async_buffer_load_with_oob_raw<uint32_t, vector_size>(
++                            reinterpret_cast<uint32_t*>(smem), zero_resource, 0, 0, pre_nop_);
++                    }
+                 }
+                 else if constexpr(std::is_same_v<ValidArray, std::nullptr_t>)
+                 {
+diff --git a/include/ck_tile/ops/fmha/kernel/fmha_batch_prefill_kernel.hpp b/include/ck_tile/ops/fmha/kernel/fmha_batch_prefill_kernel.hpp
+index cab9ee5944da37354b355e2aa51a28e6e56804e0..d895fdf889d5d9fddd864b545f203b848ea3f51f 100644
+--- a/include/ck_tile/ops/fmha/kernel/fmha_batch_prefill_kernel.hpp
++++ b/include/ck_tile/ops/fmha/kernel/fmha_batch_prefill_kernel.hpp
+@@ -755,10 +755,6 @@ struct FmhaBatchPrefillWithPagedKVCacheKernel
+         long_index_t batch_offset_randval = 0;
+         long_index_t batch_offset_lse     = 0;
+         long_index_t batch_offset_o       = 0;
+-        const float sink_value =
+-            kargs.sink_ptr != nullptr
+-                ? (*(static_cast<const float*>(kargs.sink_ptr) + i_nhead)) / kargs.scale_s
+-                : -numeric<float>::infinity();
+         // WA i_batch capture structure binding before c++20
+         const index_t seqlen_k = [&, i_batch_ = i_batch]() {
+             if constexpr(kKVLookupTable ==
+@@ -1239,6 +1235,21 @@ struct FmhaBatchPrefillWithPagedKVCacheKernel
+             }
+         }();
+
++        // sink_ptr contains final, unscaled softmax logits. The pipeline keeps
++        // its running maximum in QK accumulator units unless logits have already
++        // been transformed. Use the effective scale, including FP8 Q/K descales,
++        // so the virtual sink does not acquire those descales a second time.
++        const float sink_value = [&] {
++            if(kargs.sink_ptr == nullptr)
++                return -numeric<float>::infinity();
++            const float sink = *(static_cast<const float*>(kargs.sink_ptr) + i_nhead);
++#if CK_TILE_FMHA_FWD_FAST_EXP2
++            if constexpr(!kHasLogitsSoftCap)
++                return sink / variant_params.sm_scale;
++#endif
++            return sink;
++        }();
++
+         BlockIndices block_indices{i_batch, i_nhead, i_nhead / kargs.nhead_ratio_qk};
+
+         const index_t stride_k_for_pipeline =
