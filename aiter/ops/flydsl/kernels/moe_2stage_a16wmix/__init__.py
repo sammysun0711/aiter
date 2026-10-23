@@ -37,6 +37,15 @@ __all__ = [
 ]
 
 
+def a8w4_gemm1_kwargs(flush_tiny=False):
+    """Extra ``compile_gemm1_a16w4_port`` kwargs of the moe_kernels A8W4 (fp8r) gemm1.
+
+    Fixed to the tuned build: runtime K loop + swizzled A-LDS (unroll was slowest at
+    every shape, and the swizzle removes the fp8 A-LDS read bank conflicts).
+    """
+    return dict(a_dtype="fp8r", a_swizzle=True, flush_tiny=flush_tiny, k_loop="runtime")
+
+
 # gfx942 (CDNA3) lacks K=32 mfma_f32_16x16x32_bf16 + v_cvt_pk_bf16_f32 -> K=16 MFMA +
 # scalar dequant fallback; gfx950 (CDNA4) uses the K=32 path. compile_gemm{1,2}_a16w4_port
 # are @functools.cache'd, so building through them directly (all-keyword) shares one
@@ -72,6 +81,10 @@ def flydsl_a16w4_gemm1(
     swiglu_limit=float("inf"),
     w_dtype="fp4",
     w_layout="standard",
+    a_dtype="bf16",
+    a_scale=None,
+    b_exp=None,
+    flush_tiny=False,
     stream=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage1: gate+up GEMM + SiLU -> bf16 intermediate.
@@ -97,6 +110,11 @@ def flydsl_a16w4_gemm1(
     the W-load cache modifier (0=cached, 2=nt), taken as-is (nt when unset).
 
     ``situ_beta``/``situ_linear_beta`` (SiTUv2 only) are runtime f32 scalars (nothing baked).
+
+    ``a_dtype="fp8r"`` (A8W4, gfx942): ``a_bf16`` is instead the FP8-FNUZ row-quantized
+    A from ``a8w4.quantize_rows``, with ``a_scale`` its [n_tokens] f32 row scale and
+    ``b_exp`` the [E, 2*D_INTER] int32 ``a8w4.channel_exponents`` of W1. Built with the
+    runtime K loop and swizzled A-LDS; ``flush_tiny`` is the optional extra approximation.
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm1 only supports k_batch=1, got {k_batch}")
@@ -124,6 +142,7 @@ def flydsl_a16w4_gemm1(
             f"a16w4 gemm1 requires D_INTER % TILE_N({TILE_N}) == 0, got D_INTER={D_INTER}"
         )
 
+    _fp8r = a_dtype == "fp8r"
     launch = compile_gemm1_a16w4_port(
         BM=BM,
         D_HIDDEN=D_HIDDEN,
@@ -139,7 +158,8 @@ def flydsl_a16w4_gemm1(
         w_dtype=w_dtype,
         w_layout=w_layout,
         k_wave=k_wave,
-        use_k16="gfx95" not in str(get_rocm_arch()),
+        rocm_arch=str(get_rocm_arch()),
+        **(a8w4_gemm1_kwargs(flush_tiny) if _fp8r else {}),
     )
     max_m_blocks = int(sorted_expert_ids.numel())
     grid = gemm1_a16w4_grid(BM, INTER=D_INTER, TILE_N=TILE_N, max_m_blocks=max_m_blocks)
@@ -168,6 +188,7 @@ def flydsl_a16w4_gemm1(
         1.0 / _lbeta,
         float(swiglu_limit),
         inter_sorted_bf16.data_ptr(),
+        *((a_scale.data_ptr(), b_exp.data_ptr()) if _fp8r else ()),
         torch.cuda.current_stream() if stream is None else stream,
     )
     return inter_sorted_bf16
@@ -199,6 +220,9 @@ def flydsl_a16w4_gemm2(
     w_dtype="fp4",
     persist=None,
     epilog="atomic",
+    a_dtype="bf16",
+    a_scale=None,
+    flush_tiny=False,
     stream=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage2 (down-proj). Consumes the bf16 [sorted_size,
@@ -208,6 +232,10 @@ def flydsl_a16w4_gemm2(
     rocdl.waves_per_eu, ``b_nt`` -> W-load cache modifier, ``xcd_swizzle`` -> XCD/HBM
     grid remap. ``k_batch`` for parity (must be 1). ``b_nt`` is the W-load cache
     modifier (0=cached, 2=nt), taken as-is (cached when unset).
+
+    ``a_dtype="fp8r"`` (A8W4, gfx942): ``inter_sorted_bf16`` is instead the FP8-FNUZ
+    row-quantized intermediate and ``a_scale`` its [max_sorted] f32 row scale; the
+    per-channel W2 exponent is derived in-kernel from ``w2_scale_u8``.
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
@@ -246,9 +274,10 @@ def flydsl_a16w4_gemm2(
         waves_per_eu=waves_per_eu,
         w_dtype=w_dtype,
         persist=_persist,
-        use_k16="gfx95" not in str(get_rocm_arch()),
+        rocm_arch=str(get_rocm_arch()),
         epilog=epilog,
         topk=topk,
+        **(dict(a_dtype="fp8r", flush_tiny=flush_tiny) if a_dtype == "fp8r" else {}),
     )
     grid = gemm2_a16w4_grid(
         BM, N_OUT=D_HIDDEN, TILE_N=TILE_N, max_m_blocks=max_m_blocks, persist=_persist
@@ -266,6 +295,7 @@ def flydsl_a16w4_gemm2(
         int(max_m_blocks),
         int(grid),
         flat_out.data_ptr(),
+        *((a_scale.data_ptr(),) if a_dtype == "fp8r" else ()),
         torch.cuda.current_stream() if stream is None else stream,
     )
     return flat_out

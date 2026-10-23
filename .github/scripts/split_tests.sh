@@ -98,6 +98,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_jit_dir_with_enum.py]=64
     FILE_TIMES[op_tests/test_topk_plain.py]=63
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=61
+    FILE_TIMES[op_tests/test_flydsl_moe_a16wfp4.py]=75
     FILE_TIMES[op_tests/test_flydsl_compress_attn.py]=58
     FILE_TIMES[op_tests/test_gdn_prepare.py]=58
     FILE_TIMES[op_tests/test_pa_ps.py]=57

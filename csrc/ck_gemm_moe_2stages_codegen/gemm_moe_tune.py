@@ -50,7 +50,7 @@ from aiter.jit.core import (
     AITER_ROOT_DIR,
     get_asm_dir,
 )
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num, get_lds_capacity_bytes
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
@@ -60,8 +60,10 @@ from aiter.ops.flydsl.moe_kernels import (
     flydsl_moe_stage1,
     flydsl_moe_stage2,
     get_flydsl_stage1_kernels,
+    get_flydsl_stage1_kernels_a8w4,
     get_flydsl_stage1_kernels_int4_bf16,
     get_flydsl_stage2_kernels,
+    get_flydsl_stage2_kernels_a8w4,
     get_flydsl_stage2_kernels_int4_bf16,
     get_flydsl_stage2_v2_kernels,
 )
@@ -114,7 +116,6 @@ TUNE_MOE_EXPERT_BALANCE = (
 
 COS_DIFF_THRESHOLD = 1e-1
 
-
 def _parse_tuning_type(value):
     if isinstance(value, (torch.dtype, ActivationType, QuantType)):
         return value
@@ -137,6 +138,26 @@ def _parse_tuning_type(value):
     if not isinstance(parsed, (torch.dtype, ActivationType, QuantType)):
         raise ValueError(f"unsupported tuning type: {value!r}")  # noqa: TRY004
     return parsed
+
+
+def _check_lossy_tune_file(tune_file):
+    """--a8w4-gfx942 results are lossy: refuse a table aiter auto-merges at runtime.
+
+    get_config_file merges configs/tuned_fmoe.csv with model_configs/*tuned_fmoe*.csv
+    (non-recursive), so e.g. model_configs/lossy/ is safe and opt-in via
+    AITER_CONFIG_FMOE.
+    """
+    out = os.path.realpath(tune_file)
+    configs = os.path.realpath(f"{AITER_ROOT_DIR}/aiter/configs")
+    parent, name = os.path.dirname(out), os.path.basename(out)
+    if (parent == configs and name == "tuned_fmoe.csv") or (
+        parent == os.path.join(configs, "model_configs") and "tuned_fmoe" in name
+    ):
+        raise ValueError(
+            f"--a8w4-gfx942 writes lossy A8W4 configs; {tune_file} is auto-merged "
+            "into the default fmoe table. Use a non-merged path, e.g. "
+            "aiter/configs/model_configs/lossy/<model>_a8w4_tuned_fmoe.csv"
+        )
 
 
 def _a16w_sorted_cos(ref, res, msg="", printLog=True):
@@ -446,6 +467,7 @@ _GEN_DATA_1STAGE_KEYS = [
 
 
 class FmoeTuner(TunerCommon):
+    _a8w4_gfx942 = False  # set from --a8w4-gfx942 in tune()
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "verbose": False,
@@ -819,6 +841,7 @@ class FmoeTuner(TunerCommon):
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
             k_wave=kparams.get("k_wave", 1),
+            flush_tiny=kparams.get("flush_tiny", False),
         )
         if isinstance(result, tuple):
             out_raw = result[0]
@@ -897,8 +920,10 @@ class FmoeTuner(TunerCommon):
 
         # a16w-mix (bf16 activation) stage2 consumes a SORTED bf16 intermediate; the
         # tuner feeds the pre-sorted a2 ("a2_a16w_sorted", built once in generate_data,
-        # not per timed iter) and no inter-stage act scale.
-        if kparams["a_dtype"] == "bf16":
+        # not per timed iter) and no inter-stage act scale. A8W4 (fp8r) consumes the
+        # same bf16 intermediate and row-quantizes it inside the launcher.
+        _fp8r = kparams["a_dtype"] == "fp8r"
+        if kparams["a_dtype"] == "bf16" or _fp8r:
             a2_scale = None
 
         return flydsl_moe_stage2(
@@ -924,6 +949,15 @@ class FmoeTuner(TunerCommon):
             b_nt=kparams.get("b_nt", 0),
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
+            # A8W4 names carry _w{n}/_ftz, which the runtime wrapper forwards too.
+            **(
+                dict(
+                    waves_per_eu=kparams.get("waves_per_eu", None),
+                    flush_tiny=kparams.get("flush_tiny", False),
+                )
+                if _fp8r
+                else {}
+            ),
         )
 
     @staticmethod
@@ -3495,6 +3529,134 @@ class FmoeTuner(TunerCommon):
         flydsl_s2_kernels = get_flydsl_stage2_kernels(
             a_dtype_str, b_dtype_str, out_dtype_str
         )
+        filter_names = [
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_w2_xcd1",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x256_atomic_bnt2",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x256_atomic_bnt2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x256_w3_xcd4_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x128_atomic_persist",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x128_atomic_bnt2_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x192x128_w2_bnt0",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x128_atomic_bnt2_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w2_bnt0_xcd4_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x128_atomic_bnt2_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_w3_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_w2_xcd4",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x128_atomic_bnt2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_bnt0_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x256x128_atomic",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x128_w4_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x256_kw4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x128_atomic_bnt2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_bnt0_xcd1_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x32x256_xcd1_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_xcd1",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x128_atomic",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x256_w4_bnt0",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x128_w4_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w2_xcd1_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x256_atomic_bnt2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x256_atomic_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x256_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w4_bnt0_xcd4_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_bnt0_kw4",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x128_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_w4_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x256x128_bnt0_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x192x256_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x256_w4_bnt0_xcd1_kw4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x192x128_w2_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x192x128_bnt0_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x64x256_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_w4_bnt0",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x128x256_w2_xcd1",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x256_atomic_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x256_w2_xcd1_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x256_atomic_persist",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x128_atomic",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x256_xcd4",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x256_atomic_xcd4_persist",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x256_atomic",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x64x256_xcd4_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w2_bnt0_kw4",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x128_atomic_bnt2_xcd4",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x256_atomic_bnt2_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w3_bnt0_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x128_atomic_bnt2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w3_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x128x128_xcd4",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x128_atomic_xcd4",
+            "flydsl_moe2_abf16_wfp4_bf16_t32x128x128_atomic_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x128_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w4_bnt0_xcd1_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x128_atomic_xcd4_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x64x256_xcd1_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x128x256_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w3_bnt0_xcd1_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_w4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x256_w2_xcd1_kw4",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x128x128_w4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x256_w3_xcd1_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x128_atomic",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x128x128_atomic_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x64x128_bnt0",
+            "flydsl_moe1_abf16_wfp4_bf16_t32x64x128_w4_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w2_bnt0_kw2",
+            "flydsl_moe2_abf16_wfp4_bf16_t16x256x256_atomic_bnt2_persist",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_bnt0_xcd4_kw2",
+            "flydsl_moe1_abf16_wfp4_bf16_t16x32x128_w4_xcd1_kw2",
+            # BM=64 family (gemm1 t64x128x256 beats t32 at large token; gemm2 viable
+            # since its bf16 LDS is max(A, acc)).
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_bnt0",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_bnt0_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_bnt0_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w2",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w2_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w2_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w2_bnt0",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w2_bnt0_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w2_bnt0_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w3",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w3_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w3_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w3_bnt0",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w3_bnt0_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w3_bnt0_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w4",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w4_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w4_xcd4",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w4_bnt0",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w4_bnt0_xcd1",
+            "flydsl_moe1_abf16_wfp4_bf16_t64x128x256_w4_bnt0_xcd4",
+            "flydsl_moe2_abf16_wfp4_bf16_t64x128x256_atomic",
+            "flydsl_moe2_abf16_wfp4_bf16_t64x128x256_atomic_xcd4",
+            "flydsl_moe2_abf16_wfp4_bf16_t64x128x256_atomic_bnt2",
+            "flydsl_moe2_abf16_wfp4_bf16_t64x128x256_atomic_bnt2_xcd4",
+        ]
+        flydsl_s1_kernels = {k:v for k,v in flydsl_s1_kernels.items() if k in filter_names}
+        flydsl_s2_kernels = {k:v for k,v in flydsl_s2_kernels.items() if k in filter_names}        
+        # --a8w4-gfx942: the lossy A8W4 port kernels (afp8r) share the a16w4 contract
+        # (bf16 in, sorted bf16 mid, atomic out), so they compete in the same bf16
+        # shape and can pair freely with abf16 kernels of the same blockM.
+        if (
+            self._a8w4_gfx942
+            and a_dtype_str == "bf16"
+            and b_dtype_str == "fp4"
+            and out_dtype_str == "bf16"
+            and str(_gfx).startswith("gfx942")
+        ):
+            flydsl_s1_kernels = {
+                **flydsl_s1_kernels,
+                **get_flydsl_stage1_kernels_a8w4(out_dtype_str),
+            }
+            flydsl_s2_kernels = {
+                **flydsl_s2_kernels,
+                **get_flydsl_stage2_kernels_a8w4(out_dtype_str),
+            }
 
         for blockM in blockMs:
             # 16 included: a16w4/a8w4 emit t16 names, s1_tile_m drops the rest.
@@ -3531,6 +3693,9 @@ class FmoeTuner(TunerCommon):
                     # Match the kernel assert; a floor divide lets tile_n=96 through.
                     if kparams["tile_n"] % (16 * _n_waves) != 0:
                         continue
+                # A8W4 gemm1 rejects a TILE_N that does not divide inter_dim.
+                if kparams["a_dtype"] == "fp8r" and inter_dim % kparams["tile_n"]:
+                    continue
 
                 # (kernel_name, kparams, is_fp4, is_fp8)
                 # out_dtype encodes fused quant type: "fp4" or "fp8"
@@ -3699,10 +3864,14 @@ class FmoeTuner(TunerCommon):
                 #  - LDS is tile_m*(tile_k*2 + tile_n*4); over 160 KiB the build fails;
                 #  - tile_k must divide inter_dim (K); tile_k=256 on non-256 inter
                 #    (e.g. 384) is parsed verbatim by the wrapper -> OOB/wrong out.
-                _s2_lds = s2_tile_m * (kparams["tile_k"] * 2 + kparams["tile_n"] * 4)
+                _s2_lds = s2_tile_m * max(kparams["tile_k"] * 2, kparams["tile_n"] * 4)
+                _s2_fp8r = kparams["a_dtype"] == "fp8r"
+                if _s2_fp8r:
+                    # fp8 A tile and the f32 epilogue tile never coexist: max, not sum.
+                    _s2_lds = s2_tile_m * max(kparams["tile_k"], kparams["tile_n"] * 4)
                 if a_dtype_str == "bf16" and (
                     s2_tile_m != blockM
-                    or _s2_lds > 160 * 1024
+                    or _s2_lds > get_lds_capacity_bytes()
                     or inter_dim % kparams["tile_k"] != 0
                 ):
                     continue
@@ -3711,6 +3880,9 @@ class FmoeTuner(TunerCommon):
 
                 s2_ref_kwargs = {}
                 s2_compare_fn = None
+                if _s2_fp8r:
+                    # Lossy fp8 A: judge by cosine like the other quantized paths.
+                    s2_compare_fn = cosine_diff_compare
                 if a_dtype_str == "fp8":
                     s2_compare_fn = cosine_diff_compare
                     s2_ref_args = (
@@ -4560,9 +4732,18 @@ class FmoeTuner(TunerCommon):
             # kernel weight layout match (else outputs are uncorrelated).
             # Source of truth: aiter/fused_moe.py q_dtype_a selection.
             eff_q_dtype_a = q_dtype_a
+            # gfx942 Silu: fused_moe runs a16w4 (bf16 activation) and the
+            # FlyDSL gfx942 backend (incl. a8w4) expects SEPARATED gate/up W1.
+            gfx942_mxfp4 = (
+                q_type == QuantType.per_1x32
+                and q_dtype_w == dtypes.fp4x2
+                and get_gfx_runtime() == "gfx942"
+            )
             if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
                 if act_type == ActivationType.Swiglu:
                     eff_q_dtype_a = dtypes.bf16 if token < 256 else dtypes.fp4x2
+                elif gfx942_mxfp4:
+                    eff_q_dtype_a = dtypes.bf16
                 else:
                     eff_q_dtype_a = dtypes.fp4x2
             shape_str = (
@@ -4673,8 +4854,9 @@ class FmoeTuner(TunerCommon):
                     # a16w4 / a8w4 (16-bit or fp8 activation, fp4 weight): the
                     # weight layout follows the *config* activation dtype, not the
                     # runtime-effective one (mirror op_tests/test_moe_2stage.py).
-                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
-                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+                    gate_up = not gfx942_mxfp4
+                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, gate_up)
+                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, gate_up)
                     w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
                     w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
                 elif (
@@ -4918,6 +5100,9 @@ class FmoeTuner(TunerCommon):
         args,
     ):
         mp_num = args.mp
+        self._a8w4_gfx942 = bool(getattr(args, "a8w4_gfx942", False))
+        if self._a8w4_gfx942:
+            _check_lossy_tune_file(self.get_out_file(args.tune_file))
         blockMs = [16, 32, 64, 128]
         keys = self.keys
         tasks = []
@@ -4947,9 +5132,7 @@ class FmoeTuner(TunerCommon):
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
-            if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
-                print(f"{q_type} is not supported on {get_gfx()}")
-                return []
+
             if not use_g1u1:
                 print("no moe solution(g1u0) can tune for ", line)
                 continue

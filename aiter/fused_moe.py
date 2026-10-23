@@ -773,8 +773,9 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
         # a16w4 (bf16 A x mxfp4 W) down-proj only supports atomic scatter into a
         # pre-zeroed buffer; the ported gemm2 launcher ignores the kernelName's
         # mode, so a "reduce"-named a16w4 config must still get accumulate=True
-        # sorting (moe_buf zeroed). Treat any a16w4 stage2 as atomic here.
-        if parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") == "fp4":
+        # sorting (moe_buf zeroed). Treat any a16w4 stage2 as atomic here; A8W4
+        # (a_dtype "fp8r") rides the same port and is registered atomic-only.
+        if parsed.get("b_dtype") == "fp4" and parsed.get("a_dtype") in ("bf16", "fp8r"):
             return False
         return parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
@@ -1215,6 +1216,8 @@ def _fused_moe_impl(
                 q_dtype_a = dtypes.bf16
             else:
                 q_dtype_a = dtypes.fp8
+        elif activation == ActivationType.Silu and get_gfx() == "gfx942":
+            q_dtype_a = dtypes.bf16
         else:
             q_dtype_a = dtypes.fp4x2
 
@@ -1988,6 +1991,7 @@ def _flydsl_stage1_wrapper(
         k_wave=parsed.get("k_wave", 1),
         pipeline_phases=parsed.get("pipeline_phases", 4),
         v2_output_layout=v2_output_layout,
+        flush_tiny=parsed.get("flush_tiny", False),
     )
 
 
@@ -2079,6 +2083,7 @@ def _flydsl_stage2_wrapper(
         expert_mask=expert_mask,
         topk_ids=topk_ids,
         atomic_token_capacity=atomic_token_capacity,
+        flush_tiny=parsed.get("flush_tiny", False),
     )
 
 
@@ -4062,7 +4067,7 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and (
-                activation in (ActivationType.Swiglu, ActivationType.Situv2)
+                activation in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Silu)
                 or gate_mode == GateMode.INTERLEAVE
             )
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
@@ -4331,7 +4336,7 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation in (ActivationType.Swiglu, ActivationType.Situv2)
+            and activation in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Silu)
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
