@@ -126,6 +126,8 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
 
 
 class AITER_CONFIG(object):
+    _cache_dir = "/tmp/aiter_configs"
+
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
         return self.get_config_file(
@@ -215,7 +217,10 @@ class AITER_CONFIG(object):
                 f"when merging '{merge_name}'."
             )
 
-        _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
+        _FILL_DEFAULTS = {
+            "xbf16": 0, "run_1stage": 0, "ksplit": 0,
+            "_tag": "", "source_tokens": -1,
+        }
         all_cols = list(source_pairs[0][1].columns)
         for _, df in source_pairs[1:]:
             for c in df.columns:
@@ -253,7 +258,15 @@ class AITER_CONFIG(object):
             if "gfx" in merge_df.columns and "gfx" not in keys:
                 keys.append("gfx")
             dedup_keys = keys + ["_tag"] if has_tag else keys
-            duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
+            identity = merge_df[dedup_keys]
+            if merge_name == "tuned_fmoe":
+                from aiter.utility.moe_config import (
+                    check_fmoe_fixture_conflicts, fmoe_config_identity,
+                )
+
+                identity = fmoe_config_identity(merge_df, keys)
+                check_fmoe_fixture_conflicts(merge_df, identity)
+            duplicated_mask = identity.duplicated(keep=False)
             if duplicated_mask.any():
                 dup_count = int(duplicated_mask.sum())
                 dup_rows = merge_df[duplicated_mask].sort_values(dedup_keys)
@@ -267,8 +280,8 @@ class AITER_CONFIG(object):
 
                 # Auto-dedup: globally determine best row (lowest 'us') per shape
                 best_row_index = set(
-                    merge_df.sort_values("us", kind="stable")
-                    .drop_duplicates(subset=dedup_keys, keep="first")
+                    identity.loc[merge_df.sort_values("us", kind="stable").index]
+                    .drop_duplicates(keep="first")
                     .index
                 )
 
@@ -302,7 +315,7 @@ class AITER_CONFIG(object):
             )
         from pathlib import Path
 
-        config_path = Path("/tmp/aiter_configs/")
+        config_path = Path(self._cache_dir)
         if not config_path.exists():
             config_path.mkdir(parents=True, exist_ok=True)
         new_file_path = f"{config_path}/{merge_name}.csv"

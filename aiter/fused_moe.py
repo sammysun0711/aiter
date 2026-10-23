@@ -241,11 +241,30 @@ def get_inter_dim(w1_shape, w2_shape):
 
 
 def _try_flydsl_ep_decode_fp8_block128_gfx950(
-    hidden_states, w1, w2, topk_weight, topk_ids, expert_mask,
-    activation, quant_type, doweight_stage1, w1_scale, w2_scale,
-    a1_scale, a1_scale_is_transposed, a2_scale, num_local_tokens,
-    dtype, hidden_pad, intermediate_pad, bias1, bias2, swiglu_limit,
-    gate_mode, num_tokens_before_dispatch,
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    expert_mask,
+    activation,
+    quant_type,
+    doweight_stage1,
+    w1_scale,
+    w2_scale,
+    a1_scale,
+    a1_scale_is_transposed,
+    a2_scale,
+    num_local_tokens,
+    dtype,
+    hidden_pad,
+    intermediate_pad,
+    bias1,
+    bias2,
+    swiglu_limit,
+    gate_mode,
+    num_tokens_before_dispatch,
+    block_size_M,
 ):
     if not _USE_FLYDSL_MOE_EP_DECODE_FP8_BLOCK128_GFX950:
         return None
@@ -254,33 +273,100 @@ def _try_flydsl_ep_decode_fp8_block128_gfx950(
     gate_mode = GateMode(gate_mode)
     dtype = hidden_states.dtype if dtype is None else dtype
     if not (
-        hidden_states.is_cuda and get_gfx() == "gfx950"
-        and (num_tokens_before_dispatch is None or num_tokens_before_dispatch >= 4)
-        and expert_mask is not None and num_local_tokens is not None
-        and quant_type == QuantType.per_1x128 and activation == ActivationType.Silu
+        hidden_states.is_cuda
+        and get_gfx() == "gfx950"
+        and expert_mask is not None
+        and num_local_tokens is not None
+        and quant_type == QuantType.per_1x128
+        and activation == ActivationType.Silu
         and dtype == dtypes.bf16
-        and hidden_states.dtype == dtypes.fp8 and w1.dtype == dtypes.fp8 and w2.dtype == dtypes.fp8
+        and hidden_states.dtype == dtypes.fp8
+        and w1.dtype == dtypes.fp8
+        and w2.dtype == dtypes.fp8
         and (getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False))
-        and hidden_states.ndim == 2 and w1.ndim == 3 and w2.ndim == 3
+        and hidden_states.ndim == 2
+        and w1.ndim == 3
+        and w2.ndim == 3
+        and isinstance(topk_ids, torch.Tensor)
+        and topk_ids.ndim == 2
+        and isinstance(expert_mask, torch.Tensor)
         and w1.shape[1] == 2 * w2.shape[2]
-        and not a1_scale_is_transposed and a1_scale is not None
-        and w1_scale is not None and w2_scale is not None and a2_scale is None
-        and not doweight_stage1 and not hidden_pad and not intermediate_pad
-        and bias1 is None and bias2 is None and not swiglu_limit
-        and gate_mode == GateMode.SEPARATED and hidden_states.shape[0] <= 2048
+        and not a1_scale_is_transposed
+        and a1_scale is not None
+        and w1_scale is not None
+        and w2_scale is not None
+        and a2_scale is None
+        and not doweight_stage1
+        and not hidden_pad
+        and not intermediate_pad
+        and bias1 is None
+        and bias2 is None
+        and not swiglu_limit
+        and gate_mode == GateMode.SEPARATED
+        and hidden_states.shape[0] <= 2048
     ):
+        return None
+    if num_tokens_before_dispatch is not None and (
+        not isinstance(num_tokens_before_dispatch, int)
+        or num_tokens_before_dispatch < 0
+    ):
+        return None
+    if w2.shape[0] == 0:
         return None
     from aiter.ops.flydsl.moe_ep_decode_fp8_block128_gfx950 import (
-        fused_moe_ep_decode_fp8_block128_gfx950, is_supported_ep_decode_fp8_block128_gfx950_input,
+        fused_moe_ep_decode_fp8_block128_gfx950,
+        is_supported_ep_decode_fp8_block128_gfx950_input,
     )
-    args = (hidden_states, w1, w2, topk_ids, topk_weight, a1_scale,
-            w1_scale, w2_scale, expert_mask, num_local_tokens)
+    from dataclasses import replace
+    from aiter.ops.flydsl.kernels.moe_ep_decode_fp8_block128_gfx950.configuration import (
+        default_config,
+        OutputMode,
+        lookup_profile,
+    )
+
+    args = (
+        hidden_states,
+        w1,
+        w2,
+        topk_ids,
+        topk_weight,
+        a1_scale,
+        w1_scale,
+        w2_scale,
+        expert_mask,
+        num_local_tokens,
+    )
+    config = lookup_profile(
+        AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
+        get_cu_num(),
+        hidden_states.shape[0],
+        hidden_states.shape[1],
+        w2.shape[2],
+        w2.shape[0],
+        expert_mask.numel(),
+        topk_ids.shape[1],
+        num_tokens_before_dispatch,
+    )
+    if block_size_M is not None:
+        if block_size_M not in (16, 32, 64):
+            return None
+        # Do not silently ignore the public AITER tile override. A tuned profile
+        # is usable only if it has the requested M; otherwise use default stages.
+        if config is None or config.block_m != block_size_M:
+            config = replace(
+                default_config(
+                    num_tokens_before_dispatch, topk_ids.shape[1], w2.shape[0]
+                ),
+                block_m=block_size_M,
+                output=OutputMode.ATOMIC if block_size_M == 16 else OutputMode.PARTIAL,
+            )
     if not is_supported_ep_decode_fp8_block128_gfx950_input(
-        *args, num_tokens_before_dispatch=num_tokens_before_dispatch
+        *args, num_tokens_before_dispatch=num_tokens_before_dispatch, config=config
     ):
         return None
-    return fused_moe_ep_decode_fp8_block128_gfx950(*args, num_tokens_before_dispatch=num_tokens_before_dispatch)
-
+    return fused_moe_ep_decode_fp8_block128_gfx950(
+        *args, num_tokens_before_dispatch=num_tokens_before_dispatch, config=config
+    )
 
 def fused_moe(
     hidden_states,
@@ -456,7 +542,7 @@ def fused_moe_(
             activation, quant_type, doweight_stage1, w1_scale, w2_scale,
             a1_scale, a1_scale_is_transposed, a2_scale, num_local_tokens,
             dtype, hidden_pad, intermediate_pad, bias1, bias2, swiglu_limit,
-            gate_mode, num_tokens_before_dispatch,
+            gate_mode, num_tokens_before_dispatch, block_size_M,
         )
         if result is not None:
             return result
@@ -1080,8 +1166,9 @@ def get_2stage_cfgs(
         import pandas as pd
 
         df = pd.read_csv(tune_file)
-        if "_tag" in df.columns:
-            df = df[df["_tag"].fillna("") == ""]
+        from aiter.utility.moe_config import fmoe_config_tags
+
+        df = df[fmoe_config_tags(df).eq("")]
 
         # Primary dict: keep original act_type for exact-match lookup.
         df_primary = df.copy()

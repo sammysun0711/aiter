@@ -5,12 +5,14 @@ import pytest
 import torch
 
 fc = pytest.importorskip("flydsl.compiler")
-if not torch.cuda.is_available() or not torch.cuda.get_device_properties(0).gcnArchName.startswith(
-    "gfx950"
-):
+if not torch.cuda.is_available() or not torch.cuda.get_device_properties(
+    0
+).gcnArchName.startswith("gfx950"):
     pytest.skip("The block-FP8 EP backend requires gfx950", allow_module_level=True)
 
-from aiter.ops.flydsl.kernels.moe_ep_decode_fp8_block128_gfx950.sort import local_sort_launcher
+from aiter.ops.flydsl.kernels.moe_ep_decode_fp8_block128_gfx950.sort import (
+    local_sort_launcher,
+)
 
 
 @pytest.mark.parametrize(
@@ -20,9 +22,15 @@ from aiter.ops.flydsl.kernels.moe_ep_decode_fp8_block128_gfx950.sort import loca
         (1024, 8, 384, 48, 16, 1024),
         (96, 8, 384, 48, 32, 0),
         (1024, 1, 1024, 64, 32, 0),
+        (2048, 8, 384, 48, 32, 0),
+        (2048, 8, 384, 48, 16, 1024),
     ],
 )
-def test_routes_mask_count_and_clear(capacity, topk, global_e, local_e, block, hidden):
+@pytest.mark.parametrize("route_masks", [False, True])
+@pytest.mark.parametrize("reuse_metadata", [False, True])
+def test_routes_mask_count_and_clear(
+    capacity, topk, global_e, local_e, block, hidden, route_masks, reuse_metadata
+):
     torch.manual_seed(1234)
     device = torch.device("cuda", 0)
     ids = torch.randint(global_e, (capacity, topk), device=device, dtype=torch.int32)
@@ -34,8 +42,12 @@ def test_routes_mask_count_and_clear(capacity, topk, global_e, local_e, block, h
     maximum = capacity * topk + local_e * block
     sorted_ids = torch.empty(maximum, device=device, dtype=torch.int32)
     sorted_weights = torch.empty(maximum, device=device)
-    sorted_experts = torch.empty((maximum + block - 1) // block, device=device, dtype=torch.int32)
-    valid = torch.empty(2, device=device, dtype=torch.int32)
+    sorted_experts = torch.empty(
+        (maximum + block - 1) // block, device=device, dtype=torch.int32
+    )
+    valid = torch.empty(
+        2 + (capacity if route_masks else 0), device=device, dtype=torch.int32
+    )
     output = torch.full((capacity, hidden), 3.0, device=device, dtype=torch.bfloat16)
     args = [
         t.view(-1)
@@ -51,9 +63,20 @@ def test_routes_mask_count_and_clear(capacity, topk, global_e, local_e, block, h
             output,
         )
     ] + [torch.cuda.current_stream(device)]
-    launcher = local_sort_launcher(capacity, topk, global_e, local_e, block, hidden, device.index)
+    launcher = local_sort_launcher(
+        capacity,
+        topk,
+        global_e,
+        local_e,
+        block,
+        hidden,
+        device.index,
+        reuse_metadata=reuse_metadata,
+        route_masks=route_masks,
+    )
     compiled = fc.compile[{}](
-        launcher, *[fc.from_torch_tensor(t) if isinstance(t, torch.Tensor) else t for t in args]
+        launcher,
+        *[fc.from_torch_tensor(t) if isinstance(t, torch.Tensor) else t for t in args]
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -72,20 +95,34 @@ def test_routes_mask_count_and_clear(capacity, topk, global_e, local_e, block, h
         expected, counts = [], [0] * local_e
         for row in range(n):
             for slot in range(topk):
-                expert, weight = int(route_ids[row, slot]), float(route_weights[row, slot])
+                expert, weight = int(route_ids[row, slot]), float(
+                    route_weights[row, slot]
+                )
                 if expert in mapping and weight != 0:
                     local = mapping[expert]
                     expected.append((local, row | (slot << 24), weight))
                     counts[local] += 1
         padded = sum((value + block - 1) // block * block for value in counts)
-        assert valid.tolist() == [padded, n]
+        assert valid[:2].tolist() == [padded, n]
+        if route_masks:
+            expected_masks = [0] * n
+            for _, packed, _ in expected:
+                expected_masks[packed & 0xFFFFFF] |= 1 << (packed >> 24)
+            assert valid[2 : 2 + n].tolist() == expected_masks
         sids, sw, se = (
             sorted_ids[:padded].cpu(),
             sorted_weights[:padded].cpu(),
             sorted_experts[: padded // block].cpu(),
         )
+        if reuse_metadata:
+            for descriptor in se.tolist():
+                expert = descriptor & 0xFFFF
+                assert descriptor >> 16 == int(counts[expert] >= block + 8)
+            se = se & 0xFFFF
         actual = [
-            (int(se[i // block]), int(sids[i]), float(sw[i])) for i in range(padded) if sw[i] != 0
+            (int(se[i // block]), int(sids[i]), float(sw[i]))
+            for i in range(padded)
+            if sw[i] != 0
         ]
         assert sorted(actual) == sorted(expected)
         assert sids[sw == 0].eq(capacity).all()

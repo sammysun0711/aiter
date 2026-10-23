@@ -5,13 +5,19 @@ import pytest
 import torch
 
 pytest.importorskip("flydsl")
-if (
-    not torch.cuda.is_available()
-    or not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx950")
-):
+if not torch.cuda.is_available() or not torch.cuda.get_device_properties(
+    0
+).gcnArchName.startswith("gfx950"):
     pytest.skip("The block-FP8 EP kernel requires gfx950", allow_module_level=True)
 
-from aiter.ops.flydsl.moe_ep_decode_fp8_block128_gfx950 import fused_moe_ep_decode_fp8_block128_gfx950
+from aiter.ops.flydsl.kernels.moe_ep_decode_fp8_block128_gfx950.configuration import (
+    Stage1,
+    OutputMode,
+    WeightCache,
+)
+from aiter.ops.flydsl.moe_ep_decode_fp8_block128_gfx950 import (
+    fused_moe_ep_decode_fp8_block128_gfx950,
+)
 from aiter.ops.shuffle import shuffle_weight
 
 FP8 = torch.float8_e4m3fn
@@ -69,7 +75,21 @@ def assert_close(actual, expected):
         (6144, 2048, 8),
     ],
 )
-@pytest.mark.parametrize("source_hint", [None, 8])
+@pytest.mark.parametrize(
+    "source_hint",
+    [
+        None,
+        8,
+        "scalar_projection",
+        "tiled_projection",
+        "reuse_cache",
+        "m16_reduce",
+        "m32_atomic",
+        "m64_projection",
+        "auto_fused",
+        "auto_projection",
+    ],
+)
 def test_dynamic_count_mask_and_padding(
     hidden, intermediate, topk, source_hint, monkeypatch
 ):
@@ -95,9 +115,64 @@ def test_dynamic_count_mask_and_padding(
     mask[[0, 2, 5, 11]] = 1
     count = torch.zeros(1, device="cuda", dtype=torch.int32)
 
+    from aiter.ops.flydsl.moe_ep_decode_fp8_block128_gfx950 import MoeConfig
+
+    config = None
+    if source_hint in ("auto_fused", "auto_projection"):
+        projection = source_hint == "auto_projection"
+        source_hint = None
+        config = MoeConfig(
+            stage1=Stage1.SEPARATE_FP8_QUANT if projection else Stage1.FUSED_FP8_QUANT,
+            stage1_cache=WeightCache.ADAPTIVE,
+            stage2_cache=(WeightCache.STREAM if projection else WeightCache.ADAPTIVE),
+            down_adaptive_m=True,
+        )
+    if source_hint == "m64_projection":
+        source_hint = None
+        config = MoeConfig(
+            block_m=64,
+            stage1_n=128,
+            stage1=Stage1.SEPARATE_FP8_QUANT_TRANSPOSED,
+            quant_tiled=True,
+            down_adaptive_m=True,
+        )
+    if source_hint in ("m16_reduce", "m32_atomic"):
+        atomic = source_hint == "m32_atomic"
+        source_hint = None
+        config = MoeConfig(
+            block_m=32 if atomic else 16,
+            output=(OutputMode.ATOMIC if atomic else OutputMode.PARTIAL),
+        )
+    if source_hint in ("scalar_projection", "tiled_projection"):
+        tiled = source_hint == "tiled_projection"
+        source_hint = None
+        config = MoeConfig(
+            stage1_n=128, stage1=Stage1.SEPARATE_FP8_QUANT_TRANSPOSED, quant_tiled=tiled
+        )
+
+    if source_hint == "reuse_cache":
+        source_hint = None
+        config = MoeConfig(
+            stage2_n=128,
+            stage1_cache=WeightCache.CACHE,
+            stage2_cache=WeightCache.ADAPTIVE,
+            down_adaptive_m=True,
+        )
+
     def run():
         return fused_moe_ep_decode_fp8_block128_gfx950(
-            x, w1, w2, ids, weights, scale, s1, s2, mask, count, source_hint
+            x,
+            w1,
+            w2,
+            ids,
+            weights,
+            scale,
+            s1,
+            s2,
+            mask,
+            count,
+            source_hint,
+            config=config,
         )
 
     # Compile with no received rows, then exercise positive counts in the same graph.
@@ -125,31 +200,156 @@ def test_dynamic_count_mask_and_padding(
             assert_close(output[:n], expected)
 
 
-def test_all_local_topk_atomic_accumulation():
-    """Exercise eight local contributions per token, beyond typical EP8 load."""
+@pytest.mark.parametrize("projection_m", [None, 32, 64])
+def test_all_local_topk_graph_counts(projection_m):
+    """Exercise hot routes and every M16 tail boundary in the captured graph."""
     torch.manual_seed(4321)
     experts, hidden, intermediate, capacity, topk = 8, 1024, 128, 64, 8
-    w1, s1, ref_w1 = quantize_weights(torch.randn(experts, 2 * intermediate, hidden, device="cuda") * .04)
-    w2, s2, ref_w2 = quantize_weights(torch.randn(experts, hidden, intermediate, device="cuda") * .04)
+    w1, s1, ref_w1 = quantize_weights(
+        torch.randn(experts, 2 * intermediate, hidden, device="cuda") * 0.04
+    )
+    w2, s2, ref_w2 = quantize_weights(
+        torch.randn(experts, hidden, intermediate, device="cuda") * 0.04
+    )
     x = torch.randn(capacity, hidden, device="cuda").to(FP8)
-    scale = torch.rand(capacity, hidden // 128, device="cuda") + .1
+    scale = torch.rand(capacity, hidden // 128, device="cuda") + 0.1
     ids = torch.arange(experts, device="cuda", dtype=torch.int32).repeat(capacity, 1)
     weights = torch.rand(capacity, topk, device="cuda")
     weights /= weights.sum(-1, keepdim=True)
-    mask = torch.ones(experts, device="cuda", dtype=torch.int32)
+    mask = torch.zeros(2 * experts, device="cuda", dtype=torch.int32)
+    mask[:experts] = 1
     count = torch.tensor([capacity], device="cuda", dtype=torch.int32)
+    from aiter.ops.flydsl.moe_ep_decode_fp8_block128_gfx950 import MoeConfig
+
+    config = (
+        None
+        if projection_m is None
+        else MoeConfig(
+            block_m=projection_m,
+            stage1_n=128,
+            stage1=Stage1.SEPARATE_FP8_QUANT_TRANSPOSED,
+            output=OutputMode.ATOMIC if projection_m == 16 else OutputMode.PARTIAL,
+            quant_tiled=True,
+            down_adaptive_m=True,
+        )
+    )
 
     def run():
-        return fused_moe_ep_decode_fp8_block128_gfx950(x, w1, w2, ids, weights, scale, s1, s2, mask, count, 4)
+        return fused_moe_ep_decode_fp8_block128_gfx950(
+            x, w1, w2, ids, weights, scale, s1, s2, mask, count, 4, config=config
+        )
 
     run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = run()
-    for n in [capacity, 17, 0, capacity]:
+    for n in [capacity, 49, 48, 33, 32, 17, 16, 1, 0, capacity]:
         count.fill_(n)
         graph.replay()
         torch.cuda.synchronize()
         if n:
-            expected = reference(x[:n], scale[:n], ref_w1, ref_w2, ids[:n], weights[:n], mask)
+            expected = reference(
+                x[:n], scale[:n], ref_w1, ref_w2, ids[:n], weights[:n], mask
+            )
+            assert_close(output[:n], expected)
+
+
+def test_singleton_expert_descriptor_bounds():
+    """The last packed expert descriptor must be read within its one-word bounds."""
+    from aiter.ops.flydsl.moe_ep_decode_fp8_block128_gfx950 import MoeConfig
+
+    torch.manual_seed(765)
+    hidden, intermediate, experts = 1024, 128, 2
+    w1, s1, ref_w1 = quantize_weights(
+        torch.randn(experts, 2 * intermediate, hidden, device="cuda") * 0.04
+    )
+    w2, s2, ref_w2 = quantize_weights(
+        torch.randn(experts, hidden, intermediate, device="cuda") * 0.04
+    )
+    x = torch.randn(1, hidden, device="cuda").to(FP8)
+    scale = torch.ones(1, hidden // 128, device="cuda")
+    ids = torch.tensor([[1]], device="cuda", dtype=torch.int32)
+    weights = torch.ones(1, 1, device="cuda")
+    mask = torch.zeros(2 * experts, device="cuda", dtype=torch.int32)
+    mask[:experts] = 1
+    count = torch.ones(1, device="cuda", dtype=torch.int32)
+    config = MoeConfig(stage2_n=128, stage2_cache=WeightCache.ADAPTIVE)
+    output = fused_moe_ep_decode_fp8_block128_gfx950(
+        x, w1, w2, ids, weights, scale, s1, s2, mask, count, config=config
+    )
+    expected = reference(x, scale, ref_w1, ref_w2, ids, weights, mask)
+    assert_close(output, expected)
+
+
+@pytest.mark.parametrize(
+    "block_m,workers,adaptive,reuse,force_opus",
+    [
+        (16, 1, False, False, False),
+        (32, 0, False, False, False),
+        (32, 1, False, False, False),
+        (64, 1, False, False, False),
+        (32, 1, True, False, False),
+        (64, 1, True, False, False),
+        (32, 1, True, True, False),
+        (64, 1, True, True, False),
+        (32, 1, True, True, True),
+    ],
+)
+def test_parallel_n_shared_peaks_graph_replay(
+    block_m, workers, adaptive, reuse, force_opus, monkeypatch
+):
+    """Exercise padded M tails and reuse of the shared maxima by worker loops."""
+    from aiter.ops.flydsl.moe_ep_decode_fp8_block128_gfx950 import MoeConfig
+
+    if force_opus:
+        from aiter.ops.flydsl import moe_ep_decode_fp8_block128_gfx950 as backend
+
+        monkeypatch.setattr(backend, "_use_local_sort", lambda *args: False)
+
+    torch.manual_seed(910)
+    capacity, experts, hidden, intermediate, topk = 1024, 8, 1024, 512, 8
+    config = MoeConfig(
+        block_m=block_m,
+        stage1_workers=workers,
+        stage2_n=128,
+        stage2_workers=4,
+        stage1=Stage1.FUSED_FP8_QUANT_PARALLEL,
+        stage1_cache=WeightCache.CACHE,
+        stage2_cache=WeightCache.ADAPTIVE if reuse else WeightCache.CACHE,
+        output=OutputMode.ATOMIC if block_m == 16 else OutputMode.PARTIAL,
+        down_adaptive_m=adaptive,
+    )
+    w1, s1, ref_w1 = quantize_weights(
+        torch.randn(experts, 2 * intermediate, hidden, device="cuda") * 0.04
+    )
+    w2, s2, ref_w2 = quantize_weights(
+        torch.randn(experts, hidden, intermediate, device="cuda") * 0.04
+    )
+    x = torch.randn(capacity, hidden, device="cuda").to(FP8)
+    scale = torch.rand(capacity, hidden // 128, device="cuda") + 0.1
+    ids = torch.arange(experts, device="cuda", dtype=torch.int32).repeat(capacity, 1)
+    weights = torch.rand(capacity, topk, device="cuda")
+    weights /= weights.sum(-1, keepdim=True)
+    mask = torch.zeros(2 * experts, device="cuda", dtype=torch.int32)
+    mask[:experts] = 1
+    count = torch.tensor([capacity], device="cuda", dtype=torch.int32)
+
+    def run():
+        return fused_moe_ep_decode_fp8_block128_gfx950(
+            x, w1, w2, ids, weights, scale, s1, s2, mask, count, config=config
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run()
+    for n in [capacity, 33, 0, 513, capacity]:
+        count.fill_(n)
+        scale.mul_(0.9)
+        graph.replay()
+        torch.cuda.synchronize()
+        if n:
+            expected = reference(
+                x[:n], scale[:n], ref_w1, ref_w2, ids[:n], weights[:n], mask
+            )
             assert_close(output[:n], expected)

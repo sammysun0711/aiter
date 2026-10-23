@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""GPU implementation of the gfx950 EP decode FP8 Block128 MoE.
+"""EP decode FP8 Block128 kernels.
 
-Execution order: sort -> stage1_gate_up -> stage2_down -> optional reduce.
-stage1_gate_up contains fused and split first-stage alternatives.
-common contains only shared low-level primitives.
-The public host entry lives one level above kernels/.
+Execution: sort -> stage1 -> stage2_down -> optional reduce.
+Stage 1 is either fused_fp8_quant (one GEMM/SiLU/FP8-quant kernel) or
+separate_fp8_quant (GEMM to FP32 workspace, then SiLU/FP8-quant). Shared arithmetic and the routing ABI live in common.py;
+configuration.py owns canonical host choices and AITER CSV decoding.
 """
