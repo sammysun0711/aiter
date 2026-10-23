@@ -286,7 +286,10 @@ class TunerCommon:
                             "tflops" if "tflops" in all_cols else all_cols[-1]
                         )
                         all_cols.insert(all_cols.index(insert_before), c)
-            _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
+            _FILL_DEFAULTS = {
+                "xbf16": 0, "run_1stage": 0, "ksplit": 0,
+                "_tag": "", "source_tokens": -1,
+            }
             for j in range(len(df_list)):
                 for c in all_cols:
                     if c not in df_list[j].columns:
@@ -297,11 +300,17 @@ class TunerCommon:
         if "_tag" in merge_df.columns:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
             dedup_keys = self.keys + ["_tag"]
-        merge_df = (
-            merge_df.sort_values("us")
-            .drop_duplicates(subset=dedup_keys, keep="first")
-            .reset_index(drop=True)
-        )
+        if self.ARG_DEFAULTS.get("config_env_name") == "AITER_CONFIG_FMOE":
+            from aiter.utility.moe_config import (
+                check_fmoe_fixture_conflicts, fmoe_config_identity,
+            )
+
+            identity = fmoe_config_identity(merge_df, self.keys)
+            check_fmoe_fixture_conflicts(merge_df, identity)
+        else:
+            identity = merge_df[dedup_keys]
+        keep = identity.loc[merge_df.sort_values("us").index].drop_duplicates().index
+        merge_df = merge_df.loc[keep].reset_index(drop=True)
         pid = os.getpid()
         new_file_path = f"/tmp/{merge_name}.{pid}.csv"
         merge_df.to_csv(new_file_path, index=False)
@@ -432,10 +441,13 @@ class TunerCommon:
         if "_tag" in tunedf.columns:
             tunedf["_tag"] = tunedf["_tag"].fillna("")
             dedup_keys = self.keys + ["_tag"]
-        tunedf = tunedf.drop_duplicates(
-            subset=dedup_keys,
-            keep="last",
-        )
+        if self.ARG_DEFAULTS.get("config_env_name") == "AITER_CONFIG_FMOE":
+            from aiter.utility.moe_config import fmoe_config_identity
+
+            identity = fmoe_config_identity(tunedf, self.keys)
+            tunedf = tunedf.loc[~identity.duplicated(keep="last")]
+        else:
+            tunedf = tunedf.drop_duplicates(subset=dedup_keys, keep="last")
         tunedf.to_csv(tune_file, index=False)
 
     def get_cu_num(self):
@@ -1061,13 +1073,22 @@ class TunerCommon:
         self._emit_report_lines(lines, report_file)
 
     def _merge_compare_filtered_results(self, base_file, candidate_file, comparison):
+        # Keep rows owned by other FMoE tuners when applying a filtered update.
         old_df = self.get_tuned_gemm_list(base_file)
+        all_old = old_df
+        other_rows = all_old.iloc[0:0]
+        if self.ARG_DEFAULTS.get("config_env_name") == "AITER_CONFIG_FMOE":
+            from aiter.utility.moe_config import fmoe_config_tags
+
+            all_old = TunerCommon.get_tuned_gemm_list(self, base_file)
+            owned_tags = set(fmoe_config_tags(old_df))
+            other_rows = all_old.loc[~fmoe_config_tags(all_old).isin(owned_tags)]
         if not os.path.exists(candidate_file):
-            return old_df
+            return all_old
 
         candidate_df = self.get_tuned_gemm_list(candidate_file)
         if comparison is None or comparison.empty:
-            return old_df
+            return all_old
 
         improved_keys = set(
             comparison.loc[comparison["update"], self.keys]
@@ -1076,7 +1097,7 @@ class TunerCommon:
             .tolist()
         )
         if not improved_keys:
-            return old_df
+            return all_old
 
         def key_mask(df):
             if df.empty:
@@ -1093,7 +1114,7 @@ class TunerCommon:
         merged = merged.drop_duplicates(subset=dedup_keys, keep="last").reset_index(
             drop=True
         )
-        return merged
+        return pd.concat([merged, other_rows], ignore_index=True)
 
     def _run_config_for_shapes(self, args, shapes_df, config_file=None):
         original_untunedf = self.untunedf

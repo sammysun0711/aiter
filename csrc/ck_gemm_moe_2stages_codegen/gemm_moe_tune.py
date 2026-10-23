@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import sys
+
 import torch
 import aiter
 import pandas as pd
 import os
-import sys
 from aiter import QuantType
 from aiter.jit.core import (
     get_asm_dir,
@@ -43,6 +44,7 @@ from aiter.jit.utils.chip_info import get_gfx
 import torch.nn.functional as F
 from einops import rearrange
 from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.moe_config import fmoe_config_tags
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 
@@ -62,7 +64,6 @@ if is_flydsl_available():
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
 
-torch.set_default_device("cuda")
 torch.int4 = getattr(torch, "int4", torch.uint32)
 
 
@@ -187,6 +188,14 @@ class FmoeTuner(TunerCommon):
             required=False,
             help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
         )
+
+    def get_tuned_gemm_list(self, tuned_gemm_file, columns=None):
+        frame = super().get_tuned_gemm_list(tuned_gemm_file, columns or [])
+        return frame.loc[fmoe_config_tags(frame).isin(("", FLYDSL_FALLBACK_TAG))].copy()
+
+    def get_untuned_gemm_list(self, untuned_gemm_file):
+        frame = super().get_untuned_gemm_list(untuned_gemm_file)
+        return frame.loc[fmoe_config_tags(frame).isin(("", FLYDSL_FALLBACK_TAG))].copy()
 
     @staticmethod
     def weight_quant(
@@ -3471,7 +3480,10 @@ class FmoeTuner(TunerCommon):
             return rets
 
     def result_to_csv(self, results, file, concat=False):
-        old_tunedf = self.get_tuned_gemm_list(file)
+        old_tunedf = super().get_tuned_gemm_list(file)
+        native_rows = fmoe_config_tags(old_tunedf).isin(("", FLYDSL_FALLBACK_TAG))
+        other_backends = old_tunedf.loc[~native_rows].copy()
+        old_tunedf = old_tunedf.loc[native_rows].copy()
 
         for col in self.columns:
             if col not in old_tunedf.columns:
@@ -3526,6 +3538,7 @@ class FmoeTuner(TunerCommon):
         resultdf = resultdf.astype(str).drop_duplicates(
             subset=self.keys + ["_tag"], keep="last"
         )
+        resultdf = pd.concat([resultdf, other_backends], ignore_index=True)
         resultdf.to_csv(file, index=False)
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
@@ -4259,7 +4272,15 @@ if __name__ == "__main__":
         "tflops",
         "bw",
     ]
-    tuner = FmoeTuner("fmoeTuner", key, resultList, "fmoe tuner")
+    if "--ep-fp8-flydsl" in sys.argv:
+        from csrc.ck_gemm_moe_2stages_codegen.flydsl_ep_fp8_tune import EpFp8FlydslTuner
+
+        tuner = EpFp8FlydslTuner()
+    else:
+        # Native fixtures use implicit CUDA allocations. Keep this CLI-specific
+        # setting out of imports and the EP tuner's explicit-device fixtures.
+        torch.set_default_device("cuda")
+        tuner = FmoeTuner("fmoeTuner", key, resultList, "fmoe tuner")
     args = tuner.parse_args()
 
     tuner.run(args, False)

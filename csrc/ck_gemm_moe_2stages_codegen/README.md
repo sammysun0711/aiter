@@ -215,3 +215,100 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 - Supported quantization types include: per_Token, per_1x128 (blockscale), per_1x32 (MXFP4, gfx950 only)
 - If you use flag `PREBUILD_KERNELS=1` when you install aiter, it will build moe kernels in tuned csv by default. If you want to use the new result of moe tuning, please remove `build` and `*.so` in `aiter/jit` first, then re-install aiter after finishing tune. This can take a lot of time and is not recommended.
 
+
+## FlyDSL EP FP8 Block128 tuning on gfx950
+
+`--ep-fp8-flydsl` selects the EP tuner through the same entry point as the
+native MoE tuner. It searches this backend's complete local MoE pipeline and
+saves the lowest-latency numerically valid configuration. ASM and old-kernel
+comparisons belong in separate benchmarks.
+
+Defaults are under `aiter/configs/`:
+
+- Input: `flydsl_ep_decode_fp8_block128_gfx950_untuned_fmoe.csv`
+- Output: `flydsl_ep_decode_fp8_block128_gfx950_tuned_fmoe.csv` (created by tuning)
+
+`token` is the physical input capacity C, `expert` is the local expert count, and
+`global_expert / expert` is the logical EP size. One GPU simulates the last
+rank. Tuning uses R=C; dynamic R<C remains an operator-test case and is not a
+tuning input for now. `source_tokens` is a separate CPU workload hint; -1 means absent.
+
+```csv
+token,model_dim,inter_dim,expert,global_expert,topk,source_tokens
+128,4096,1024,32,256,8,16
+128,4096,1024,16,256,8,8
+```
+
+Backend-specific fixture options use one JSON object:
+
+| Field | Values | Default |
+| --- | --- | --- |
+| `routing` | `uniform`, `randn`, `hot` | `uniform` |
+| `hot_experts` | Positive integer, at most the local expert count; hot only | `min(topk, local experts)` |
+
+Uniform samples FP32 scores from U(5,10) and normalizes sigmoid routing weights.
+Randn uses normally distributed scores. Hot adds 20 to the scores of the first
+N local experts; when N<top-k, remaining slots select other experts without
+duplicating IDs. Unknown JSON keys and invalid options fail explicitly.
+`TUNE_MOE_EXPERT_BALANCE` does not affect this tuner.
+
+```bash
+cp aiter/configs/flydsl_ep_decode_fp8_block128_gfx950_untuned_fmoe.csv my_model_untuned_fmoe.csv
+# Edit the copied shape list for your model before tuning.
+python csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  --ep-fp8-flydsl -i my_model_untuned_fmoe.csv -o my_model_tuned_fmoe.csv -o2 my_model_candidates.csv \
+  --ep-fp8-flydsl-tune-kwargs '{"routing":"uniform"}' \
+  --mp 1 --warmup 5 --iters 101
+
+# Retune the same shapes for a chosen hot-expert set and replace their rows.
+python csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  --ep-fp8-flydsl -i my_model_untuned_fmoe.csv -o my_model_tuned_fmoe.csv --all \
+  --ep-fp8-flydsl-tune-kwargs '{"routing":"hot","hot_experts":8}'
+
+# Reproduce the saved fixture through public fused_moe dispatch.
+python csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  --ep-fp8-flydsl --run_config my_model_tuned_fmoe.csv
+
+# Evaluate that same saved configuration on another routing; no tuning/writes.
+python csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  --ep-fp8-flydsl --run_config my_model_tuned_fmoe.csv \
+  --ep-fp8-flydsl-tune-kwargs '{"routing":"randn"}'
+```
+
+Runtime uses the existing `AITER_CONFIG_FMOE` variable. A model CSV can hold
+both native and EP rows. The EP rows carry
+`_tag=flydsl_ep_decode_fp8_block128_gfx950`; the native loader ignores them.
+EP shape identity includes gfx/CU/C/H/I/local experts/global experts/top-k and
+source hint. Native rows retain their native keys.
+
+Do not load different routing profiles for the same shape together. `tune_kwargs` records the effective options for reproduction, not runtime
+selection. `--all` replaces the same backend/shape row; it does not retain one
+runtime row per routing. A failed shape leaves its previous valid row intact.
+Without `--all`, already tuned shapes are skipped. The source-hint heuristic
+remains the fallback when no matching FlyDSL profile exists; TP and unsupported
+inputs still delegate to native AITER.
+
+```bash
+AITER_FLYDSL_MOE_EP_DECODE_FP8_BLOCK128_GFX950=1 \
+AITER_CONFIG_FMOE=my_model_tuned_fmoe.csv \
+python op_tests/test_moe_blockscale.py \
+  -d bf16 -m 128 -dim 4096 -idim 1024 -e 256 -k 8 -ep 8 \
+  --tokens-before-dispatch 16 --routing hot --hot-experts 8
+```
+
+To retain native tuned rows in another file, pass both via
+`AITER_CONFIG_FMOE=/path/native.csv:/path/my_model_tuned_fmoe.csv`. Model tables under
+`aiter/configs/model_configs/*tuned_fmoe*.csv` also participate in the existing
+default scan. Restart an application after changing its offline configuration.
+
+Timing is complete local MoE GPU-event mean, including sorting, required
+quantization and output reduction, excluding network dispatch/combine. Four
+input/weight address sets are rotated. `--iters` is rounds per captured graph;
+five graph replays are averaged. `--warmup` is untimed rounds before capture.
+
+The adapter supports `--mp 1`, with no split-K or per-candidate watchdog.
+`--last`, `--run_config`, and the common optional `--compare` workflow remain
+available. Candidate records, including failures, are written to `-o2`.
+The standalone test and the tuner share fixtures, reference and timing; the
+public test/replay also assert that FlyDSL was actually selected. This does
+not imply one routing's best configuration is optimal for every routing.
