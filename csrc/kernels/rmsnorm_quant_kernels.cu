@@ -335,12 +335,11 @@ __global__ void add_rmsnorm_quant_kernel(
         core_loop(std::false_type{});
     }
 
-// MiMo-V2.5-Pro's post-attention RMSNorm has N=6144. The production RMSNorm
-// geometry for that width is 256 threads x 24 values/thread, which cannot form
-// independent 128-value quantization groups. Keep the RMSNorm geometry and
-// remap the same block to 48 groups x 4 threads x 32 BF16 values for quant.
-template <typename DTYPE_I, bool ADD_RESIDUAL>
-__global__ void mimo_rmsnorm_fp8_group_quant_6144_kernel(
+// MiMo Flash uses N=4096; Pro uses N=6144. Preserve the 256-thread RMSNorm
+// geometry, then form 128-value quantization groups from 16 lanes x 8 BF16
+// values. Each wave retains two or three interleaved segments in registers.
+template <typename DTYPE_I, bool ADD_RESIDUAL, int HIDDEN_SIZE>
+__global__ void mimo_rmsnorm_fp8_group_quant_kernel(
     opus::fp8_t* __restrict__ quantized,
     DTYPE_I* __restrict__ normalized,
     float* __restrict__ scale,
@@ -352,9 +351,10 @@ __global__ void mimo_rmsnorm_fp8_group_quant_6144_kernel(
     int m,
     int n)
 {
-    static constexpr int hidden_size = 6144;
+    static constexpr int hidden_size = HIDDEN_SIZE;
     static constexpr int BlockSize = 256;
-    static constexpr int thread_data_size = 24;
+    static constexpr int thread_data_size = hidden_size / BlockSize;
+    static_assert(hidden_size == 4096 || hidden_size == 6144);
     static constexpr bool interleave = true;
     static constexpr int32_t load_chunk_bytes = 16;
     static constexpr int32_t load_vec_size = load_chunk_bytes / sizeof(DTYPE_I);
@@ -474,9 +474,9 @@ __global__ void mimo_rmsnorm_fp8_group_quant_6144_kernel(
                  num_load_inst,
                  DTYPE_I>(normalized_buffer, thread_data_float, row_offset);
 
-    // Each wave owns three interleaved 512-value segments. Sixteen lanes x
+    // Each wave owns two or three interleaved 512-value segments. Sixteen lanes x
     // eight BF16 values form one 128-value quantization group, so four waves
-    // produce all 48 groups while retaining the normalized values in registers.
+    // produce all 32/48 groups while retaining the normalized values in registers.
     static constexpr int quant_values_per_thread = load_vec_size;
     static constexpr int quant_threads_per_group = 128 / quant_values_per_thread;
     static constexpr int quant_segments_per_wave = num_load_inst;
@@ -534,7 +534,7 @@ __global__ void mimo_rmsnorm_fp8_group_quant_6144_kernel(
     }
 }
 
-static void check_mimo_rmsnorm_fp8_group_quant_6144_inputs(
+static void check_mimo_rmsnorm_fp8_group_quant_inputs(
     const aiter_tensor_t& quantized,
     const aiter_tensor_t& normalized,
     const aiter_tensor_t& scale,
@@ -547,19 +547,19 @@ static void check_mimo_rmsnorm_fp8_group_quant_6144_inputs(
                 " is specialized for gfx950/gfx942, got ",
                 arch);
     AITER_CHECK(input.is_gpu(), __func__, " input must be on a HIP device");
-    AITER_CHECK(input.dim() == 2 && input.size(1) == 6144,
+    AITER_CHECK(input.dim() == 2 && (input.size(1) == 4096 || input.size(1) == 6144),
                 __func__,
-                " input must have shape [M, 6144]");
+                " input must have shape [M, 4096] or [M, 6144]");
     AITER_CHECK(input.dtype() == AITER_DTYPE_bf16,
                 __func__,
                 " input must be bfloat16, got ",
                 AiterDtype_to_str(input.dtype()));
     AITER_CHECK(input.is_contiguous(), __func__, " input must be contiguous");
     AITER_CHECK(weight.is_gpu() && weight.dtype() == AITER_DTYPE_bf16 &&
-                    weight.dim() == 1 && weight.numel() == 6144 &&
+                    weight.dim() == 1 && weight.numel() == input.size(1) &&
                     weight.is_contiguous(),
                 __func__,
-                " weight must be contiguous HIP bfloat16 with shape [6144]");
+                " weight must be contiguous HIP bfloat16 matching the input width");
     AITER_CHECK(normalized.is_gpu() && normalized.dtype() == AITER_DTYPE_bf16 &&
                     normalized.dim() == input.dim() &&
                     normalized.size(0) == input.size(0) &&
@@ -576,9 +576,9 @@ static void check_mimo_rmsnorm_fp8_group_quant_6144_inputs(
                 " quantized must be contiguous HIP FP8 matching input");
     AITER_CHECK(scale.is_gpu() && scale.dtype() == AITER_DTYPE_fp32 &&
                     scale.dim() == 2 && scale.size(0) == input.size(0) &&
-                    scale.size(1) == 48 && scale.is_contiguous(),
+                    scale.size(1) == input.size(1) / 128 && scale.is_contiguous(),
                 __func__,
-                " scale must be contiguous HIP float32 with shape [M, 48]");
+                " scale must be contiguous HIP float32 with shape [M, N / 128]");
     AITER_CHECK(input.device_id == weight.device_id &&
                     input.device_id == normalized.device_id &&
                     input.device_id == quantized.device_id &&
@@ -588,7 +588,7 @@ static void check_mimo_rmsnorm_fp8_group_quant_6144_inputs(
 }
 
 template <bool ADD_RESIDUAL>
-static void launch_mimo_rmsnorm_fp8_group_quant_6144(
+static void launch_mimo_rmsnorm_fp8_group_quant(
     aiter_tensor_t& quantized,
     aiter_tensor_t& normalized,
     aiter_tensor_t& scale,
@@ -598,7 +598,7 @@ static void launch_mimo_rmsnorm_fp8_group_quant_6144(
     aiter_tensor_t& weight,
     double epsilon)
 {
-    check_mimo_rmsnorm_fp8_group_quant_6144_inputs(
+    check_mimo_rmsnorm_fp8_group_quant_inputs(
         quantized, normalized, scale, input, weight);
     if constexpr(ADD_RESIDUAL)
     {
@@ -641,7 +641,9 @@ static void launch_mimo_rmsnorm_fp8_group_quant_6144(
     auto* residual_out_ptr =
         ADD_RESIDUAL ? reinterpret_cast<opus::bf16_t*>(residual_out->data_ptr())
                      : nullptr;
-    mimo_rmsnorm_fp8_group_quant_6144_kernel<opus::bf16_t, ADD_RESIDUAL>
+    auto launch = [&](auto hidden_size_tag) {
+        constexpr int hidden_size = decltype(hidden_size_tag)::value;
+        mimo_rmsnorm_fp8_group_quant_kernel<opus::bf16_t, ADD_RESIDUAL, hidden_size>
         <<<dim3(m), dim3(256), 0, stream>>>(
             reinterpret_cast<opus::fp8_t*>(quantized.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(normalized.data_ptr()),
@@ -652,7 +654,12 @@ static void launch_mimo_rmsnorm_fp8_group_quant_6144(
             reinterpret_cast<const opus::bf16_t*>(weight.data_ptr()),
             epsilon,
             m,
-            6144);
+            hidden_size);
+    };
+    if(input.size(1) == 4096)
+        launch(std::integral_constant<int, 4096>{});
+    else
+        launch(std::integral_constant<int, 6144>{});
 }
 
 void mimo_add_rmsnorm_fp8_group_quant(aiter_tensor_t& quantized,
@@ -664,7 +671,7 @@ void mimo_add_rmsnorm_fp8_group_quant(aiter_tensor_t& quantized,
                                       aiter_tensor_t& weight,
                                       double epsilon)
 {
-    launch_mimo_rmsnorm_fp8_group_quant_6144<true>(quantized,
+    launch_mimo_rmsnorm_fp8_group_quant<true>(quantized,
                                                    normalized,
                                                    scale,
                                                    input,
@@ -681,7 +688,7 @@ void mimo_rmsnorm_fp8_group_quant(aiter_tensor_t& quantized,
                                   aiter_tensor_t& weight,
                                   double epsilon)
 {
-    launch_mimo_rmsnorm_fp8_group_quant_6144<false>(
+    launch_mimo_rmsnorm_fp8_group_quant<false>(
         quantized, normalized, scale, input, nullptr, nullptr, weight, epsilon);
 }
 

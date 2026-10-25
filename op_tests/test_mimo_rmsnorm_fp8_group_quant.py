@@ -12,10 +12,9 @@ from aiter.ops.rmsnorm import (
     mimo_rmsnorm_fp8_group_quant,
 )
 
-
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_gfx() != "gfx950",
-    reason="MiMo fused RMSNorm/group-quant kernels require gfx950",
+    not torch.cuda.is_available() or get_gfx() not in ("gfx942", "gfx950"),
+    reason="MiMo fused RMSNorm/group-quant kernels require gfx942/gfx950",
 )
 
 
@@ -81,28 +80,68 @@ def _fused_result(
     return normalized, quantized, scale, residual_out
 
 
-@pytest.mark.parametrize("m", [1, 7, 129])
+def _assert_matches_production(actual, reference, *, allow_subnormal_ulp=False):
+    for observed, expected in zip(actual, reference):
+        if expected is None:
+            assert observed is None
+        elif (
+            not allow_subnormal_ulp
+            or observed.dtype != dtypes.fp8
+            or torch.equal(observed, expected)
+        ):
+            assert torch.equal(observed, expected)
+        else:
+            # Keep BF16 normalization/residuals and FP32 scales bitwise exact.
+            # At FP8 subnormal midpoints the fused/register and separate/load
+            # paths can differ by one representable subnormal step. Normal
+            # FP8 values must still match bitwise; this is not a relative-error
+            # allowance across the FP8 range.
+            a, b = observed.float(), expected.float()
+            mismatch = a != b
+            tiny = torch.finfo(dtypes.fp8).smallest_normal
+            assert torch.all(a[mismatch].abs() <= tiny)
+            assert torch.all(b[mismatch].abs() <= tiny)
+            assert torch.all((a[mismatch] - b[mismatch]).abs() <= tiny / 8)
+
+
+@pytest.mark.parametrize("m", [1, 7, 129, 8192])
+@pytest.mark.parametrize("n", [4096, 6144])
 @pytest.mark.parametrize("add_residual", [False, True])
-def test_mimo_rmsnorm_fp8_group_quant_matches_production_path(m, add_residual):
+def test_mimo_rmsnorm_fp8_group_quant_matches_production_path(m, n, add_residual):
     torch.manual_seed(2026 + m)
     epsilon = 1e-6
-    x = (torch.randn((m, 6144), dtype=torch.bfloat16, device="cuda") / 4).contiguous()
+    x = (torch.randn((m, n), dtype=torch.bfloat16, device="cuda") / 4).contiguous()
     weight = (
-        1
-        + torch.randn((6144,), dtype=torch.bfloat16, device="cuda") / 16
+        1 + torch.randn((n,), dtype=torch.bfloat16, device="cuda") / 16
     ).contiguous()
-    residual = (
-        (torch.randn_like(x) / 4).contiguous() if add_residual else None
-    )
+    residual = (torch.randn_like(x) / 4).contiguous() if add_residual else None
 
     reference = _production_reference(x, weight, residual, epsilon)
     actual = _fused_result(x, weight, residual, epsilon)
 
-    for actual_tensor, reference_tensor in zip(actual, reference):
-        if reference_tensor is None:
-            assert actual_tensor is None
-        else:
-            assert torch.equal(actual_tensor, reference_tensor)
+    _assert_matches_production(actual, reference, allow_subnormal_ulp=m >= 8192)
+
+
+@pytest.mark.parametrize("n", [4096, 6144])
+@pytest.mark.parametrize("add_residual", [False, True])
+def test_mimo_rmsnorm_fp8_group_quant_replays_graph(n, add_residual):
+    torch.manual_seed(942)
+    x = torch.randn((17, n), dtype=torch.bfloat16, device="cuda") / 4
+    weight = torch.ones(n, dtype=torch.bfloat16, device="cuda")
+    residual = torch.randn_like(x) / 4 if add_residual else None
+    _fused_result(x, weight, residual, 1e-6)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = _fused_result(x, weight, residual, 1e-6)
+    for factor in (0.0, 0.25, 1.0):
+        x.fill_(factor)
+        if residual is not None:
+            residual.fill_(factor * 0.5)
+        graph.replay()
+        reference = _production_reference(x, weight, residual, 1e-6)
+        for observed, expected in zip(actual, reference):
+            if expected is not None:
+                assert torch.equal(observed, expected)
 
 
 @pytest.mark.parametrize("use_num_local_tokens", [False, True])
@@ -162,7 +201,9 @@ def test_prequantized_fused_moe_2stage_transposes_per_1x128_scales(
     fake_stage2.func = None
     fake_stage2.transpose_quant = True
 
-    monkeypatch.setattr(fused_moe_mod.aiter, "partial_transpose", fake_partial_transpose)
+    monkeypatch.setattr(
+        fused_moe_mod.aiter, "partial_transpose", fake_partial_transpose
+    )
     monkeypatch.setattr(fused_moe_mod, "get_quant", lambda quant_type: fake_quant)
     monkeypatch.setattr(
         fused_moe_mod,
@@ -254,10 +295,10 @@ def test_prequantized_fused_moe_1stage_transposes_per_1x128_scales(
     ):
         captured["a1_scale"] = a1_scale
 
-    monkeypatch.setattr(fused_moe_mod.aiter, "partial_transpose", fake_partial_transpose)
     monkeypatch.setattr(
-        fused_moe_mod.aiter, "fmoe_fp8_blockscale_g1u1", fake_fmoe
+        fused_moe_mod.aiter, "partial_transpose", fake_partial_transpose
     )
+    monkeypatch.setattr(fused_moe_mod.aiter, "fmoe_fp8_blockscale_g1u1", fake_fmoe)
 
     token_num = 2
     model_dim = 256
