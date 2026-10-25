@@ -53,6 +53,7 @@ def compile_pa_decode_tile(
     query_dtype: str = "f16",
     per_token_kv: bool = False,
     query_length: int = 1,
+    query_splits: int | None = None,
     trans_v: bool = True,
     kv_dtype: str = "fp8",
 ):
@@ -64,6 +65,8 @@ def compile_pa_decode_tile(
     ``TOTAL_ROWS = query_length * query_group_size``, tiled into
     independent 16-row MFMA tiles. Long BF16 verification blocks distribute
     these tiles across CTAs to bound loop-carried register and LDS state.
+    ``query_splits`` optionally divides aligned GQA rows among CTAs; the
+    gfx942 MiMo Q8/D192/V128 BF16 specialization defaults to four splits.
     """
     arch = str(get_rocm_arch()).split(":", 1)[0]
     is_gfx950 = "gfx95" in arch
@@ -120,10 +123,32 @@ def compile_pa_decode_tile(
         if (is_bf16_kv and query_length > 4) or (WIDE_MFMA and head_dim == 128)
         else 1
     )
+    # MiMo Flash TP4 verification: retain CDNA3's native K16 BF16 MFMA,
+    # but split Q8/GQA16 into four 32-row tasks to limit register pressure.
+    if (
+        query_splits is None
+        and arch == "gfx942"
+        and is_bf16_kv
+        and (head_dim, v_head_dim, query_length, query_group_size, block_size)
+        == (192, 128, 8, 16, 64)
+    ):
+        query_splits = 4
+    if query_splits is not None:
+        if (
+            isinstance(query_splits, bool)
+            or not isinstance(query_splits, int)
+            or query_splits < 1
+            or query_length % query_splits
+            or total_m_tiles % query_splits
+        ):
+            raise ValueError(
+                "query_splits must divide query_length and the number of MFMA tiles"
+            )
+        QUERY_TILE_GROUPS = query_splits
     # Balance uneven totals across groups instead of computing whole padded
     # M-tiles in the final CTA (e.g. nine M-tiles become three groups of three).
     M_TILES = cdiv(total_m_tiles, QUERY_TILE_GROUPS)
-    QUERY_GROUPS_X = WIDE_MFMA and QUERY_TILE_GROUPS > 1
+    QUERY_GROUPS_X = (WIDE_MFMA or query_splits is not None) and QUERY_TILE_GROUPS > 1
     ROWS_PADDED = M_TILES * MFMA_MNK
     # PV layout: V=A, P=B -> output [V-head-dim (row), query-row (col=lane16)],
     # generalized over v_head_dim via the VHE_CHUNKS loop.

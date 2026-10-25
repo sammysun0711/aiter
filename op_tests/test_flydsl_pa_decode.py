@@ -889,6 +889,47 @@ def test_fp8_cache_offset_above_2gib(
 
 
 @_requires_tile_pa
+@pytest.mark.skipif(_ARCH != "gfx942", reason="MiMo Flash TP4 target uses gfx942")
+class TestGfx942MiMoTarget:
+    @pytest.mark.parametrize("batch", [1, 3, 9, 17])
+    @pytest.mark.parametrize("parts", [1, 4, 16])
+    def test_split_query_tail_and_graph(self, batch, parts):
+        test_tile_pa_vectorized_5d_matches_torch(
+            compute_type="bf16",
+            query_length=8,
+            value_head_size=128,
+            num_partitions=parts,
+            head_size=192,
+            num_heads=(16, 1),
+            context_length=1027,
+            batch_size=batch,
+            block_size=64,
+            entrypoint="ps-preallocated",
+        )
+
+    def test_large_physical_page_address(self):
+        # Both K and V addresses exceed 2 GiB; only the referenced page is read.
+        page = (2**31 // (128 * 64 * 2)) + 3
+        key = torch.empty((page + 1, 1, 24, 64, 8), device="cuda", dtype=torch.bfloat16)
+        value = torch.empty(
+            (page + 1, 1, 8, 128, 8), device="cuda", dtype=torch.bfloat16
+        )
+        key[page].zero_()
+        value[page].fill_(3.0)
+        query = torch.zeros((8, 16, 192), device="cuda", dtype=torch.bfloat16)
+        output = torch.full(
+            (8, 16, 128), float("nan"), device="cuda", dtype=torch.bfloat16
+        )
+        table = torch.tensor([[page]], device="cuda", dtype=torch.int32)
+        lengths = torch.tensor([64], device="cuda", dtype=torch.int32)
+        tile.pa_decode_tile(
+            output, query, key, value, table, lengths, None, None, num_partitions=16
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, torch.full_like(output, 3.0), rtol=0, atol=0)
+
+
+@_requires_tile_pa
 class TestBF16Wave:
     @pytest.fixture
     def force_wave(self, monkeypatch):

@@ -7,6 +7,8 @@ Packed query/output rows have a uniform query length per request. Context
 lengths include those query tokens; masking is bottom-right causal.
 Small physical pages (16/64) are supported. The optimized gfx950 Q8 path
 uses GQA16, page64 and D128/V128 or D192/V128.
+gfx942 BF16 Q8/GQA16/page64 D192/V128 uses four query splits with native
+K16 BF16 MFMA and the existing normalized-partial reduction.
 
 Metadata and KV caches must be dense on the query device. Pass GPU scalar
 FP8 scales and preallocated partials before graph capture. Explicit NP16 is
@@ -16,6 +18,8 @@ on the optimized Q8 path. No SWA, sinks or variable per-request Q lengths.
 
 This module does not change AITER's existing attention dispatcher.
 """
+
+from dataclasses import replace
 
 import torch
 from packaging.version import Version
@@ -153,6 +157,7 @@ def pa_decode_tile(
     pmax: torch.Tensor | None = None,
     psum: torch.Tensor | None = None,
     pout: torch.Tensor | None = None,
+    query_splits: int | None = None,
 ) -> None:
     """Host entry point. See module docstring for tensor layouts.
 
@@ -365,6 +370,8 @@ def pa_decode_tile(
         num_partitions=num_partitions,
     )
     num_partitions = plan.num_partitions
+    if query_splits is not None:
+        plan = replace(plan, kernel="tile")
 
     supplied = (pmax, psum, pout)
     if (
@@ -413,6 +420,7 @@ def pa_decode_tile(
             query_length=query_length,
             trans_v=trans_v,
             kv_dtype=kv_dtype,
+            query_splits=query_splits,
         )
     if num_partitions == 1:
         # NP1 writes output directly; supplied buffers serve only as dummy arguments.
