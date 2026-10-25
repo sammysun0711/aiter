@@ -930,6 +930,164 @@ class TestGfx942MiMoTarget:
 
 
 @_requires_tile_pa
+class TestDFlashBF16Window:
+    def test_window_requires_bf16_kv(self):
+        query = torch.zeros((8, 16, 128), device="cuda", dtype=torch.bfloat16)
+        key = torch.empty((1, 2, 8, 64, 16), device="cuda", dtype=dtypes.fp8)
+        value = torch.empty((1, 2, 4, 128, 16), device="cuda", dtype=dtypes.fp8)
+        table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+        lengths = torch.tensor([8], device="cuda", dtype=torch.int32)
+        with pytest.raises(ValueError, match="requires BF16 KV"):
+            tile.pa_decode_tile(
+                torch.empty_like(query),
+                query,
+                key,
+                value,
+                table,
+                lengths,
+                None,
+                None,
+                sliding_window=1024,
+            )
+
+    @pytest.mark.parametrize("parts", [1, 8])
+    @pytest.mark.parametrize("query_splits", [1, 4])
+    def test_window_sinks_and_mutated_graph(self, parts, query_splits):
+        torch.manual_seed(91)
+        batch, qlen, heads, kv_heads, dim, pages = 2, 8, 16, 2, 128, 17
+        query = (
+            torch.randn((batch * qlen, heads, dim), device="cuda", dtype=torch.bfloat16)
+            / 3
+        )
+        key = (
+            torch.randn(
+                (batch * pages, kv_heads, 16, 64, 8),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            / 3
+        )
+        value = (
+            torch.randn(
+                (batch * pages, kv_heads, 8, dim, 8),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            / 3
+        )
+        table = (
+            torch.randperm(batch * pages, device="cuda")
+            .to(torch.int32)
+            .view(batch, pages)
+        )
+        lengths = torch.tensor([9, 1031], device="cuda", dtype=torch.int32)
+        sinks = torch.linspace(-2, 2, heads, device="cuda")
+        sinks[0] = float("-inf")
+        sinks[1] = 20
+        output = torch.empty_like(query)
+        shape = (batch, kv_heads, parts, qlen * heads // kv_heads)
+        pmax = torch.empty(shape, device="cuda")
+        psum = torch.empty_like(pmax)
+        pout = torch.empty((*shape, dim), device="cuda", dtype=torch.bfloat16)
+
+        def run():
+            tile.pa_decode_tile(
+                output,
+                query,
+                key,
+                value,
+                table,
+                lengths,
+                None,
+                None,
+                num_partitions=parts,
+                pmax=pmax,
+                psum=psum,
+                pout=pout,
+                sliding_window=1024,
+                sinks=sinks,
+                query_splits=query_splits,
+            )
+
+        def reference():
+            outputs = []
+            for b, length in enumerate(lengths.tolist()):
+                k = (
+                    key[table[b].long()]
+                    .permute(0, 3, 1, 2, 4)
+                    .reshape(-1, kv_heads, dim)[:length]
+                )
+                v = (
+                    value[table[b].long()]
+                    .permute(0, 2, 4, 1, 3)
+                    .reshape(-1, kv_heads, dim)[:length]
+                )
+                k = k.float().repeat_interleave(heads // kv_heads, dim=1)
+                v = v.float().repeat_interleave(heads // kv_heads, dim=1)
+                scores = (
+                    torch.einsum(
+                        "qhd,khd->hqk", query[b * qlen : (b + 1) * qlen].float(), k
+                    )
+                    * dim**-0.5
+                )
+                positions = torch.arange(length, device="cuda")
+                bound = length - qlen + torch.arange(qlen, device="cuda") + 1
+                visible = (positions[None, :] < bound[:, None]) & (
+                    positions[None, :] >= bound[:, None] - 1024
+                )
+                scores.masked_fill_(~visible[None], float("-inf"))
+                weights = torch.softmax(
+                    torch.cat(
+                        (scores, sinks[:, None, None].expand(heads, qlen, 1)), dim=-1
+                    ),
+                    dim=-1,
+                )[..., :-1]
+                outputs.append(torch.einsum("hqk,khd->qhd", weights, v))
+            return torch.cat(outputs)
+
+        run()
+        torch.testing.assert_close(output.float(), reference(), atol=0.005, rtol=0.005)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        lengths.copy_(torch.tensor([8, 1025], device="cuda", dtype=torch.int32))
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output.float(), reference(), atol=0.005, rtol=0.005)
+
+    @pytest.mark.parametrize("parts", [1, 8])
+    def test_sink_is_counted_once_across_partitions(self, parts):
+        query = torch.zeros((8, 16, 128), device="cuda", dtype=torch.bfloat16)
+        key = torch.zeros((9, 2, 16, 64, 8), device="cuda", dtype=torch.bfloat16)
+        value = torch.ones((9, 2, 8, 128, 8), device="cuda", dtype=torch.bfloat16)
+        table = torch.arange(9, device="cuda", dtype=torch.int32)[None]
+        lengths = torch.tensor([519], device="cuda", dtype=torch.int32)
+        sinks = torch.full((16,), 8.0, device="cuda").log()
+        output = torch.empty_like(query)
+        tile.pa_decode_tile(
+            output,
+            query,
+            key,
+            value,
+            table,
+            lengths,
+            None,
+            None,
+            num_partitions=parts,
+            sliding_window=3,
+            sinks=sinks,
+        )
+        torch.testing.assert_close(
+            output.float(),
+            torch.full_like(output.float(), 3 / 11),
+            atol=0.002,
+            rtol=0.002,
+        )
+
+
+@_requires_tile_pa
 class TestBF16Wave:
     @pytest.fixture
     def force_wave(self, monkeypatch):

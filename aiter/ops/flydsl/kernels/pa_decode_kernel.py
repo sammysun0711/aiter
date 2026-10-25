@@ -56,6 +56,9 @@ def compile_pa_decode_tile(
     query_splits: int | None = None,
     trans_v: bool = True,
     kv_dtype: str = "fp8",
+    sliding_window: int = 0,
+    use_sinks: bool = False,
+    sink_dtype: str = "f32",
 ):
     """Build the tile-programming PA-decode kernel + launch wrapper.
 
@@ -75,6 +78,8 @@ def compile_pa_decode_tile(
             f"pa_decode_tile only supports kv_dtype in ('fp8', 'bf16'), got {kv_dtype!r}"
         )
     is_bf16_kv = kv_dtype == "bf16"
+    if (sliding_window or use_sinks) and not is_bf16_kv:
+        raise ValueError("FlyDSL window/sink PA decode requires BF16 KV")
     FP8 = fx.Float8E4M3FN if is_gfx950 else fx.Float8E4M3FNUZ
     FP8_MAX = (
         448.0 if is_gfx950 else 240.0
@@ -114,7 +119,11 @@ def compile_pa_decode_tile(
     TOTAL_ROWS = query_length * query_group_size
     total_m_tiles = cdiv(TOTAL_ROWS, MFMA_MNK)
     WIDE_MFMA = (
-        is_gfx950 and query_length == 8 and v_head_dim == 128 and head_dim in (128, 192)
+        is_gfx950
+        and not sliding_window
+        and query_length == 8
+        and v_head_dim == 128
+        and head_dim in (128, 192)
     )
     # Bound BF16 state to avoid spills. The wide D128 FP8 schedule also gains
     # from four M-tiles/CTA; D192 FP8 benefits from sharing KV across eight.
@@ -256,6 +265,7 @@ def compile_pa_decode_tile(
         context_lengths_ptr: fx.Tensor,  # [num_seqs]
         key_scale_ptr: fx.Tensor,  # [1] per-tensor OR [num_blocks, num_kv_heads, block_size] per-token
         value_scale_ptr: fx.Tensor,  # same shape as key_scale_ptr
+        sinks_ptr: fx.Tensor,
         max_blocks_per_seq: fx.Int32,
         stride_ks_block: fx.Int32,
         stride_ks_head: fx.Int32,
@@ -409,8 +419,14 @@ def compile_pa_decode_tile(
             value_scale = fx.Int32(buf_scalar_load(vs_rsrc, 0)).bitcast(fx.Float32)
 
         num_tiles = cdiv(context_len, TILE_TOK)
-        tiles_per_part = cdiv(num_tiles, NP)
-        part_start = part * tiles_per_part
+        first_tile = fx.Int32(0)
+        if const_expr(sliding_window > 0):
+            first_token = fx.max(
+                context_len - (query_length - 1) - sliding_window, fx.Int32(0)
+            )
+            first_tile = first_token // TILE_TOK
+        tiles_per_part = cdiv(num_tiles - first_tile, NP)
+        part_start = first_tile + part * tiles_per_part
         part_end_raw = part_start + tiles_per_part
         part_end = (part_end_raw < num_tiles).select(part_end_raw, num_tiles)
 
@@ -819,6 +835,19 @@ def compile_pa_decode_tile(
                 for m in range_constexpr(M_TILES)
             ]
 
+        def _mask_window(chunks, bound, tok0, invalid):
+            if const_expr(sliding_window > 0):
+                lower = (bound - tok0 - sliding_window).to(fx.Float32)
+                base = fx.Int32(warp * TOK_CHUNK + rgroup * 4).to(fx.Float32)
+                threshold = fx.Vector.from_elements(
+                    [lower - base], dtype=fx.Float32
+                ).broadcast_to(4)
+                return [
+                    (_ct[a] >= threshold).select(chunks[a], invalid)
+                    for a in range_constexpr(NCHUNK)
+                ]
+            return chunks
+
         K_SLOT, V_SLOT = 0, 1
         # Per-M-tile loop-carried state after the K/V slots: one output chunk
         # per VHE_CHUNKS (2 for v_head_dim=128, 4 for 256, 1 for 64),
@@ -836,8 +865,28 @@ def compile_pa_decode_tile(
 
         o_zero = fx.Vector.filled(OP_ELEMS, 0.0, fx.Float32)
         init_state = [k_pf0, v_page_pf0]
+        if const_expr(use_sinks):
+            sink_type = fx.BFloat16 if const_expr(sink_dtype == "bf16") else fx.Float32
+            sink_copy = (
+                fx.rocdl.BufferCopy16b()
+                if const_expr(sink_dtype == "bf16")
+                else fx.rocdl.BufferCopy32b()
+            )
+            load_sink = make_flat_loader(sinks_ptr, sink_type, 1, sink_copy)
         for _m in range_constexpr(M_TILES):
-            init_state.extend([o_zero] * VHE_CHUNKS + [NEG_INF, ZERO_F])
+            initial_max, initial_sum = NEG_INF, ZERO_F
+            if const_expr(use_sinks):
+                # The sink is a zero-valued attention token in partition 0.
+                # The existing normalized-partial reducer counts it exactly once.
+                head = (
+                    kv_h * query_group_size
+                    + (query_row_base + _m * MFMA_MNK + lane16) % query_group_size
+                )
+                sink = fx.Float32(load_sink(head)[0]) * fx.Float32(LOG2E)
+                active_sink = (part == 0) & (sink > NEG_INF)
+                initial_max = active_sink.select(sink, NEG_INF)
+                initial_sum = active_sink.select(fx.Float32(1.0), ZERO_F)
+            init_state.extend([o_zero] * VHE_CHUNKS + [initial_max, initial_sum])
         for tt, ostate in range(part_start, part_end, 1, init=init_state):
             k_cur = ostate[
                 K_SLOT
@@ -987,6 +1036,12 @@ def compile_pa_decode_tile(
                             for a in range_constexpr(NCHUNK)
                         ]
 
+                    masked_chunks = _mask_window(
+                        masked_chunks,
+                        causal_bound[m],
+                        tok0,
+                        fx.Vector.filled(4, float("-inf"), fx.Float32),
+                    )
                     pm = fx.Float32(float("-inf"))
                     for a in range_constexpr(NCHUNK):
                         pm = fx.maxnumf(
@@ -1215,6 +1270,7 @@ def compile_pa_decode_tile(
                     (_ct[a] < thr).select(scaled_frags[a], neg4)
                     for a in range_constexpr(NCHUNK)
                 ]
+                masked_chunks = _mask_window(masked_chunks, causal_bound[0], tok0, neg4)
                 # pass 1: per-warp max for this qhead
                 pm = fx.Float32(float("-inf"))
                 for a in range_constexpr(NCHUNK):
@@ -1411,6 +1467,7 @@ def compile_pa_decode_tile(
         context_lengths: fx.Tensor,
         key_scale: fx.Tensor,  # [1] per-tensor OR [num_blocks, num_kv_heads, block_size] per-token
         value_scale: fx.Tensor,  # same shape as key_scale
+        sinks: fx.Tensor,
         max_blocks_per_seq: fx.Int32,
         num_seqs: fx.Int32,
         num_kv_heads: fx.Int32,
@@ -1435,6 +1492,7 @@ def compile_pa_decode_tile(
                 context_lengths,
                 key_scale,
                 value_scale,
+                sinks,
                 max_blocks_per_seq,
                 stride_ks_block,
                 stride_ks_head,
@@ -1450,4 +1508,8 @@ def compile_pa_decode_tile(
                 stream=stream,
             )
 
-    return {"launch": pa_decode_tile_launch, "kernel": pa_decode_tile_kernel}
+    return {
+        "launch": pa_decode_tile_launch,
+        "kernel": pa_decode_tile_kernel,
+        "accepts_sinks": True,
+    }
