@@ -643,7 +643,7 @@ def mimo_add_rmsnorm_fp8_group_quant(
     weight: Tensor,
     epsilon: float,
 ) -> None:
-    """MiMo N=6144 fused add, RMSNorm, and per-1x128 FP8 quantization."""
+    """MiMo N=4096/6144 fused add, RMSNorm, and per-1x128 FP8 quantization."""
     ...
 
 
@@ -656,5 +656,5 @@ def mimo_rmsnorm_fp8_group_quant(
     weight: Tensor,
     epsilon: float,
 ) -> None:
-    """MiMo N=6144 fused RMSNorm and per-1x128 FP8 quantization."""
+    """MiMo N=4096/6144 fused RMSNorm and per-1x128 FP8 quantization."""
     ...

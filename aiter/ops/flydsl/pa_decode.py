@@ -7,15 +7,21 @@ Packed query/output rows have a uniform query length per request. Context
 lengths include those query tokens; masking is bottom-right causal.
 Small physical pages (16/64) are supported. The optimized gfx950 Q8 path
 uses GQA16, page64 and D128/V128 or D192/V128.
+gfx942 BF16 Q8/GQA16/page64 D192/V128 uses four query splits with native
+K16 BF16 MFMA and the existing normalized-partial reduction.
 
 Metadata and KV caches must be dense on the query device. Pass GPU scalar
 FP8 scales and preallocated partials before graph capture. Explicit NP16 is
 recommended for the measured B96/C65536 BF16 workload; automatic splits retain
 the existing cap of eight. FP8 storage uses BF16 computation for contexts <=512
-on the optimized Q8 path. No SWA, sinks or variable per-request Q lengths.
+on the optimized Q8 path. BF16 D128/V128 additionally supports causal sliding
+windows and per-head sinks. FP8 remains full-attention only; query lengths
+are uniform within a batch.
 
 This module does not change AITER's existing attention dispatcher.
 """
+
+from dataclasses import replace
 
 import torch
 from packaging.version import Version
@@ -153,12 +159,19 @@ def pa_decode_tile(
     pmax: torch.Tensor | None = None,
     psum: torch.Tensor | None = None,
     pout: torch.Tensor | None = None,
+    sliding_window: int = 0,
+    sinks: torch.Tensor | None = None,
+    query_splits: int | None = None,
 ) -> None:
     """Host entry point. See module docstring for tensor layouts.
 
     ``num_partitions``/``pmax``/``psum``/``pout`` are optional caller overrides
     (e.g. for CUDA-graph capture, where nothing may be allocated on-the-fly);
     when omitted they are picked/allocated here.
+
+    BF16 D128/V128 supports a positive ``sliding_window`` measured in visible
+    keys including the current query. ``sinks`` contains one unscaled natural
+    logit per query head; it contributes to the denominator, not the value sum.
     """
     _validate_metadata(query, block_tables, context_lengths)
     if query.ndim != 3 or output.ndim != 3 or min(query.shape) <= 0:
@@ -204,6 +217,23 @@ def pa_decode_tile(
         total_q_rows % num_seqs == 0
     ), f"query.shape[0] ({total_q_rows}) must be a multiple of context_lengths.shape[0] ({num_seqs})"
     query_length = total_q_rows // num_seqs
+    if (
+        isinstance(sliding_window, bool)
+        or not isinstance(sliding_window, int)
+        or sliding_window < 0
+    ):
+        raise ValueError("sliding_window must be a non-negative integer token count")
+    if sliding_window and (head_dim, value_head_dim) != (128, 128):
+        raise ValueError("FlyDSL draft sliding-window decode requires D128/V128")
+    if sinks is not None and (
+        sinks.device != query.device
+        or sinks.dtype not in (torch.float32, torch.bfloat16)
+        or sinks.shape != (num_q_heads,)
+        or not sinks.is_contiguous()
+    ):
+        raise ValueError(
+            "sinks must be contiguous FP32/BF16 [num_query_heads] on the query device"
+        )
     _, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
     arch = str(get_rocm_arch()).split(":", 1)[0]
     fp8_dtype = torch.float8_e4m3fn if "gfx95" in arch else torch.float8_e4m3fnuz
@@ -212,6 +242,8 @@ def pa_decode_tile(
             f"pa_decode_tile supports BF16 or {fp8_dtype} KV cache on {arch}, got {key_cache.dtype}"
         )
     is_bf16_kv = key_cache.dtype == torch.bfloat16
+    if (sliding_window or sinks is not None) and not is_bf16_kv:
+        raise ValueError("FlyDSL window/sink PA decode requires BF16 KV")
     kv_dtype = "bf16" if is_bf16_kv else "fp8"
 
     expected_vector = 8 if is_bf16_kv else 16
@@ -365,6 +397,22 @@ def pa_decode_tile(
         num_partitions=num_partitions,
     )
     num_partitions = plan.num_partitions
+    if sliding_window or sinks is not None or query_splits is not None:
+        plan = replace(plan, kernel="tile")
+    if (
+        query_splits is None
+        and sliding_window
+        and arch == "gfx942"
+        and (head_dim, value_head_dim, query_length, query_group_size)
+        == (128, 128, 8, 8)
+    ):
+        # Match query splitting to useful window tiles, rather than the full context.
+        window_tiles = (
+            sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
+        ) // KV_COMPUTE_BLOCK + 1
+        grid = num_seqs * num_kv_heads * min(num_partitions, window_tiles)
+        cus = torch.cuda.get_device_properties(dev).multi_processor_count
+        query_splits = 4 if 4 * grid <= 2 * cus else 2 if 2 * grid <= 3 * cus else 1
 
     supplied = (pmax, psum, pout)
     if (
@@ -413,6 +461,12 @@ def pa_decode_tile(
             query_length=query_length,
             trans_v=trans_v,
             kv_dtype=kv_dtype,
+            query_splits=query_splits,
+            sliding_window=sliding_window,
+            use_sinks=sinks is not None,
+            sink_dtype=(
+                "bf16" if sinks is not None and sinks.dtype == torch.bfloat16 else "f32"
+            ),
         )
     if num_partitions == 1:
         # NP1 writes output directly; supplied buffers serve only as dummy arguments.
@@ -470,8 +524,7 @@ def pa_decode_tile(
         ):
             tensor.record_stream(s)
 
-    _run_compiled(
-        compiled["launch"],
+    launch_tensors = [
         output,
         pmax.view(-1),
         psum.view(-1),
@@ -483,6 +536,14 @@ def pa_decode_tile(
         context_lengths,
         key_scale_t,
         value_scale_t,
+    ]
+    if compiled.get("accepts_sinks", False):
+        launch_tensors.append(query if sinks is None else sinks)
+    if stream is not None and sinks is not None:
+        sinks.record_stream(s)
+    _run_compiled(
+        compiled["launch"],
+        *launch_tensors,
         int(max_blocks_per_seq),
         int(num_seqs),
         int(num_kv_heads),
