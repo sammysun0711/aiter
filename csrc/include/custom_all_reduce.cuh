@@ -4481,6 +4481,10 @@ class CustomAllreduce
                    int block_limit = 16)
     {
 #endif
+        if(size == 0)
+        {
+            return;
+        }
         auto d = 16 / sizeof(T);
     if(size % d != 0)
         throw std::runtime_error("custom allreduce currently requires input length to be multiple "
@@ -4715,6 +4719,14 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
                            int m, int n, int k,
                            ReduceScatterSplitDim split_dim)
 {
+    // First-dim calls encode (0, 0, numel); last-dim calls encode
+    // (0, outer_rows, last_dim). Only the middle-dim path uses all three.
+    if(k == 0 ||
+       (split_dim != ReduceScatterSplitDim::kFirst && n == 0) ||
+       (split_dim == ReduceScatterSplitDim::kMid && m == 0))
+    {
+        return;
+    }
     RankData* ptrs          = get_buffer_RD(stream, input);
     constexpr int pack_size = 16 / sizeof(T);
     constexpr int kGridCap  = 80;  // bounded by signal slots (see kMaxBlocks)
@@ -4805,6 +4817,10 @@ template <typename T>
 void dispatchAllGather(
     hipStream_t stream, T* input, T* output, int size, int last_dim_size, int gather_dim)
 {
+    if(size == 0)
+    {
+        return;
+    }
     RankData* ptrs = get_buffer_RD(stream, input);
     auto d         = 16 / sizeof(T);
     dim3 block(512);
@@ -4899,6 +4915,10 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
+    if(size == 0)
+    {
+        return;
+    }
     if(size % d != 0)
     {
         throw std::runtime_error("custom allreduce currently requires input length to be multiple "
