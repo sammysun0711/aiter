@@ -908,12 +908,14 @@ class TestGfx942MiMoTarget:
         )
 
     def test_large_physical_page_address(self):
-        # Both K and V addresses exceed 2 GiB; only the referenced page is read.
+        # Referenced K/V addresses exceed 2 GiB; masked tile tails read page 0.
         page = (2**31 // (128 * 64 * 2)) + 3
         key = torch.empty((page + 1, 1, 24, 64, 8), device="cuda", dtype=torch.bfloat16)
         value = torch.empty(
             (page + 1, 1, 8, 128, 8), device="cuda", dtype=torch.bfloat16
         )
+        key[0].zero_()
+        value[0].zero_()
         key[page].zero_()
         value[page].fill_(3.0)
         query = torch.zeros((8, 16, 192), device="cuda", dtype=torch.bfloat16)
