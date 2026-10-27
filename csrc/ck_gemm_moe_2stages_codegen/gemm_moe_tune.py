@@ -3650,11 +3650,11 @@ class FmoeTuner(TunerCommon):
             and str(_gfx).startswith("gfx942")
         ):
             flydsl_s1_kernels = {
-                **flydsl_s1_kernels,
+                #**flydsl_s1_kernels,
                 **get_flydsl_stage1_kernels_a8w4(out_dtype_str),
             }
             flydsl_s2_kernels = {
-                **flydsl_s2_kernels,
+                #**flydsl_s2_kernels,
                 **get_flydsl_stage2_kernels_a8w4(out_dtype_str),
             }
 
