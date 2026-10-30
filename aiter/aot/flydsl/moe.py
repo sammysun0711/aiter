@@ -881,6 +881,16 @@ def _precompile_a16w4_to_cache(
         "xcd_swizzle": xcd_swizzle,
         "stream": 0,
     }
+    # A8W4 (a_dtype="fp8r"): same launchers, built for fp8 A (+ the scale ptrs; only
+    # gemm1 takes a precomputed W exponent, gemm2 derives it in-kernel).
+    if kwargs.get("a_dtype") == "fp8r":
+        common.update(
+            a_dtype="fp8r",
+            a_scale=z,
+            flush_tiny=kwargs.get("flush_tiny", False),
+        )
+        if stage == 1:
+            common["b_exp"] = z
     with compile_only_env():
         if stage == 1:
             flydsl_a16w4_gemm1(
@@ -923,6 +933,7 @@ def _precompile_a16w4_to_cache(
                 max_sorted=1,
                 tile_n=g2_tile_n,
                 tile_k=g2_tile_k,
+                waves_per_eu=waves_per_eu,
                 w_dtype=b_dtype,
                 epilog=(
                     "reduce"
@@ -1044,8 +1055,10 @@ def compile_one_config(
     is_a16w_port = (
         not is_epilogue
         and kwargs.get("shared_expert_id", -1) < 0
-        and kwargs.get("a_dtype") == "bf16"
-        and kwargs.get("b_dtype") in ("fp4", "int4")
+        and (
+            (kwargs.get("a_dtype") == "bf16" and kwargs.get("b_dtype") in ("fp4", "int4"))
+            or kwargs.get("a_dtype") == "fp8r"
+        )
     )
 
     t0 = time.time()
