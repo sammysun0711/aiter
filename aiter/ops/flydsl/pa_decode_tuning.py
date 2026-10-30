@@ -7,6 +7,7 @@ Run with: python -m aiter.ops.flydsl.pa_decode_tuning --help
 """
 
 import argparse
+import inspect
 import os
 from contextlib import contextmanager
 from copy import copy
@@ -18,13 +19,13 @@ import torch
 from flydsl.autotune import Config, autotune
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.kernels.pa_decode import implementation_cache_tag
-from aiter.ops.flydsl.kernels.pa_decode_plan import (
+from .kernels.pa_decode import implementation_cache_tag
+from .kernels.pa_decode_plan import (
     DEFAULT_MAX_BATCH_SIZE,
     PADecodePlan,
     plan_pa_decode,
 )
-from aiter.ops.flydsl.pa_decode import pa_decode
+from .pa_decode import pa_decode
 
 _PA_DECODE_CONFIGS_PATH = Path(__file__).parent / "configs" / "pa"
 
@@ -208,7 +209,11 @@ def _validate_pa_decode_config(arguments):
         "implementation",
     ],
     default=_pa_decode_default,
-    validate_hook=_validate_pa_decode_config,
+    **(
+        {"validate_hook": _validate_pa_decode_config}
+        if "validate_hook" in inspect.signature(autotune).parameters
+        else {}
+    ),
 )
 def _pa_decode_autotuner(
     num_seqs,
@@ -232,6 +237,59 @@ def _pa_decode_autotuner(
     workgroup_budget,
 ):
     resources.graphs[workgroup_budget].replay()
+
+
+def _resolve_pa_decode_config(tuner, **arguments):
+    """Resolve without a decode launch, including on FlyDSL 0.3.2.
+
+    Older native autotuners lack resolve_config/validate_hook. Reuse their
+    cache, pruning and benchmark machinery, validating each candidate once
+    outside the timed replay loop. Never discard candidate validation.
+    """
+    resolve = getattr(tuner, "resolve_config", None)
+    if resolve is not None:
+        return resolve(**arguments)
+
+    from flydsl.autotune import _tuning_enabled
+
+    key = tuner._make_key((), arguments)
+    force = _tuning_enabled()
+    if not force and key in tuner.cache:
+        return tuner.cache[key]
+    artifact = tuner._artifact_ref((), arguments, required=force)
+    if not force:
+        cached = tuner._load_artifact(artifact, (), arguments)
+        if cached is not None:
+            return cached
+        if tuner.default is not None:
+            return tuner.default(**arguments)
+
+    configs = tuner.configs(**arguments) if callable(tuner.configs) else tuner.configs
+    configs = tuner._prune(configs, (), arguments)
+    measured = []
+    failures = []
+    for config in configs:
+        merged = dict(arguments)
+        merged.update(config.all_kwargs())
+        try:
+            with tuner._stream_context((), merged):
+                with _validate_pa_decode_config(merged):
+                    tuner._run_with_hints(config.compiler_opts(), (), merged)
+            latency = tuner._bench_one(config, (), arguments)
+            measured.append((config, latency))
+        except Exception as error:
+            failures.append(f"{config}: {error}")
+    if not measured:
+        raise RuntimeError(
+            "All PA autotune configs failed validation or benchmarking: "
+            + "; ".join(failures)
+        )
+    best, _ = min(measured, key=lambda item: item[1])
+    if force and artifact is not None:
+        tuner._emit_artifact(best, artifact, (), arguments)
+    tuner.cache[key] = best
+    tuner._save_disk_cache()
+    return best
 
 
 @cache
@@ -369,10 +427,10 @@ def prepare_pa_decode_plan(
             search._artifact_cache = dict(tuner._artifact_cache)
             search.default = None
             search.cache.pop(search._make_key((), tuning_args), None)
-            config = search.resolve_config(**tuning_args)
+            config = _resolve_pa_decode_config(search, **tuning_args)
             tuner.cache.update(search.cache)
         else:
-            config = tuner.resolve_config(**tuning_args)
+            config = _resolve_pa_decode_config(tuner, **tuning_args)
         budget = config.kwargs.get("workgroup_budget")
         if (
             set(config.all_kwargs()) != {"workgroup_budget"}

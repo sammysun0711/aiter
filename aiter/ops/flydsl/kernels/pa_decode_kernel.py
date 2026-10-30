@@ -51,11 +51,11 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
-from flydsl.runtime.device import check_smem_capacity
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .pa_decode import implementation_cache_tag
+from .pa_decode.compat import check_smem_capacity
 from .pa_decode.context import PaDecodeContext
 from .pa_decode.pipeline import Gfx1250Bf16Pipeline, Gfx1250Pipeline, PaDecodePipeline
 from .pa_decode.traits import (
