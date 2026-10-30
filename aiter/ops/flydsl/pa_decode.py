@@ -193,8 +193,14 @@ def pa_decode(
     work_plan: PADecodePlan,
     max_context_length: int | None = None,
     mask_unowned_kv: bool = True,
+    query_splits: int | None = None,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
+
+    ``query_splits`` optionally overrides the compiler's query splitting.
+    It must be a positive divisor of ``query_length``; the compiler also
+    checks the selected layout's shared-memory requirements. None retains
+    the existing automatic policy.
 
     Supports page sizes 16/64/128. On gfx942/gfx950, BF16 and FP8 head
     dimensions are multiples of 64 up to 1024. gfx1250 supports 64 and
@@ -283,6 +289,12 @@ def pa_decode(
         raise TypeError("query_length must be an int")
     if query_length < 1:
         raise ValueError(f"query_length must be positive, got {query_length}")
+    if query_splits is not None and (
+        type(query_splits) is not int
+        or query_splits < 1
+        or query_length % query_splits
+    ):
+        raise ValueError("query_splits must be a positive integer dividing query_length")
 
     required_tensors = (
         ("output", output),
@@ -655,6 +667,7 @@ def pa_decode(
             direct_output=direct_output,
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
+            query_splits=query_splits,
         )
 
     total_rows = query_length * query_group_size

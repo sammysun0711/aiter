@@ -11,10 +11,10 @@ explicit SSA values. Every LDS publication/retirement barrier stays here.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
-from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import ReductionOp
 
 from ..utils import rcp_f32
+from .compat import tdm_ops
 from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
