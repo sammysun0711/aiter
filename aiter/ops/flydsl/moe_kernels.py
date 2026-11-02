@@ -981,9 +981,7 @@ def compile_flydsl_moe_stage2(
             epilog=("reduce" if b_dtype == "int4" and mode == "reduce" else "atomic"),
             topk=topk,
             **(
-                dict(a_dtype="fp8r", flush_tiny=flush_tiny)
-                if a_dtype == "fp8r"
-                else {}
+                dict(a_dtype="fp8r", flush_tiny=flush_tiny) if a_dtype == "fp8r" else {}
             ),
         )
     if b_dtype in ("fp4", "fp8"):
@@ -1707,6 +1705,7 @@ def _flydsl_moe_stage1_impl(
     pipeline_phases: int = 4,
     v2_output_layout: bool = False,
     flush_tiny: bool = False,
+    a8w4_input_scale: torch.Tensor | None = None,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1782,14 +1781,28 @@ def _flydsl_moe_stage1_impl(
         sorted_size = int(sorted_expert_ids.shape[0]) * int(tile_m)
         _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
         inter_sorted = _alloc(sorted_size, inter_dim, dtype=torch.bfloat16, device=dev)
-        _a = a.to(torch.bfloat16).contiguous()
+        if a8w4_input_scale is not None and not _is_a8w4:
+            raise ValueError("row-FP8 input scales require the native A8W4 kernel")
+        _a = a if a8w4_input_scale is not None else a.to(torch.bfloat16).contiguous()
         _a8w4_args = {}
         if _is_a8w4:
             # A8W4: same bf16-in/bf16-out contract as a16w4; A is row-quantized to
             # FP8-FNUZ here, W1's per-channel exponent is weight-static (cached).
             from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.a8w4 import quantize_rows
 
-            _a, _a_scale = quantize_rows(_a)
+            if a8w4_input_scale is None:
+                _a, _a_scale = quantize_rows(_a)
+            else:
+                if (
+                    _a.dtype != torch.float8_e4m3fnuz
+                    or not _a.is_contiguous()
+                    or a8w4_input_scale.dtype != torch.float32
+                    or a8w4_input_scale.device != _a.device
+                    or a8w4_input_scale.numel() != token_num
+                    or not a8w4_input_scale.is_contiguous()
+                ):
+                    raise ValueError("invalid native A8W4 prequantized rows or scales")
+                _a_scale = a8w4_input_scale
             _a8w4_args = dict(
                 a_dtype="fp8r",
                 a_scale=_a_scale,
@@ -2203,6 +2216,7 @@ def flydsl_moe_stage1(
     pipeline_phases: int = 4,
     v2_output_layout: bool = False,
     flush_tiny: bool = False,
+    a8w4_input_scale: torch.Tensor | None = None,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -2243,6 +2257,7 @@ def flydsl_moe_stage1(
         situ_linear_beta=situ_linear_beta,
         w1_scale=w1_scale,
         a1_scale=a1_scale,
+        a8w4_input_scale=a8w4_input_scale,
         sorted_weights=sorted_weights,
         persist_m=persist_m,
         use_async_copy=use_async_copy,

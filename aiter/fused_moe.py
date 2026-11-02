@@ -1549,6 +1549,87 @@ def _fused_moe_impl(
         return _return_output(ret, output)
 
 
+def fused_moe_a8w4_prequantized(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    *,
+    a1_scale,
+    **kwargs,
+):
+    """Consume the exact gfx942 native-A8W4 row-FP8 operand and FP32 scale.
+
+    Weight storage, routing, selected GEMMs and intermediate quantization are
+    unchanged. This entry point skips only GEMM1's existing row quantization;
+    it must not be used for MXFP8 group scales or A16W4 kernel selections.
+    """
+    if get_gfx() != "gfx942" or hidden_states.dtype != torch.float8_e4m3fnuz:
+        raise ValueError("native prequantized A8W4 requires gfx942 FP8-FNUZ input")
+    if w1.dtype != dtypes.fp4x2 or w2.dtype != dtypes.fp4x2:
+        raise ValueError("native prequantized A8W4 requires packed MXFP4 weights")
+    if (
+        hidden_states.ndim != 2
+        or not hidden_states.is_contiguous()
+        or a1_scale is None
+        or a1_scale.dtype != torch.float32
+        or a1_scale.device != hidden_states.device
+        or a1_scale.numel() != hidden_states.shape[0]
+        or not a1_scale.is_contiguous()
+    ):
+        raise ValueError("expected contiguous FP8 rows and one FP32 scale per row")
+    if kwargs.get("expert_mask") is not None:
+        raise ValueError("native row-FP8 input currently supports EP1 only")
+    if QuantType(kwargs.get("quant_type", QuantType.per_1x32)) != QuantType.per_1x32:
+        raise ValueError("native MXFP4 weights require per_1x32 weight quantization")
+    if (
+        ActivationType(kwargs.get("activation", ActivationType.Silu))
+        != ActivationType.Silu
+    ):
+        raise ValueError("native row-FP8 input currently supports SiLU only")
+    if (
+        GateMode(kwargs.get("gate_mode", GateMode.SEPARATED.value))
+        != GateMode.SEPARATED
+    ):
+        raise ValueError("native row-FP8 input requires separated gate/up weights")
+    if kwargs.get("hidden_pad", 0) or kwargs.get("intermediate_pad", 0):
+        raise ValueError("native row-FP8 input currently requires unpadded dimensions")
+    if kwargs.pop("dtype", dtypes.bf16) != dtypes.bf16:
+        raise ValueError("native row-FP8 input keeps BF16 output")
+    if any(k.startswith("_") for k in kwargs):
+        raise ValueError(
+            "internal metadata overrides are not accepted by this entry point"
+        )
+    if hidden_states.shape[0] == 0:
+        return hidden_states.new_empty(hidden_states.shape, dtype=dtypes.bf16)
+
+    def select_native(metadata):
+        function = getattr(metadata.stage1, "func", metadata.stage1)
+        name = getattr(metadata.stage1, "keywords", {}).get("kernelName", "")
+        if (
+            metadata.run_1stage
+            or function is not _flydsl_stage1_wrapper
+            or not name.startswith("flydsl_moe1_afp8r_wfp4_")
+        ):
+            raise ValueError("prequantized input requires a selected native A8W4 GEMM1")
+        return replace(metadata, prequant=False)
+
+    kwargs.setdefault("quant_type", QuantType.per_1x32)
+    return _fused_moe_impl(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        dtype=dtypes.bf16,
+        _q_dtype_a=dtypes.bf16,
+        _metadata_transform=select_native,
+        _stage1_extra_args={"a8w4_input_scale": a1_scale.reshape(-1)},
+        **kwargs,
+    )
+
+
 def fused_moe_1stage(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1934,6 +2015,7 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     out_dtype: str | None = None,
     v2_output_layout: bool = False,
+    a8w4_input_scale: torch.Tensor | None = None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1992,6 +2074,7 @@ def _flydsl_stage1_wrapper(
         pipeline_phases=parsed.get("pipeline_phases", 4),
         v2_output_layout=v2_output_layout,
         flush_tiny=parsed.get("flush_tiny", False),
+        a8w4_input_scale=a8w4_input_scale,
     )
 
 
@@ -3045,9 +3128,7 @@ def get_2stage_cfgs(
         result = _lookup_variants(lookup_keys, keys_disabled, preferred_variants)
         fallback_keys = []
         if config_file is None and token > _PADDED_M_TIERS[0]:
-            tier_idx = (
-                _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
-            )
+            tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
             for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
                 # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
                 keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
@@ -3069,9 +3150,7 @@ def get_2stage_cfgs(
         result = _lookup_variants(lookup_keys, keys_disabled, alternate_variants)
         if result is None:
             for keys_fb, keys_fb_disabled in fallback_keys:
-                result = _lookup_variants(
-                    keys_fb, keys_fb_disabled, alternate_variants
-                )
+                result = _lookup_variants(keys_fb, keys_fb_disabled, alternate_variants)
                 if result is not None:
                     break
         return result
@@ -3355,9 +3434,7 @@ def get_2stage_cfgs(
     if isinstance(kernelName1, str) and kernelName1.startswith("pyhip_"):
         wg_m, wg_n = 256, 256
         if int(block_m) != wg_m:
-            raise ValueError(
-                f"PyHIP MiMo MoE requires block_m={wg_m}, got {block_m}"
-            )
+            raise ValueError(f"PyHIP MiMo MoE requires block_m={wg_m}, got {block_m}")
 
         def stage1_func(
             a1,
@@ -4038,8 +4115,7 @@ def fused_moe_2stages(
         metadata = _metadata_transform(metadata)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage1_uses_transposed_scale = quant_type == QuantType.per_1x128 and (
-        stage1_func is asm_stage1
-        or getattr(metadata.stage1, "transpose_quant", False)
+        stage1_func is asm_stage1 or getattr(metadata.stage1, "transpose_quant", False)
     )
     if stage1_uses_transposed_scale:
         quant_func = functools.partial(quant_func, transpose_scale=True)
@@ -4067,7 +4143,8 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and (
-                activation in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Silu)
+                activation
+                in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Silu)
                 or gate_mode == GateMode.INTERLEAVE
             )
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
@@ -4279,9 +4356,9 @@ def fused_moe_2stages(
             )
         )
         if uses_flydsl_v2_stage2:
-            extra_stage2_args["topk_weights"] = (
-                topk_weights.to(torch.float32).contiguous()
-            )
+            extra_stage2_args["topk_weights"] = topk_weights.to(
+                torch.float32
+            ).contiguous()
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
@@ -4336,7 +4413,8 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Silu)
+            and activation
+            in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Silu)
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
