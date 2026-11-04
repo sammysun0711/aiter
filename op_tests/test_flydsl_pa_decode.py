@@ -742,6 +742,115 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
 
 
 @pytest.mark.parametrize(
+    "batch,parts,splits,full_budget",
+    [
+        (1, 2, 8, True),
+        (7, 4, 4, True),
+        (8, 8, 2, True),
+        (9, 16, 4, True),
+        (12, 64, 2, True),
+        (17, 128, 4, True),
+        (33, 8, 1, True),
+        (9, 16, 4, False),
+    ],
+)
+def test_mimo_query_grid_dynamic_graph(device, monkeypatch, batch, parts, splits, full_budget):
+    """Interleaved Q groups preserve packed ownership and empty-row outputs."""
+    if get_gfx_runtime() != "gfx942":
+        pytest.skip("MiMo query-grid scheduling is specific to gfx942")
+    from aiter.ops.flydsl.kernels.pa_decode.traits import (
+        PaDecodeSchedule,
+        PaDecodeTraits,
+    )
+
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    torch.manual_seed(814)
+    pattern = (0, 1, 7, 8, 127, 255, 256, 257, 511, 1025, 4097)
+    lengths = tuple(pattern[i % len(pattern)] for i in range(batch))
+    # Keep a nonempty allocation even for the all-empty B1 entry.
+    initial = tuple(max(length, 4097) for length in lengths)
+    query, key, value, table, context = _make_inputs(
+        8, 1, 16, 192, 128, 64, torch.bfloat16, "random", device,
+        initial, table_width=16384,
+    )
+    # Reserve block zero for padded table reads, and poison every unowned token.
+    key = torch.cat([torch.zeros_like(key[:1]), key])
+    value = torch.cat([torch.zeros_like(value[:1]), value])
+    used_pages = (4097 + 63) // 64
+    table[:, :used_pages].add_(1)
+    pages = key.shape[0]
+    kc = torch.empty((pages, 1, 24, 64, 8), dtype=key.dtype, device=device)
+    vc = torch.empty((pages, 1, 8, 128, 8), dtype=value.dtype, device=device)
+
+    def refresh_cache():
+        owned = torch.zeros((pages, 64), dtype=torch.bool, device=device)
+        for seq, length in enumerate(context.tolist()):
+            tokens = torch.arange(length, device=device)
+            owned[table[seq, tokens // 64].long(), tokens % 64] = True
+        poisoned_key = key.masked_fill(~owned[:, None, :, None], float("nan"))
+        poisoned_value = value.masked_fill(~owned[:, None, :, None], float("nan"))
+        kc.copy_(poisoned_key.view(pages, 1, 64, 24, 8).permute(0, 1, 3, 2, 4))
+        vc.copy_(poisoned_value.view(pages, 1, 8, 8, 128).permute(0, 1, 2, 4, 3))
+
+    context.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+    refresh_cache()
+    plan = pa.plan_pa_decode(
+        context, 1, max_partitions=parts,
+        workgroup_budget=batch * (parts if full_budget else 3), query_length=8,
+    )
+    shape = (1, plan.capacity, 128)
+    pmax = torch.empty(shape, dtype=torch.float32, device=device)
+    psum = torch.empty_like(pmax)
+    pout = torch.empty((*shape, 128), dtype=torch.bfloat16, device=device)
+    guarded = torch.full((batch * 8 + 2, 16, 128), 19.0, dtype=query.dtype, device=device)
+    output = guarded[1:-1]
+    compiled = []
+    original_compile = pa.compile_pa_decode_tile
+
+    def compile_spy(**kwargs):
+        selected = {k: v for k, v in kwargs.items() if k not in ("architecture", "direct_output")}
+        traits = PaDecodeTraits.create(PaDecodeSchedule.select(**selected))
+        compiled.append(traits.query_first_plan_grid)
+        return original_compile(**kwargs)
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", compile_spy)
+
+    def launch():
+        pa.plan_pa_decode(context, 1, plan=plan, query_length=8)
+        pa.pa_decode(
+            output, query, kc, vc, context, table, 192**-0.5, 8,
+            work_plan=plan, query_splits=splits, max_context_length=1048576,
+            max_logits=pmax, exp_sums=psum, temporary_output=pout,
+        )
+
+    def check():
+        reference = _reference(query, key.float(), value.float(), table, context, 8, 0, None)
+        _check_output(output, reference, 5e-3)
+        assert bool((guarded[0] == 19).all() and (guarded[-1] == 19).all())
+
+    launch()
+    check()
+    assert compiled and all(flag == full_budget for flag in compiled)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        launch()
+    for state in ("all-empty", "mixed", "remapped"):
+        if state == "all-empty":
+            context.zero_()
+        else:
+            new_lengths = tuple(pattern[(batch - i) % len(pattern)] for i in range(batch))
+            context.copy_(torch.tensor(new_lengths, dtype=torch.int32, device=device))
+        if state == "remapped":
+            table.copy_(table.roll(1, dims=0))
+            query.neg_()
+        refresh_cache()
+        output.fill_(float("nan"))
+        graph.replay()
+        check()
+
+
+@pytest.mark.parametrize(
     "case",
     [
         *[
