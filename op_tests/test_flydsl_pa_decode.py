@@ -850,6 +850,91 @@ def test_mimo_query_grid_dynamic_graph(device, monkeypatch, batch, parts, splits
         check()
 
 
+@pytest.mark.parametrize("batch,parts,splits", [(12,24,1),(24,64,2),(40,64,2),(96,3,1),
+    (152,2,1),(208,8,2),(240,4,2),(256,4,2),(7,16,None)])
+def test_mimo_auto_joint_plan(device, monkeypatch, tmp_path, batch, parts, splits):
+    if get_gfx_runtime() != "gfx942" or torch.cuda.get_device_properties(device).multi_processor_count != 304:
+        pytest.skip("Calibrated MiMo defaults require gfx942")
+    from aiter.ops.flydsl import pa_decode_tuning as tuning
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    torch.manual_seed(813)
+    q,k,v,table,lengths = _make_inputs(8,1,16,192,128,64,torch.bfloat16,
+        "random",device,(256,)*batch,table_width=64)
+    lengths.copy_(torch.tensor([128+(i%3)*57 for i in range(batch)],device=device,dtype=torch.int32))
+    kc=k.view(k.shape[0],1,64,24,8).permute(0,1,3,2,4).contiguous()
+    vc=v.view(v.shape[0],1,8,8,128).permute(0,1,2,4,3).contiguous()
+    monkeypatch.setenv("FLYDSL_AUTOTUNE","1")
+    def no_search(*args,**kwargs):
+        raise AssertionError("Serving cache-only preparation launched tuning candidates")
+    monkeypatch.setattr(tuning._PADecodeAutotuneResources,"prepare",no_search)
+    plan=tuning.prepare_pa_decode_plan(q,kc,vc,lengths,table,192**-.5,8,
+        max_batch_size=batch,max_context_length=4096,cache_only=True,config_dir=tmp_path)
+    assert (plan.max_partitions,plan.query_splits)==(parts,splits)
+    shape=(1,plan.capacity,128)
+    pmax=torch.empty(shape,device=device,dtype=torch.float32)
+    psum=torch.empty_like(pmax)
+    pout=torch.empty((*shape,128),device=device,dtype=torch.bfloat16)
+    output=torch.empty((batch*8,16,128),device=device,dtype=torch.bfloat16)
+    pointers=(plan.work_info.data_ptr(),plan.reduce_info.data_ptr())
+    def run():
+        assert pa.plan_pa_decode(lengths,1,plan=plan,query_length=8) is plan
+        pa.pa_decode(output,q,kc,vc,lengths,table,192**-.5,8,work_plan=plan,
+            max_context_length=4096,max_logits=pmax,exp_sums=psum,temporary_output=pout)
+    def check():
+        reference=_reference(q,k.float(),v.float(),table,lengths,8,0,None)
+        _check_output(output,reference,5e-3)
+    run();check()
+    graph=torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):run()
+    for state in ("mixed_empty","remapped"):
+        if state=="mixed_empty":lengths[::2]=0
+        else:
+            lengths.fill_(185)
+            table.copy_(table.roll(1,dims=0))
+            q.neg_()
+        output.fill_(float("nan"))
+        graph.replay();check()
+    assert pointers==(plan.work_info.data_ptr(),plan.reduce_info.data_ptr())
+    assert plan.query_splits==splits
+
+
+def test_mimo_joint_tuning_cache_and_resources(device, monkeypatch, tmp_path):
+    if get_gfx_runtime() != "gfx942" or torch.cuda.get_device_properties(device).multi_processor_count != 304:
+        pytest.skip("Calibrated MiMo defaults require gfx942")
+    from aiter.ops.flydsl import pa_decode_tuning as tuning
+    from flydsl.autotune import Config
+    q,k,v,table,lengths=_make_inputs(8,1,16,192,128,64,torch.bfloat16,
+        "random",device,(256,)*12,table_width=64)
+    kc=k.view(k.shape[0],1,64,24,8).permute(0,1,3,2,4).contiguous()
+    vc=v.view(v.shape[0],1,8,8,128).permute(0,1,2,4,3).contiguous()
+    arguments=(q,kc,vc,lengths,table,192**-.5,8)
+    captured={}
+    original=tuning._resolve_pa_decode_config
+    def observe(tuner,**kwargs):
+        captured.update(tuner=tuner,args={k:v for k,v in kwargs.items() if k!='cache_only'})
+        return original(tuner,**kwargs)
+    monkeypatch.setattr(tuning,'_resolve_pa_decode_config',observe)
+    plan=tuning.prepare_pa_decode_plan(*arguments,max_batch_size=12,
+        max_context_length=4096,cache_only=True,config_dir=tmp_path)
+    assert (plan.max_partitions,plan.query_splits)==(24,1)
+    tuner=captured['tuner'];key=tuner._make_key((),captured['args'])
+    tuner.cache[key]=Config(workgroup_budget=96,partition_count=8,query_splits=2)
+    tuner._save_disk_cache();tuner.cache.clear();tuner._load_disk_cache()
+    cached=tuning.prepare_pa_decode_plan(*arguments,max_batch_size=12,
+        max_context_length=4096,cache_only=True,config_dir=tmp_path)
+    assert (cached.max_partitions,cached.query_splits,cached.capacity)==(8,2,96)
+    options=dict(compute_type=None,key_scale=None,value_scale=None,sinks=None,
+                 sliding_window=0,max_context_length=4096,query_splits=None)
+    resources=tuning._PADecodeAutotuneResources(q,arguments[1:],options,304,12)
+    for budget,parts,splits in [(608,304,None),(288,24,1),(288,24,2)]:
+        resources.prepare(budget,parts,splits)
+    assert len(resources.graphs)==3
+    for key,graph in resources.graphs.items():
+        graph.replay();torch.cuda.synchronize()
+        torch.testing.assert_close(resources.outputs[key],resources.reference,atol=5e-3,rtol=5e-3)
+
+
 @pytest.mark.parametrize(
     "case",
     [
