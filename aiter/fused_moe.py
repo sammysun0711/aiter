@@ -1431,6 +1431,7 @@ def _fused_moe_impl(
             or bool(intermediate_pad)
             or bool(swiglu_limit)
             or a2_scale is not None
+            or a1_scale_is_transposed
             or stage2_scatter is not None
             or _metadata_transform is not None
             or _metadata_config_file is not None
