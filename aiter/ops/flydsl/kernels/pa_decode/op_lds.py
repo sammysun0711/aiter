@@ -275,7 +275,11 @@ class PaDecodeKVLoader:
         # Stream dense KV; retain cache locality for sliding windows.
         copy_op = (
             fx.rocdl.BufferCopy128b(
-                cache_modifier=2 if const_expr(self.traits.sliding_window == 0) else 0
+                cache_modifier=(
+                    self.traits.bf16_kv_buffer_cache
+                    if const_expr(self.traits.bf16_kv_buffer_cache is not None)
+                    else 2 if const_expr(self.traits.sliding_window == 0) else 0
+                )
             )
             if const_expr(self.traits.BUFFER_KV)
             else fx.UniversalCopy128b()

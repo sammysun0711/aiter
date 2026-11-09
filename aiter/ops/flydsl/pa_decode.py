@@ -9,6 +9,9 @@ MFMA/WMMA specialization details. Native BF16 uses unscaled, 8-element packed
 K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches.
 """
 
+import logging
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -26,6 +29,25 @@ from .kernels.pa_decode_reduce import (
     compile_pa_decode_ps_reduce,
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
+
+_buffer_option = os.environ.get("AITER_FLYDSL_PA_BF16_BUFFER_CACHE", "off")
+if _buffer_option not in ("off", "0", "1", "2"):
+    raise ValueError("AITER_FLYDSL_PA_BF16_BUFFER_CACHE must be off, 0, 1 or 2")
+_BF16_BUFFER_POLICY = None if _buffer_option == "off" else int(_buffer_option)
+_buffer_path_logged = False
+
+
+def _bf16_buffer_policy(arch, is_bf16_kv, query_dtype, head_dim, value_dim,
+                        query_length, query_group_size, block_size,
+                        num_kv_heads, sliding_window, trans_v, kv_buffer_u32):
+    if (
+        _BF16_BUFFER_POLICY is not None and arch == "gfx942" and is_bf16_kv
+        and query_dtype == "bf16" and head_dim == 192 and value_dim == 128
+        and query_length == 8 and query_group_size == 16 and block_size == 64
+        and num_kv_heads == 1 and sliding_window == 0 and trans_v and kv_buffer_u32
+    ):
+        return _BF16_BUFFER_POLICY
+    return None
 
 
 def _flydsl_pointer_dtype(dtype: torch.dtype):
@@ -642,6 +664,18 @@ def pa_decode(
     )
     wide_kv_addressing = cache_extent >= 2**31
     kv_buffer_u32 = cache_extent < 2**32
+    buffer_policy = _bf16_buffer_policy(
+        arch, is_bf16_kv, query_dtype, head_dim, value_dim, query_length,
+        query_group_size, int(block_size), num_kv_heads, sliding_window, trans_v,
+        kv_buffer_u32,
+    )
+    global _buffer_path_logged
+    if buffer_policy is not None and not _buffer_path_logged:
+        logging.getLogger(__name__).info(
+            "Experimental BF16 PA buffer path: policy=%s, cache_extent=%s, source=%s",
+            buffer_policy, cache_extent, __file__,
+        )
+        _buffer_path_logged = True
 
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
@@ -671,6 +705,7 @@ def pa_decode(
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             query_splits=query_splits,
+            bf16_kv_buffer_cache=buffer_policy,
         )
 
     total_rows = query_length * query_group_size

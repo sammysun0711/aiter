@@ -600,6 +600,7 @@ class PaDecodeTraits:
     sVScaleMax_off: int
     sPages_off: int
     total_bytes: int
+    bf16_kv_buffer_cache: int | None = None
 
     @property
     def query_first_plan_grid(self) -> bool:
@@ -629,7 +630,7 @@ class PaDecodeTraits:
         return 2 + self.STATE_PER_M * m + self.VHE_CHUNKS + 1
 
     @classmethod
-    def create(cls, schedule: PaDecodeSchedule) -> PaDecodeTraits:
+    def create(cls, schedule: PaDecodeSchedule, bf16_kv_buffer_cache=None) -> PaDecodeTraits:
         """Derive the immutable kernel layout after a specialization cache miss."""
         cache_key = schedule.cache_key
         (
@@ -658,6 +659,10 @@ class PaDecodeTraits:
         ) = cache_key
         is_gfx950 = schedule.is_gfx950
         is_bf16_kv = kv_dtype == "bf16"
+        if bf16_kv_buffer_cache is not None:
+            # The compile entry point requires a proven sub-4-GiB byte span.
+            # Keep offsets unsigned until the buffer instruction consumes them.
+            BUFFER_KV = True
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = (
             value_dim == head_dim
@@ -945,6 +950,7 @@ class PaDecodeTraits:
             sVScaleMax_off=sVScaleMax_off,
             sPages_off=sPages_off,
             total_bytes=total_bytes,
+            bf16_kv_buffer_cache=bf16_kv_buffer_cache,
         )
 
 
