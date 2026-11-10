@@ -21,6 +21,7 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -41,6 +42,20 @@ namespace aiter {
 enum class ReduceScatterSplitDim : int { kFirst = 0, kLast = 1, kMid = 2 };
 
 constexpr int kMaxBlocks = 80;
+
+inline bool use_small_packed_allgather_grid()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("AITER_PACKED_ALLGATHER_SMALL_GRID");
+        if(value == nullptr || std::string(value) == "0")
+            return false;
+        if(std::string(value) != "1")
+            throw std::runtime_error("AITER_PACKED_ALLGATHER_SMALL_GRID must be 0 or 1");
+        return true;
+    }();
+    return enabled;
+}
+
 // note: we don't want to use atomics for signals because peer atomics are no
 // supported on PCIe links
 struct Signal
@@ -4854,10 +4869,21 @@ void dispatchAllGather(
         }
         else
         {
+            int grid_limit = kMaxBlocks;
+            // The decoded FP8 packets travel as packed FP32 words. Keep the
+            // original signal layout and all other collective dispatches.
+            if constexpr(std::is_same<T, float>::value)
+            {
+                const int64_t bytes = static_cast<int64_t>(size) * sizeof(T);
+                if(bytes >= 1024 * 1024 && bytes <= 8 * 1024 * 1024 &&
+                   (world_size_ == 4 || world_size_ == 8) &&
+                   use_small_packed_allgather_grid())
+                    grid_limit = world_size_ == 4 ? 16 : 32;
+            }
             size /= d;
             int tnum_per_block = 512 / world_size_;
             int block_num      = (size + tnum_per_block - 1) / tnum_per_block;
-            dim3 grid(std::min(block_num, 80));
+            dim3 grid(std::min(block_num, grid_limit));
             switch(world_size_)
             {
             case 8:
