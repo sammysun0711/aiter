@@ -143,6 +143,7 @@ def compile_pa_decode_tile(
     direct_output: bool = False,
     trans_k: bool = True,
     mask_unowned_kv: bool = True,
+    bf16_kv_buffer_cache: int | None = None,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -190,6 +191,16 @@ def compile_pa_decode_tile(
     if not trans_k:
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
+    if bf16_kv_buffer_cache is not None:
+        if type(bf16_kv_buffer_cache) is not int or bf16_kv_buffer_cache not in (0, 1, 2):
+            raise ValueError("BF16 buffer cache policy must be 0, 1 or 2")
+        if not (
+            architecture == "gfx942" and kv_dtype == query_dtype == "bf16"
+            and head_dim == 192 and value_dim == 128 and query_length == 8
+            and query_group_size == 16 and block_size == 64 and num_kv_heads == 1
+            and sliding_window == 0 and trans_v and kv_buffer_u32
+        ):
+            raise ValueError("BF16 buffer loads require gfx942 Q8/GQA16/D192/V128/page64 and both caches below4GiB")
     if architecture == "gfx1250":
         if value_dim not in (None, head_dim):
             raise NotImplementedError("asymmetric value width requires gfx942/gfx950")
@@ -251,15 +262,16 @@ def compile_pa_decode_tile(
         trans_k=trans_k,
         mask_unowned_kv=mask_unowned_kv,
     )
-    cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
+    tile_cache_key = (schedule.cache_key, bf16_kv_buffer_cache)
+    cached = _PA_DECODE_TILE_CACHE.get(tile_cache_key)
     if cached is not None:
         return cached
 
-    traits = PaDecodeTraits.create(schedule)
+    traits = PaDecodeTraits.create(schedule, bf16_kv_buffer_cache=bf16_kv_buffer_cache)
     check_smem_capacity(traits.total_bytes, architecture)
     # As in fmha_gfx950, expose scalar specialization data to FlyDSL's closure
     # cache walker: it cannot inspect the fields of a captured traits object.
-    _pa_decode_cache_tag = (traits.cache_key, implementation_cache_tag())
+    _pa_decode_cache_tag = (traits.cache_key, bf16_kv_buffer_cache, implementation_cache_tag())
 
     @fx.struct
     class SharedStorage:
@@ -326,6 +338,8 @@ def compile_pa_decode_tile(
         sliding_window=traits.sliding_window,
         query_splits=traits.query_splits,
     )
+    if bf16_kv_buffer_cache is not None:
+        kernel_name += f"_buf{bf16_kv_buffer_cache}"
 
     @flyc.kernel(name=kernel_name, known_block_size=(traits.BLOCK_THREADS, 1, 1))
     def pa_decode_tile_kernel(
@@ -460,7 +474,7 @@ def compile_pa_decode_tile(
         "launch": pa_decode_tile_launch,
         "kernel": pa_decode_tile_kernel,
     }
-    return _PA_DECODE_TILE_CACHE.setdefault(traits.cache_key, compiled)
+    return _PA_DECODE_TILE_CACHE.setdefault(tile_cache_key, compiled)
 
 
 def compile_gfx1250_pa_decode(
