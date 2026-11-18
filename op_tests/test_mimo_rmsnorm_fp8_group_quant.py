@@ -16,6 +16,8 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or get_gfx() not in ("gfx942", "gfx950"),
     reason="MiMo fused RMSNorm/group-quant kernels require gfx942/gfx950",
 )
+FN_COMPAT_ENV = "AITER_MIMO_RMSNORM_FP8_FN_COMPAT"
+MIMO_WIDTHS = (2048, 4096, 6144)
 
 
 def _production_reference(
@@ -105,9 +107,13 @@ def _assert_matches_production(actual, reference, *, allow_subnormal_ulp=False):
 
 
 @pytest.mark.parametrize("m", [1, 7, 129, 8192])
-@pytest.mark.parametrize("n", [4096, 6144])
+@pytest.mark.parametrize("n", MIMO_WIDTHS)
 @pytest.mark.parametrize("add_residual", [False, True])
-def test_mimo_rmsnorm_fp8_group_quant_matches_production_path(m, n, add_residual):
+@pytest.mark.parametrize("fn_compat", [False, True])
+def test_mimo_rmsnorm_fp8_group_quant_matches_production_path(
+    m, n, add_residual, fn_compat, monkeypatch
+):
+    monkeypatch.setenv(FN_COMPAT_ENV, str(int(fn_compat)))
     torch.manual_seed(2026 + m)
     epsilon = 1e-6
     x = (torch.randn((m, n), dtype=torch.bfloat16, device="cuda") / 4).contiguous()
@@ -122,9 +128,49 @@ def test_mimo_rmsnorm_fp8_group_quant_matches_production_path(m, n, add_residual
     _assert_matches_production(actual, reference, allow_subnormal_ulp=m >= 8192)
 
 
-@pytest.mark.parametrize("n", [4096, 6144])
+@pytest.mark.parametrize("n", MIMO_WIDTHS)
 @pytest.mark.parametrize("add_residual", [False, True])
-def test_mimo_rmsnorm_fp8_group_quant_replays_graph(n, add_residual):
+def test_mimo_fn_compat_group_range(monkeypatch, n, add_residual):
+    x = torch.ones((3, n), dtype=torch.bfloat16, device="cuda")
+    x[1].neg_()
+    x[2].zero_()
+    weight = (
+        (torch.arange(n // 128, device="cuda") % 4 + 1)
+        .repeat_interleave(128)
+        .bfloat16()
+    )
+    weight[:128] = 0
+    weight[::4] *= -0.5
+    residual = x * 0.5 if add_residual else None
+
+    monkeypatch.delenv(FN_COMPAT_ENV, raising=False)
+    native = _fused_result(x, weight, residual, 1e-6)
+    monkeypatch.setenv(FN_COMPAT_ENV, "1")
+    compat = _fused_result(x, weight, residual, 1e-6)
+    assert torch.equal(compat[0], native[0])
+    if add_residual:
+        assert torch.equal(compat[3], native[3])
+
+    blocks = native[0].cpu().float().view(3, n // 128, 128)
+    amax = blocks.abs().amax(-1).clamp_min(1e-10)
+    native_max = torch.finfo(dtypes.fp8).max
+    compat_max = 224.0 if get_gfx() == "gfx942" else native_max
+    for (_, q, raw_scale, _), limit in ((native, native_max), (compat, compat_max)):
+        scale = amax * (1.0 / limit)
+        expected = (blocks * scale.reciprocal().unsqueeze(-1)).to(dtypes.fp8)
+        assert torch.equal(raw_scale.cpu().view(n // 128, 3).T, scale)
+        assert torch.equal(
+            q.cpu().view(torch.uint8), expected.flatten(1).view(torch.uint8)
+        )
+
+
+@pytest.mark.parametrize("n", MIMO_WIDTHS)
+@pytest.mark.parametrize("add_residual", [False, True])
+@pytest.mark.parametrize("fn_compat", [False, True])
+def test_mimo_rmsnorm_fp8_group_quant_replays_graph(
+    n, add_residual, fn_compat, monkeypatch
+):
+    monkeypatch.setenv(FN_COMPAT_ENV, str(int(fn_compat)))
     torch.manual_seed(942)
     x = torch.randn((17, n), dtype=torch.bfloat16, device="cuda") / 4
     weight = torch.ones(n, dtype=torch.bfloat16, device="cuda")
@@ -137,11 +183,77 @@ def test_mimo_rmsnorm_fp8_group_quant_replays_graph(n, add_residual):
         x.fill_(factor)
         if residual is not None:
             residual.fill_(factor * 0.5)
-        graph.replay()
+        with monkeypatch.context() as replay_env:
+            replay_env.setenv(FN_COMPAT_ENV, str(int(not fn_compat)))
+            graph.replay()
         reference = _production_reference(x, weight, residual, 1e-6)
         for observed, expected in zip(actual, reference):
             if expected is not None:
                 assert torch.equal(observed, expected)
+
+
+@pytest.mark.parametrize(
+    "path, rows, width",
+    [
+        ("mimo", 5, 2048),
+        ("mimo", 5, 4096),
+        ("split", 5, 512),
+        ("generic", 5, 512),
+        ("standalone", 129, 512),
+    ],
+)
+def test_per128_fn_compat_dequant_vs_cpu_fn(monkeypatch, path, rows, width):
+    monkeypatch.setenv(FN_COMPAT_ENV, "1")
+    x = torch.randn(
+        rows, width, device="cpu", generator=torch.Generator().manual_seed(33 + width)
+    ).bfloat16()
+    w = (
+        torch.rand(
+            width, device="cpu", generator=torch.Generator().manual_seed(34 + width)
+        )
+        + 0.5
+    ).bfloat16()
+    eps = 1e-6
+    y = x.float()
+    if path != "standalone":
+        y = (
+            ((y * torch.rsqrt(y.square().mean(-1, keepdim=True) + eps)) * w.float())
+            .bfloat16()
+            .float()
+        )
+    blocks = y.reshape(rows, -1, 128)
+    scale = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448
+    golden = (blocks / scale).clamp(-448, 448).to(torch.float8_e4m3fn).float() * scale
+
+    x, w = x.cuda(), w.cuda()
+    if path in ("mimo", "split"):
+        run = _fused_result if path == "mimo" else _production_reference
+        _, q, raw, _ = run(x, w, None, eps)
+        scale = raw.view(width // 128, rows).T
+    elif path == "generic":
+        q = torch.empty_like(x, dtype=dtypes.fp8)
+        scale = torch.empty((rows, width // 128), dtype=torch.float32, device=x.device)
+        aiter.rmsnorm_quant(q, x, scale, w, eps, 128)
+    else:
+        q, scale = get_hip_quant(QuantType.per_1x128)(x, quant_dtype=dtypes.fp8)
+    actual = q.cpu().float().reshape_as(blocks) * scale.cpu().unsqueeze(-1)
+    assert torch.isfinite(actual).all()
+    bad = ~torch.isclose(actual, golden, rtol=0.01, atol=0.01)
+    assert bad.sum().item() * 20 <= golden.numel()
+
+
+def test_token_and_group_of_width_128(monkeypatch):
+    x = torch.ones(128, dtype=torch.bfloat16, device="cuda")
+    for flag in ("0", "1"):
+        monkeypatch.setenv(FN_COMPAT_ENV, flag)
+        token, _ = get_hip_quant(QuantType.per_Token)(
+            x.view(1, 128), quant_dtype=dtypes.fp8
+        )
+        grouped, _ = get_hip_quant(QuantType.per_1x128)(x, quant_dtype=dtypes.fp8)
+        native_max = torch.finfo(dtypes.fp8).max
+        selected = 224 if flag == "1" and get_gfx() == "gfx942" else native_max
+        assert torch.all(token.float() == native_max)
+        assert torch.all(grouped.float() == selected)
 
 
 @pytest.mark.parametrize("use_num_local_tokens", [False, True])

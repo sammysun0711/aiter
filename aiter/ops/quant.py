@@ -447,6 +447,7 @@ def per_group_quant_hip(
     num_rows_factor: int = 1,
     scale_type: torch.dtype = dtypes.fp32,
 ) -> "tuple[Tensor, Tensor]":
+    """On gfx942, AITER_MIMO_RMSNORM_FP8_FN_COMPAT=1 selects 224 for FP8 per-128 FP32 scales."""
     shape = x.shape
     device = x.device
     if scale is None:
@@ -461,10 +462,17 @@ def per_group_quant_hip(
         128,
     ], f"unsupported group size {group_size=}, only support [32, 64, 128]"
     y = torch.empty(shape, dtype=quant_dtype, device=device)
-    if scale_type == dtypes.fp8_e8m0:
+    # Distinguish explicit groups from a genuine per-token call of width 128.
+    fp8_per128 = (
+        group_size == 128
+        and quant_dtype == dtypes.fp8
+        and scale_type == dtypes.fp32
+        and x.is_contiguous()
+    )
+    if scale_type == dtypes.fp8_e8m0 or fp8_per128:
         dynamic_per_group_scaled_quant(
             y,
-            x,
+            x.unsqueeze(0) if fp8_per128 and x.ndim == 1 else x,
             scale,
             group_size,
             shuffle_scale=transpose_scale,

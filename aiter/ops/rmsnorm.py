@@ -594,7 +594,9 @@ def add_rmsnorm_quant(
     group_size: int = 0,
     shuffle_scale: bool = False,
     gemma_norm: bool = False,
-) -> None: ...
+) -> None:
+    """On gfx942, AITER_MIMO_RMSNORM_FP8_FN_COMPAT=1 selects 224 for FP8 per-128 FP32 scales."""
+    ...
 
 
 @compile_ops("module_rmsnorm_quant", develop=True)
@@ -619,7 +621,9 @@ def rmsnorm_quant(
     group_size: int = 0,
     shuffle_scale: bool = False,
     gemma_norm: bool = False,
-) -> None: ...
+) -> None:
+    """On gfx942, AITER_MIMO_RMSNORM_FP8_FN_COMPAT=1 selects 224 for FP8 per-128 FP32 scales."""
+    ...
 
 
 @compile_ops("module_rmsnorm_quant", develop=True)
@@ -643,7 +647,11 @@ def mimo_add_rmsnorm_fp8_group_quant(
     weight: Tensor,
     epsilon: float,
 ) -> None:
-    """MiMo N=4096/6144 fused add, RMSNorm, and per-1x128 FP8 quantization."""
+    """MiMo N=2048/4096/6144 fused add, RMSNorm, and per-1x128 FP8 quantization.
+
+    On gfx942, set AITER_MIMO_RMSNORM_FP8_FN_COMPAT=1 before launch or graph
+    capture to use a group maximum of 224. The default is the native FP8 maximum.
+    """
     ...
 
 
@@ -656,5 +664,9 @@ def mimo_rmsnorm_fp8_group_quant(
     weight: Tensor,
     epsilon: float,
 ) -> None:
-    """MiMo N=4096/6144 fused RMSNorm and per-1x128 FP8 quantization."""
+    """MiMo N=2048/4096/6144 fused RMSNorm and per-1x128 FP8 quantization.
+
+    On gfx942, set AITER_MIMO_RMSNORM_FP8_FN_COMPAT=1 before launch or graph
+    capture to use a group maximum of 224. The default is the native FP8 maximum.
+    """
     ...

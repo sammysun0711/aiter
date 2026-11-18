@@ -10,6 +10,7 @@
 #include "aiter_dispatch.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
+#include "fp8_quant_range.h"
 #include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
 
@@ -41,7 +42,8 @@ __global__ void add_rmsnorm_quant_kernel(
     int out_stride,
     int group_size,
     bool shuffle_scale=false,
-    bool emit_e8m0_scale=false)
+    bool emit_e8m0_scale=false,
+    bool fn_compat=false)
     {
         static constexpr int32_t load_chunk_bytes = sizeof(DTYPE_I) * thread_data_size % 16 == 0 ? 16 : 8;
         static_assert(thread_data_size * sizeof(DTYPE_I) % load_chunk_bytes == 0, "thread_data_size * sizeof(DTYPE_I) must be a multiple of load_chunk_bytes");
@@ -63,8 +65,7 @@ __global__ void add_rmsnorm_quant_kernel(
         using vec_ix2 = opus::vector_t<DTYPE_I, thread_data_size * 2>;
         static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
         static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
-        constexpr float inverted_DTYPE_MAX =
-            (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        const float inverted_DTYPE_MAX = quant_inv_dtype_max<DTYPE_O>(fn_compat);
         DTYPE_I* input_ptr = input + idx * static_cast<int64_t>(input_stride);
         DTYPE_O_STORE* out_ptr;
         const int oob_i = (n + ooba_i - 1) / ooba_i * ooba_i;
@@ -335,9 +336,8 @@ __global__ void add_rmsnorm_quant_kernel(
         core_loop(std::false_type{});
     }
 
-// MiMo Flash uses N=4096; Pro uses N=6144. Preserve the 256-thread RMSNorm
-// geometry, then form 128-value quantization groups from 16 lanes x 8 BF16
-// values. Each wave retains two or three interleaved segments in registers.
+// A 256-thread block normalizes one row. Each wave holds one 512-value
+// segment for N=2048, two for N=4096, and three for N=6144.
 template <typename DTYPE_I, bool ADD_RESIDUAL, int HIDDEN_SIZE>
 __global__ void mimo_rmsnorm_fp8_group_quant_kernel(
     opus::fp8_t* __restrict__ quantized,
@@ -349,12 +349,13 @@ __global__ void mimo_rmsnorm_fp8_group_quant_kernel(
     const DTYPE_I* __restrict__ weight,
     double epsilon,
     int m,
-    int n)
+    int n,
+    bool fn_compat)
 {
     static constexpr int hidden_size = HIDDEN_SIZE;
     static constexpr int BlockSize = 256;
     static constexpr int thread_data_size = hidden_size / BlockSize;
-    static_assert(hidden_size == 4096 || hidden_size == 6144);
+    static_assert(hidden_size == 2048 || hidden_size == 4096 || hidden_size == 6144);
     static constexpr bool interleave = true;
     static constexpr int32_t load_chunk_bytes = 16;
     static constexpr int32_t load_vec_size = load_chunk_bytes / sizeof(DTYPE_I);
@@ -474,9 +475,8 @@ __global__ void mimo_rmsnorm_fp8_group_quant_kernel(
                  num_load_inst,
                  DTYPE_I>(normalized_buffer, thread_data_float, row_offset);
 
-    // Each wave owns two or three interleaved 512-value segments. Sixteen lanes x
-    // eight BF16 values form one 128-value quantization group, so four waves
-    // produce all 32/48 groups while retaining the normalized values in registers.
+    // Sixteen lanes x eight BF16 values form one quantization group.
+    // Each 512-value segment contributes four consecutive groups to the row.
     static constexpr int quant_values_per_thread = load_vec_size;
     static constexpr int quant_threads_per_group = 128 / quant_values_per_thread;
     static constexpr int quant_segments_per_wave = num_load_inst;
@@ -492,6 +492,7 @@ __global__ void mimo_rmsnorm_fp8_group_quant_kernel(
     const int thread_in_group = lane_id % quant_threads_per_group;
     auto output_buffer = opus::make_gmem<opus::fp8_t>(
         quantized, static_cast<int64_t>(m) * hidden_size * sizeof(opus::fp8_t));
+    const float inverted_dtype_max = quant_inv_dtype_max<opus::fp8_t>(fn_compat);
 
     for(int segment = 0; segment < quant_segments_per_wave; ++segment)
     {
@@ -509,8 +510,6 @@ __global__ void mimo_rmsnorm_fp8_group_quant_kernel(
         }
         abs_max = multithread_reduce(abs_max, aiter::Max(), quant_threads_per_group);
 
-        constexpr float inverted_dtype_max =
-            1.0f / static_cast<float>(opus::finfo<opus::fp8_t>::max());
         float inverted_scale = abs_max * inverted_dtype_max;
         const int group_id = wave_id * quant_groups_per_wave +
                              segment * quant_groups_per_segment + group_in_segment;
@@ -547,9 +546,10 @@ static void check_mimo_rmsnorm_fp8_group_quant_inputs(
                 " is specialized for gfx950/gfx942, got ",
                 arch);
     AITER_CHECK(input.is_gpu(), __func__, " input must be on a HIP device");
-    AITER_CHECK(input.dim() == 2 && (input.size(1) == 4096 || input.size(1) == 6144),
+    AITER_CHECK(input.dim() == 2 &&
+                    (input.size(1) == 2048 || input.size(1) == 4096 || input.size(1) == 6144),
                 __func__,
-                " input must have shape [M, 4096] or [M, 6144]");
+                " input must have shape [M, 2048], [M, 4096], or [M, 6144]");
     AITER_CHECK(input.dtype() == AITER_DTYPE_bf16,
                 __func__,
                 " input must be bfloat16, got ",
@@ -641,6 +641,7 @@ static void launch_mimo_rmsnorm_fp8_group_quant(
     auto* residual_out_ptr =
         ADD_RESIDUAL ? reinterpret_cast<opus::bf16_t*>(residual_out->data_ptr())
                      : nullptr;
+    const bool fn_compat = fp8_fn_compat_enabled();
     auto launch = [&](auto hidden_size_tag) {
         constexpr int hidden_size = decltype(hidden_size_tag)::value;
         mimo_rmsnorm_fp8_group_quant_kernel<opus::bf16_t, ADD_RESIDUAL, hidden_size>
@@ -654,9 +655,12 @@ static void launch_mimo_rmsnorm_fp8_group_quant(
             reinterpret_cast<const opus::bf16_t*>(weight.data_ptr()),
             epsilon,
             m,
-            hidden_size);
+            hidden_size,
+            fn_compat);
     };
-    if(input.size(1) == 4096)
+    if(input.size(1) == 2048)
+        launch(std::integral_constant<int, 2048>{});
+    else if(input.size(1) == 4096)
         launch(std::integral_constant<int, 4096>{});
     else
         launch(std::integral_constant<int, 6144>{});
@@ -702,13 +706,14 @@ void mimo_rmsnorm_fp8_group_quant(aiter_tensor_t& quantized,
     const int num_row_per_block = 1; \
     dim3 grid((m + num_row_per_block - 1) / num_row_per_block); \
     dim3 block(BlockSize); \
+    const bool fn_compat = std::is_same_v<DTYPE_OO, opus::fp8_t> && group_size == 128 && !emit_e8m0_scale && fp8_fn_compat_enabled(); \
     add_rmsnorm_quant_kernel<DTYPE_I, DTYPE_OO, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, num_row_per_block><<<grid, block, 0, stream>>>(reinterpret_cast<DTYPE_OO*>(out.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(residual_out.data_ptr()), \
                                                                                                      reinterpret_cast<float*>(scale.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(input.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(residual_in.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(weight.data_ptr()), \
-                                                                                                     epsilon, gemma_norm, m, n, input_stride, residual_in_stride, residual_out_stride, out_stride, group_size, shuffle_scale, emit_e8m0_scale); \
+                                                                                                     epsilon, gemma_norm, m, n, input_stride, residual_in_stride, residual_out_stride, out_stride, group_size, shuffle_scale, emit_e8m0_scale, fn_compat); \
                                                                                                      });
 
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT) \

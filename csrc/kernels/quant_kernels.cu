@@ -9,6 +9,7 @@
 #include "aiter_hip_common.h"
 #include "aiter_dispatch.h"
 #include "aiter_opus_plus.h"
+#include "fp8_quant_range.h"
 #include "aiter_stream.h"
 #include "gemm_dispatch_utils.h"
 #include "quant.h"
@@ -40,7 +41,8 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       int32_t ori_row_stride,
                                       int64_t oob_size,
                                       int32_t const* __restrict__ num_rows = nullptr,
-                                      const int32_t num_cols_factor        = 1)
+                                      const int32_t num_cols_factor        = 1,
+                                      bool fn_compat                       = false)
 {
     static_assert(!emit_e8m0_scale
                       || std::is_same_v<DTYPE_O, opus::fp4_t>
@@ -85,13 +87,6 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     using vec_i = opus::vector_t<DTYPE_I, thread_data_size>;
     static constexpr int32_t vec_size_o =
         std::is_same_v<DTYPE_O, opus::fp4_t> ? thread_data_size / 2 : thread_data_size;
-    // The non-e8m0 (continuous fp32-scale) path uses the exact 1/DTYPE_MAX
-    // divisor. The e8m0 path instead derives a power-of-2 scale via
-    // fp_f32_to_e8m0_scale<> below (which folds in / max_pos), so it does not
-    // use this divisor.
-    const float inverted_DTYPE_MAX =
-        (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
-
     auto const* input_vecs = reinterpret_cast<vec_i const*>(input + row_offset);
     vec_i thread_data = input_vecs[threadIdx.x % num_thread_per_group];
     float absMax      = 1e-10f;
@@ -123,7 +118,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
     else
     {
-        inverted_scale = absMax * inverted_DTYPE_MAX;
+        inverted_scale = absMax * quant_inv_dtype_max<DTYPE_O>(fn_compat);
     }
     const int64_t out_row_offset =
         std::is_same_v<DTYPE_O, opus::fp4_t> ? x * ori_cols / 2 : x * ori_cols;
@@ -963,6 +958,8 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                 __func__,
                 " expects scales.dtype in {fp8_e8m0, u8, fp32}, got ",
                 AiterDtype_to_str(scales.dtype()));
+    const bool fn_compat = group_size == 128 && out.dtype() == AITER_DTYPE_fp8 &&
+                           !use_e8m0_scale && fp8_fn_compat_enabled();
 
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -1039,7 +1036,8 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                         row_stride,
                         oob_size,
                         num_rows_ptr,
-                        num_rows_factor);
+                        num_rows_factor,
+                        fn_compat);
                 });
         };
 
