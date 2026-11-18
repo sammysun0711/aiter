@@ -526,8 +526,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         K = input_.shape[-1]
         fused_ok = False
         out = res_out = scale_out = bf16_out = None
+        # The fused gfx942 epilogue uses /240. Use the per-group fallback for /224.
+        use_compat_quant = (
+            group_size == 128
+            and fp8 == torch.float8_e4m3fnuz
+            and os.getenv("AITER_MIMO_RMSNORM_FP8_FN_COMPAT") == "1"
+        )
         if (
-            K % group_size == 0
+            not use_compat_quant
+            and K % group_size == 0
             and K <= 16384
             and total_bytes < 8 * 1024 * 8192
             and self.world_size != 6

@@ -472,7 +472,7 @@ def per_group_quant_hip(
     if scale_type == dtypes.fp8_e8m0 or fp8_per128:
         dynamic_per_group_scaled_quant(
             y,
-            x.unsqueeze(0) if fp8_per128 and x.ndim == 1 else x,
+            x.view(-1, shape[-1]) if fp8_per128 else x,
             scale,
             group_size,
             shuffle_scale=transpose_scale,

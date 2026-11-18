@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -254,6 +256,47 @@ def test_token_and_group_of_width_128(monkeypatch):
         selected = 224 if flag == "1" and get_gfx() == "gfx942" else native_max
         assert torch.all(token.float() == native_max)
         assert torch.all(grouped.float() == selected)
+
+
+def test_per128_flattens_contiguous_rows(monkeypatch):
+    from aiter.ops import quant
+
+    x = torch.empty((1, 2, 128), dtype=torch.bfloat16, device="cuda").transpose(0, 1)
+    assert x.is_contiguous() and x.stride(-2) != 128
+    launch = Mock()
+    monkeypatch.setattr(quant, "dynamic_per_group_scaled_quant", launch)
+    q, scale = quant.per_group_quant_hip(x, quant_dtype=dtypes.fp8)
+    launch.assert_called_once()
+    rows = launch.call_args.args[1]
+    assert rows.shape == (2, 128) and rows.stride() == (128, 1)
+    assert rows.data_ptr() == x.data_ptr()
+    assert q.shape == x.shape and scale.shape == (2, 1, 1)
+
+
+@pytest.mark.parametrize("flag", ["0", "1"])
+def test_allreduce_per128_compat_dispatch(monkeypatch, flag):
+    from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
+
+    x = torch.ones((3, 256), dtype=torch.bfloat16, device="cuda")
+    comm = Mock(world_size=2, _ar_1stage_max_kb=-1, _ar_1stage_override=True)
+    comm.fused_allreduce_rmsnorm.return_value = (x, x)
+    fused = comm.ca_comm.custom_fused_ar_rms_per_group_quant
+    monkeypatch.setenv(FN_COMPAT_ENV, flag)
+    # Force the existing fallback to obtain its real HIP FP8 output and scales.
+    fused.return_value = None
+    run = CudaCommunicator.fused_allreduce_rmsnorm_quant_per_group
+    expected = run(comm, x, x, x[0], 1e-6, emit_bf16=True, transpose_scale=True)
+    use_fallback = flag == "1" and get_gfx() == "gfx942"
+    assert torch.all(
+        expected[0].float() == (224 if use_fallback else torch.finfo(dtypes.fp8).max)
+    )
+    fused.return_value = expected
+    comm.reset_mock()
+    actual = run(comm, x, x, x[0], 1e-6, emit_bf16=True, transpose_scale=True)
+    assert fused.call_count == int(not use_fallback)
+    assert comm.fused_allreduce_rmsnorm.call_count == int(use_fallback)
+    assert actual[2].stride() == (1, x.size(0))
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
 
 
 @pytest.mark.parametrize("use_num_local_tokens", [False, True])
