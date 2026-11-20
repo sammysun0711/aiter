@@ -268,7 +268,10 @@ def gemm_a8w8_blockscale_flydsl(
 ) -> Tensor:
     # A tuned FlyDSL row must execute FlyDSL, never silently select another backend.
     gfx = get_gfx()
-    assert gfx == "gfx950", f"FlyDSL blockscale only supports gfx950, got {gfx}"
+    assert gfx in (
+        "gfx942",
+        "gfx950",
+    ), f"Unsupported FlyDSL FP32 blockscale architecture: {gfx}"
     assert Out.dtype in (
         dtypes.bf16,
         dtypes.fp16,
@@ -630,6 +633,22 @@ def get_CKGEMM_config(
         key = (gfx, cu_num, padded_M, N, K) if has_gfx else (cu_num, padded_M, N, K)
         config = _CKGEMM_CONFIG_CACHE[tuned_file].get(key, None)
         if config is not None:
+            # gfx942 FlyDSL tiles have no M tail. A row found by rounding M
+            # up is usable only if the actual M still fills whole tiles.
+            if padded_M != M and config.get("libtype") == "flydsl":
+                from .flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+                    kernel_fits_shape,
+                    kernels_by_name,
+                )
+
+                kernel = kernels_by_name.get(config.get("kernelName"))
+                if (
+                    kernel is not None
+                    and kernel.gfx == "gfx942"
+                    and not kernel_fits_shape(kernel, M, N, K, gfx)
+                ):
+                    config = None
+                    continue
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
                     f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {tuned_file} , kernel name is {config['kernelName']}!"
@@ -2030,7 +2049,9 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 w_scale=w_scale,
                 family="a8w8_blockscale_bpreshuffle",
             )
-        elif libtype == "flydsl" and kernelName.startswith("flydsl_blockscale_8w_"):
+        elif libtype == "flydsl" and kernelName.startswith(
+            ("flydsl_blockscale_8w_", "flydsl_blockscale_gfx942_")
+        ):
             return gemm_a8w8_blockscale_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config, isBpreshuffled=True
             )

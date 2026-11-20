@@ -222,15 +222,19 @@ def test_gemm(
             ret["triton err"] = err_triton
             ret["triton/ck"] = avg_d / avg_b
 
-        # FlyDSL blockscale runs on gfx950 with FP32 scales, on shapes its tile fits.
-        if get_gfx() == "gfx950":
+        gfx = get_gfx()
+        if gfx in ("gfx942", "gfx950"):
             from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
                 kernel_fits_shape,
-                kernelInstance,
+                kernels_list,
             )
 
-            flydsl_kernel = kernelInstance(ck_preshuffle)
-            if kernel_fits_shape(flydsl_kernel, m, n, k, get_gfx()):
+            for flydsl_kernel in kernels_list.values():
+                if (
+                    flydsl_kernel.preshuffle_b != ck_preshuffle
+                    or not kernel_fits_shape(flydsl_kernel, m, n, k, gfx)
+                ):
+                    continue
                 f, avg_f = run_flydsl(
                     x,
                     gemm_weight,
@@ -240,12 +244,18 @@ def test_gemm(
                     ck_preshuffle,
                     dtype,
                 )
-                ret["flydsl us"] = avg_f
-                ret["flydsl TFLOPS"] = m * n * k * 2 / avg_f / 1e6
-                ret["flydsl TB/s"] = (x.nbytes + weight.nbytes) / avg_f / 1e6
-                ret["flydsl err"] = checkAllclose(
-                    a, f, msg="flydsl", catastrophic_check=True
+                tag = (
+                    "flydsl"
+                    if gfx == "gfx950"
+                    else f"flydsl {flydsl_kernel.tile_m}x{flydsl_kernel.tile_n} {flydsl_kernel.variant}".rstrip()
                 )
+                ret[f"{tag} us"] = avg_f
+                ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_f / 1e6
+                ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_f / 1e6
+                ret[f"{tag} err"] = checkAllclose(
+                    a, f, msg=tag, catastrophic_check=True
+                )
+                assert ret[f"{tag} err"] <= 0.05, f"{tag} mismatch for {(m, n, k)}"
 
     return ret
 

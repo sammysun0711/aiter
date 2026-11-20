@@ -8,6 +8,7 @@ import aiter
 from aiter import dtypes
 from aiter.ops import gemm_op_a8w8 as gemm_mod
 from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import checkAllclose
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or gemm_mod.get_gfx() not in ("gfx942", "gfx950"),
@@ -130,6 +131,83 @@ def test_fp16_output_on_asm_row_uses_ck(monkeypatch):
     assert y.dtype == dtypes.fp16
     assert asm_calls == [4], "fp16 output must not reach the bf16-only asm kernel"
     torch.testing.assert_close(y.float(), ref.float(), atol=0.5, rtol=0.02)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or gemm_mod.get_gfx() != "gfx942",
+    reason="CDNA3 FNUZ kernel",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "m,n,k,tile,variant",
+    [(128, 256, 384, "128x128", ""), (32, 192, 128, "32x64", "")]
+    + [
+        (128, 256, k, "128x128", "_" + v)
+        for k in (128, 256, 384)
+        for v in ("lds_m", "lds_n", "reg_a")
+    ],
+)
+def test_gfx942_flydsl_packed_out(monkeypatch, dtype, m, n, k, tile, variant):
+    torch.manual_seed(942)
+    # A view may be contiguous while missing the variant's load alignment.
+    offset = 8 if variant else 1
+    x = torch.randn(m * k + offset, device="cuda").to(dtypes.fp8)[offset:].view(m, k)
+    w = torch.randn(n, k, device="cuda").to(dtypes.fp8)
+    sx = torch.rand(m, k // 128, device="cuda") + 0.25
+    sw = torch.rand((n + 127) // 128, k // 128, device="cuda") + 0.25
+    ref = (x.double() * sx.repeat_interleave(128, 1)) @ (
+        w.double() * sw.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)
+    ).T
+    outer = torch.full((m, n + 8), SENTINEL, dtype=dtype, device="cuda")
+    out = outer[:, :n]
+    out.fill_(float("nan"))
+    row = {
+        "libtype": "flydsl",
+        "kernelName": f"flydsl_blockscale_gfx942_{tile}x128_ps1{variant}",
+    }
+    monkeypatch.setattr(gemm_mod, "get_CKGEMM_config", lambda *a, **kw: row)
+
+    def unexpected_ck(*args, **kwargs):
+        pytest.fail("a tuned FlyDSL row dispatched to CK")
+
+    monkeypatch.setattr(gemm_mod, "gemm_a8w8_blockscale_bpreshuffle_ck", unexpected_ck)
+    y = gemm_mod.gemm_a8w8_blockscale_bpreshuffle(
+        x, shuffle_weight(w, layout=(16, 16)), sx.T.contiguous().T, sw, dtype, out=out
+    )
+    assert y.data_ptr() == out.data_ptr()
+    assert bool((outer[:, n:] == SENTINEL).all())
+    assert checkAllclose(ref.float(), out.float(), rtol=0.01, atol=0.01) == 0
+
+    if variant == "_reg_a":
+        # The vector epilogue also accepts a contiguous but offset output view.
+        storage = torch.full((m * n + 1,), SENTINEL, dtype=dtype, device="cuda")
+        offset_out = storage[1:].view(m, n)
+        y = gemm_mod.gemm_a8w8_blockscale_bpreshuffle(
+            x,
+            shuffle_weight(w, layout=(16, 16)),
+            sx.T.contiguous().T,
+            sw,
+            dtype,
+            out=offset_out,
+        )
+        assert y.data_ptr() == offset_out.data_ptr() and storage[0].item() == SENTINEL
+        assert checkAllclose(ref.float(), y.float(), rtol=0.01, atol=0.01) == 0
+
+
+def test_gfx942_flydsl_padded_lookup(tmp_path):
+    table = tmp_path / "flydsl.csv"
+    table.write_text(
+        "gfx,cu_num,M,N,K,libtype,kernelName\n"
+        "gfx942,304,128,256,384,flydsl,flydsl_blockscale_gfx942_128x128x128_ps1\n"
+    )
+
+    def lookup(m):
+        return gemm_mod.get_CKGEMM_config(
+            m, 256, 384, str(table), gfx="gfx942", cu_num=304
+        )
+
+    assert lookup(128)["libtype"] == "flydsl"
+    assert lookup(127) is None
 
 
 if __name__ == "__main__":

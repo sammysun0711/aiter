@@ -1,5 +1,7 @@
 # CK GEMM A8W8 Blockscale BPreshuffle Tune
 
+For 304-CU gfx942, the MI300X guide includes the native tuning commands, runtime CSVs, row-chunk plans and a signed-input benchmark. [MI300X FP8 GEMM tuning guide](../../docs/mi300x-fp8-gemm-tuning-guide.md)
+
 1. Install aiter:
 `cd $aiter_path`
 `python3 setup.py develop`

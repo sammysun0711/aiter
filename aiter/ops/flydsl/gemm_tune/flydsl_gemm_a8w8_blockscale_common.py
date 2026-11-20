@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tune space for the gfx950 8-wave FP8 blockscale GEMM.
+"""Tune spaces for the gfx950 8-wave and gfx942 4-wave FP8 blockscale GEMMs.
 
-The tile, half-M pipeline, raw DMA, PID swizzle and permlane epilogue are fixed.
-The preshuffle bit distinguishes the two weight layouts: ID 0 is plain B and
-ID 1 is preshuffled B. Kernel names omit the fixed pipeline and DMA flags.
-The historical B16 names also serve FP16 calls; the output tensor specializes
-the epilogue, with separate runtime/AOT cache entries for the two dtypes.
-No FlyDSL compiler imports are needed to read this table.
+On gfx950 IDs 0 and 1 select plain and preshuffled B with the fixed 8-wave
+pipeline. On gfx942 each tile has a plain and a preshuffled variant. The
+output tensor specializes the epilogue for BF16 or FP16.
 """
 
 from dataclasses import dataclass
@@ -22,9 +19,16 @@ KERNEL_PREFIX = "flydsl_blockscale_8w_"
 @dataclass(frozen=True)
 class kernelInstance:
     preshuffle_b: bool
+    gfx: str = "gfx950"
+    tile_m: int = TILE_M
+    tile_n: int = TILE_N
+    variant: str = ""
 
     @property
     def name(self) -> str:
+        if self.gfx == "gfx942":
+            suffix = f"_{self.variant}" if self.variant else ""
+            return f"flydsl_blockscale_gfx942_{self.tile_m}x{self.tile_n}x128_ps{int(self.preshuffle_b)}{suffix}"
         return (
             f"{KERNEL_PREFIX}{TILE_M}x{TILE_N}x{TILE_K}_F8_F8_B16_"
             f"ps{int(self.preshuffle_b)}"
@@ -36,6 +40,12 @@ kernels_list = {
     0: kernelInstance(False),
     1: kernelInstance(True),
 }
+for tm, tn in ((32, 64), (64, 64), (64, 128), (128, 64), (128, 128)):
+    for packed in (False, True):
+        kernels_list[len(kernels_list)] = kernelInstance(packed, "gfx942", tm, tn)
+# Append packed candidates so existing tuned IDs keep their meaning.
+for variant in ("lds_m", "lds_n", "reg_a"):
+    kernels_list[len(kernels_list)] = kernelInstance(True, "gfx942", 128, 128, variant)
 kernels_by_name = {ki.name: ki for ki in kernels_list.values()}
 
 
@@ -46,6 +56,19 @@ def lds_bytes(K: int) -> int:
 
 
 def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int, gfx: str) -> bool:
+    if gfx != ki.gfx:
+        return False
+    if gfx == "gfx942":
+        # Exact register tiles, i32 dimensions, i64 matrix addresses. Flattened
+        # scale tensors also have to fit the FlyDSL launcher extent ABI.
+        return (
+            min(M, N, K) > 0
+            and M % ki.tile_m == 0
+            and N % ki.tile_n == 0
+            and K % 128 == 0
+            and (ki.variant != "reg_a" or 128 * K < 2**31)
+            and max(M, N, K, M * (K // 128), ((N + 127) // 128) * (K // 128)) < 2**31
+        )
     if gfx != "gfx950" or M <= 0 or N <= 0 or K < 256 or K % 256:
         return False
     if N % (16 if ki.preshuffle_b else 8):

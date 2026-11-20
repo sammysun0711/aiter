@@ -530,7 +530,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         self, info_keys, seed, preshuffleB, run_kwargs
     ):
         gfx, _, M, N, K = info_keys
-        if gfx != "gfx950":
+        if gfx not in ("gfx942", "gfx950"):
             return []
         try:
             from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (

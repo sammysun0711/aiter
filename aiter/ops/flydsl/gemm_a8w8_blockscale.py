@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Aiter adapter for the rebased half-M, raw-DMA FP8 blockscale kernel."""
+"""AITER launch adapter for FP32 block-scaled FP8 GEMM."""
 
 import functools
 
 import torch
 from torch import Tensor
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     TILE_K,
     TILE_M,
     TILE_N,
     kernel_fits_shape,
-    kernelInstance,
     kernels_by_name,
+    kernels_list,
 )
 
 
@@ -28,13 +30,17 @@ def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> boo
         return False
     if not XQ.is_cuda or WQ.device != XQ.device or Out.device != XQ.device:
         return False
-    fp8_storage = (torch.float8_e4m3fn, torch.int8, torch.uint8)
+    gfx = get_gfx_runtime()
+    fp8_dtype = torch.float8_e4m3fnuz if gfx == "gfx942" else torch.float8_e4m3fn
+    fp8_storage = (fp8_dtype, torch.int8, torch.uint8)
     if XQ.dtype not in fp8_storage or WQ.dtype not in fp8_storage:
         return False
     if Out.dtype not in (torch.bfloat16, torch.float16):
         return False
-    gfx = torch.cuda.get_device_properties(XQ.device).gcnArchName.split(":", 1)[0]
-    return kernel_fits_shape(kernelInstance(preshuffle_b), M, N, K, gfx)
+    return any(
+        ki.preshuffle_b == preshuffle_b and kernel_fits_shape(ki, M, N, K, gfx)
+        for ki in kernels_list.values()
+    )
 
 
 def _prepare_scales(
@@ -85,21 +91,27 @@ def _compile_gemm(
     device_index: int,
     out_dtype: torch.dtype = torch.bfloat16,
 ):
-    from .kernels.gemm_a8w8_blockscale_8wave import compile_gemm_fp8_8wave
-
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("FlyDSL blockscale requires BF16 or FP16 output")
     # The output tensor specializes the epilogue. Keep separate launchers since
     # _run_compiled caches the first typed CompiledFunction on each launcher.
     ki = kernels_by_name[kernel_name]
-    launch = compile_gemm_fp8_8wave(
-        TILE_M,
-        TILE_N,
-        TILE_K,
-        N,
-        K,
-        preshuffle_b=ki.preshuffle_b,
-    )
+    if ki.variant == "reg_a":
+        from .kernels.gemm_a8w8_blockscale_gfx942_register import compile_register_gemm
+
+        launch = compile_register_gemm(N, K, kernel_name)
+    elif ki.gfx == "gfx942":
+        from .kernels.gemm_a8w8_blockscale_gfx942 import compile_blockscale_gfx942
+
+        launch = compile_blockscale_gfx942(
+            N, K, ki.tile_m, ki.tile_n, ki.preshuffle_b, ki.variant
+        )
+    else:
+        from .kernels.gemm_a8w8_blockscale_8wave import compile_gemm_fp8_8wave
+
+        launch = compile_gemm_fp8_8wave(
+            TILE_M, TILE_N, TILE_K, N, K, preshuffle_b=ki.preshuffle_b
+        )
     # Match the prototype's flyc.compile[{"opt_level": 2}] without a global knob.
     launch.compile_hints["opt_level"] = 2
     return launch
@@ -118,7 +130,7 @@ def run_gemm_a8w8_blockscale(
 
     Plain B: XQ[M,K], WQ[N,K], row-major x_scale[M,K/128].
     Preshuffled B: shuffle_weight(WQ, (16,16)) and column-major x_scale.
-    Both use w_scale[ceil(N/128),K/128] and BF16/FP16 output on gfx950.
+    Both use w_scale[ceil(N/128),K/128] and BF16/FP16 output.
     """
     ki = kernels_by_name.get(kernel_name)
     if ki is None:
@@ -136,16 +148,35 @@ def run_gemm_a8w8_blockscale(
 
     M, K = XQ.shape
     N = WQ.shape[0]
+    if not kernel_fits_shape(ki, M, N, K, get_gfx_runtime()):
+        raise ValueError(f"{kernel_name} cannot serve this device or shape")
     with torch.cuda.device(XQ.device):
         sa, sb = _prepare_scales(x_scale, w_scale, M, N, K, preshuffle_b)
         launch = _compile_gemm(N, K, kernel_name, XQ.device.index, Out.dtype)
         out_contiguous = Out.contiguous()
         # Keep matrix dimensions separate in the launch ABI: flattening a
         # >2**31-element matrix overflows a dynamic i32 FlyDSL extent.
+        a, b = XQ.contiguous(), WQ.contiguous()
+        if ki.gfx == "gfx942":
+            # Each MFMA operand is eight FP8 bytes. Offset views may require
+            # realignment even if PyTorch considers the matrix contiguous.
+            # The LDS and transposed-register variants issue 16-byte loads.
+            alignment = 16 if ki.variant else 8
+            a = (
+                a.clone() if a.storage_offset() % 8 or a.data_ptr() % alignment else a
+            ).view(torch.int64)
+            b = (
+                b.clone() if b.storage_offset() % 8 or b.data_ptr() % alignment else b
+            ).view(torch.int64)
+            # The transposed MFMA epilogue writes four BF16/FP16 columns at once.
+            if ki.variant == "reg_a" and out_contiguous.data_ptr() % 8:
+                out_contiguous = torch.empty_like(out_contiguous)
+        else:
+            a, b = a.view(torch.int8), b.view(torch.int8)
         _run_compiled(
             launch,
-            XQ.contiguous().view(torch.int8),
-            WQ.contiguous().view(torch.int8),
+            a,
+            b,
             out_contiguous,
             sa,
             sb,
