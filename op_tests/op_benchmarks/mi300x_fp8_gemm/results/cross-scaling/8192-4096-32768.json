@@ -1,0 +1,579 @@
+{
+  "shape": [
+    8192,
+    4096,
+    32768
+  ],
+  "gpu_uuid": "64626539-3161-6632-3134-326231366539",
+  "samples_checked": 1024,
+  "graph_ops": 3,
+  "rounds": 4,
+  "groups": 2,
+  "methods": {
+    "ptpc_torch": {
+      "name": "ptpc_torch",
+      "scaling": "ptpc",
+      "weight": "ordinary",
+      "rows": 8192,
+      "backend": "PyTorch _scaled_mm",
+      "kernel": "",
+      "kernel_id": "",
+      "calls": 1,
+      "rounds_us": [
+        [
+          1920.5153783162434,
+          1962.9063606262207
+        ],
+        [
+          1982.711950937907,
+          1967.1826362609863
+        ],
+        [
+          1963.7749989827473,
+          1956.2509854634602
+        ],
+        [
+          1981.642723083496,
+          1959.2043558756511
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0015927571191828253,
+      "max_over_rms": 0.008726626476604504,
+      "median_us": 1963.340679804484,
+      "tflops": 1120.0416097785874
+    },
+    "ptpc_tgemm_plain": {
+      "name": "ptpc_tgemm_plain",
+      "scaling": "ptpc",
+      "weight": "ordinary",
+      "rows": 8192,
+      "backend": "hipBLASLt",
+      "kernel": "Cijk_Alik_Bljk_F8NBS_BH_Bias_HA_S_SABV_SAV_UserArgs_MT256x224x128_MI16x16x1_SN_LDSB0_AFC1_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA1_DTVB0_EPS0_FDSI0_GRPM1_GRVWA16_GRVWB16_GSUAMBSK_GLS0_ISA942_IU1_K1_LDSTI0_LBSPPA0_LBSPPB256_LBSPPM0_LPA0_LPB32_LPM0_LRVW16_LWPMn1_MIAV0_MIWT4_14_MO40_NTn1_NTA0_NTB0_NTC0_NTD4_NTM0_NEPBS8_NLCA2_NLCB1_ONLL0_PGR2_PLR1_PKA1_SIA3_SS1_SPO0_SRVW0_SSO0_SVW4_SK0_SKFTR0_SKXCCM0_TLDS1_ULSGRO0_USL1_UIOFGRO0_USFGROn1_VSn1_VWA4_VWB2_WSGRA0_WSGRB0_WS64_WG64_4_1",
+      "kernel_id": "261367",
+      "calls": 1,
+      "rounds_us": [
+        [
+          1970.5773989359539,
+          1971.739927927653
+        ],
+        [
+          1968.9070383707683,
+          1959.8326683044434
+        ],
+        [
+          1978.7160555521648,
+          1977.8742790222168
+        ],
+        [
+          1962.0107014973958,
+          1992.6676750183105
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0015927571191828253,
+      "max_over_rms": 0.008726626476604504,
+      "median_us": 1971.1586634318035,
+      "tflops": 1115.5993154419555
+    },
+    "ptpc_tgemm_packed": {
+      "name": "ptpc_tgemm_packed",
+      "scaling": "ptpc",
+      "weight": "packed",
+      "rows": 8192,
+      "backend": "hipBLASLt",
+      "kernel": "Cijk_Alik_Bljk_F8NBS_STA_BH_SABV_UserArgs_MT256x224x128_MI16x16x1_SN_LDSB0_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA1_DTVB0_EPS0_FDSI0_GRPM1_GRVWA16_GRVWB16_GSUAMBSK_GLS0_ISA942_IU1_K1_LDSTI0_LBSPPA0_LBSPPB256_LBSPPM0_LPA0_LPB32_LPM0_LRVW16_LWPMn1_MIAV0_MIWT4_14_MO40_NTn1_NTA0_NTB0_NTC0_NTD4_NTM0_NEPBS8_NLCA2_NLCB1_ONLL0_PGR2_PLR1_PKA1_SIA3_SS1_SPO0_SRVW0_SSO0_SVW4_SK0_SKFTR0_SKXCCM0_TLDS1_ULSGRO0_USL1_UIOFGRO0_USFGROn1_VSn1_VWA4_VWB2_WSGRA0_WSGRB0_WS64_WG64_4_1",
+      "kernel_id": "278514",
+      "calls": 1,
+      "rounds_us": [
+        [
+          1862.2609774271648,
+          1880.7303110758464
+        ],
+        [
+          1906.201998392741,
+          1916.3859685262044
+        ],
+        [
+          1936.7663065592449,
+          1902.3399353027344
+        ],
+        [
+          1924.7652689615886,
+          1890.673319498698
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0015927571191828253,
+      "max_over_rms": 0.008726626476604504,
+      "median_us": 1904.2709668477378,
+      "tflops": 1154.7848461882422
+    },
+    "ptpc_aiter_native": {
+      "name": "ptpc_aiter_native",
+      "scaling": "ptpc",
+      "weight": "packed",
+      "rows": 8192,
+      "backend": "ck",
+      "kernel": "",
+      "kernel_id": "",
+      "calls": 1,
+      "rounds_us": [
+        [
+          2210.0753784179688,
+          2244.327704111735
+        ],
+        [
+          2223.8003412882485,
+          2250.0473658243814
+        ],
+        [
+          2217.545986175537,
+          2271.7107137044272
+        ],
+        [
+          2259.4289779663086,
+          2258.2263946533203
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0015927571191828253,
+      "max_over_rms": 0.008726626476604504,
+      "median_us": 2247.187534968058,
+      "tflops": 978.5668625040933
+    },
+    "tensor_channel_torch": {
+      "name": "tensor_channel_torch",
+      "scaling": "tensor_channel",
+      "weight": "ordinary",
+      "rows": 8192,
+      "backend": "PyTorch _scaled_mm",
+      "kernel": "",
+      "kernel_id": "",
+      "calls": 1,
+      "rounds_us": [
+        [
+          1955.5962880452473,
+          1958.9773813883464
+        ],
+        [
+          1991.719404856364,
+          1967.409610748291
+        ],
+        [
+          1960.914929707845,
+          1972.782293955485
+        ],
+        [
+          1974.6665954589844,
+          1983.9413960774739
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0017078418853608305,
+      "max_over_rms": 0.009078786866862757,
+      "median_us": 1970.0959523518882,
+      "tflops": 1116.2010931126579
+    },
+    "tensor_channel_tgemm_plain": {
+      "name": "tensor_channel_tgemm_plain",
+      "scaling": "tensor_channel",
+      "weight": "ordinary",
+      "rows": 8192,
+      "backend": "hipBLASLt",
+      "kernel": "Cijk_Alik_Bljk_F8NBS_BH_Bias_HA_S_SABV_SAV_UserArgs_MT256x224x128_MI16x16x1_SN_LDSB0_AFC1_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA1_DTVB0_EPS0_FDSI0_GRPM1_GRVWA16_GRVWB16_GSUAMBSK_GLS0_ISA942_IU1_K1_LDSTI0_LBSPPA0_LBSPPB256_LBSPPM0_LPA0_LPB32_LPM0_LRVW16_LWPMn1_MIAV0_MIWT4_14_MO40_NTn1_NTA0_NTB0_NTC0_NTD4_NTM0_NEPBS8_NLCA2_NLCB1_ONLL0_PGR2_PLR1_PKA1_SIA3_SS1_SPO0_SRVW0_SSO0_SVW4_SK0_SKFTR0_SKXCCM0_TLDS1_ULSGRO0_USL1_UIOFGRO0_USFGROn1_VSn1_VWA4_VWB2_WSGRA0_WSGRB0_WS64_WG64_4_1",
+      "kernel_id": "261367",
+      "calls": 1,
+      "rounds_us": [
+        [
+          1975.121021270752,
+          1964.6569887797039
+        ],
+        [
+          2000.3393491109211,
+          1938.1693204243977
+        ],
+        [
+          1986.3333702087402,
+          1968.5726165771484
+        ],
+        [
+          1968.6923027038574,
+          1969.4946606953938
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0017078418853608305,
+      "max_over_rms": 0.009078786866862757,
+      "median_us": 1969.0934816996255,
+      "tflops": 1116.7693540145744
+    },
+    "tensor_channel_tgemm_packed": {
+      "name": "tensor_channel_tgemm_packed",
+      "scaling": "tensor_channel",
+      "weight": "packed",
+      "rows": 8192,
+      "backend": "hipBLASLt",
+      "kernel": "Cijk_Alik_Bljk_F8NBS_STA_BH_SABV_UserArgs_MT256x224x128_MI16x16x1_SN_LDSB0_AFC0_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA0_DTLB0_DTVA1_DTVB0_EPS0_FDSI0_GRPM1_GRVWA16_GRVWB16_GSUAMBSK_GLS0_ISA942_IU1_K1_LDSTI0_LBSPPA0_LBSPPB256_LBSPPM0_LPA0_LPB32_LPM0_LRVW16_LWPMn1_MIAV0_MIWT4_14_MO40_NTn1_NTA0_NTB0_NTC0_NTD4_NTM0_NEPBS8_NLCA2_NLCB1_ONLL0_PGR2_PLR1_PKA1_SIA3_SS1_SPO0_SRVW0_SSO0_SVW4_SK0_SKFTR0_SKXCCM0_TLDS1_ULSGRO0_USL1_UIOFGRO0_USFGROn1_VSn1_VWA4_VWB2_WSGRA0_WSGRB0_WS64_WG64_4_1",
+      "kernel_id": "278514",
+      "calls": 1,
+      "rounds_us": [
+        [
+          1892.250378926595,
+          1890.3660774230957
+        ],
+        [
+          1849.3247032165527,
+          1865.4419581095378
+        ],
+        [
+          1913.4052594502766,
+          1907.9662958780925
+        ],
+        [
+          1867.3529624938965,
+          1917.0673688252766
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0017078418853552933,
+      "max_over_rms": 0.009078786866862757,
+      "median_us": 1891.3082281748452,
+      "tflops": 1162.6995657255225
+    },
+    "tensor_channel_aiter_native": {
+      "name": "tensor_channel_aiter_native",
+      "scaling": "tensor_channel",
+      "weight": "packed",
+      "rows": 8192,
+      "backend": "ck",
+      "kernel": "",
+      "kernel_id": "",
+      "calls": 1,
+      "rounds_us": [
+        [
+          2223.8403956095376,
+          2227.301279703776
+        ],
+        [
+          2227.83629099528,
+          2247.9893366495767
+        ],
+        [
+          2212.708314259847,
+          2251.1165936787925
+        ],
+        [
+          2287.1726353963218,
+          2244.1004117329917
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0017078418853552933,
+      "max_over_rms": 0.009078786866862757,
+      "median_us": 2235.9683513641357,
+      "tflops": 983.4769146935394
+    },
+    "block_ck_plain": {
+      "name": "block_ck_plain",
+      "scaling": "block128",
+      "weight": "ordinary",
+      "rows": 8192,
+      "backend": "ck",
+      "kernel": "a8w8_blockscale_1x128x128_256x128x128x128_16x16_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8_1x1_intrawave_v3",
+      "kernel_id": "0",
+      "calls": 1,
+      "rounds_us": [
+        [
+          3627.0310084025064,
+          3617.128372192383
+        ],
+        [
+          3637.5624338785806,
+          3715.2077356974282
+        ],
+        [
+          3629.8913955688477,
+          3664.1031901041665
+        ],
+        [
+          3666.9766108194985,
+          3685.7531865437827
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0016159862808059616,
+      "max_over_rms": 0.006422540860199609,
+      "median_us": 3650.8328119913735,
+      "tflops": 602.3346915063269
+    },
+    "block_triton": {
+      "name": "block_triton",
+      "scaling": "block128",
+      "weight": "ordinary",
+      "rows": 8192,
+      "backend": "triton",
+      "kernel": "",
+      "kernel_id": "",
+      "calls": 1,
+      "rounds_us": [
+        [
+          8652.41559346517,
+          8745.723724365234
+        ],
+        [
+          8522.743860880533,
+          8541.653315226236
+        ],
+        [
+          8636.76643371582,
+          8525.14902750651
+        ],
+        [
+          8622.666676839193,
+          8561.793645222982
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0016159862808059616,
+      "max_over_rms": 0.006422540860199609,
+      "median_us": 8592.230161031088,
+      "tflops": 255.93160498951437
+    },
+    "block_ck": {
+      "name": "block_ck",
+      "scaling": "block128",
+      "weight": "packed",
+      "rows": 8192,
+      "backend": "ck",
+      "kernel": "a8w8_blockscale_bpreshuffle_1x128x128_256x128x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v3",
+      "kernel_id": "0",
+      "calls": 1,
+      "rounds_us": [
+        [
+          2740.7105763753257,
+          2681.4937591552734
+        ],
+        [
+          2689.5523071289062,
+          2674.210548400879
+        ],
+        [
+          2691.6774113972983,
+          2658.775011698405
+        ],
+        [
+          2675.347010294596,
+          2675.4802068074546
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0016159862808059616,
+      "max_over_rms": 0.006422540860199609,
+      "median_us": 2678.4869829813642,
+      "tflops": 820.9945650377275
+    },
+    "block_cktile": {
+      "name": "block_cktile",
+      "scaling": "block128",
+      "weight": "packed",
+      "rows": 8192,
+      "backend": "cktile",
+      "kernel": "a8w8_blockscale_cktile_128x128x128_2x2x1_16x16x64_intrawave_0x1x0_2",
+      "kernel_id": "74",
+      "calls": 1,
+      "rounds_us": [
+        [
+          3034.480094909668,
+          3030.8850606282554
+        ],
+        [
+          3110.281308492025,
+          3075.4543940226235
+        ],
+        [
+          3068.6524709065757,
+          3069.934844970703
+        ],
+        [
+          3160.1425806681314,
+          3103.9603551228843
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0016159862808059616,
+      "max_over_rms": 0.006422540860199609,
+      "median_us": 3072.694619496663,
+      "tflops": 715.6660611825529
+    },
+    "block_asm": {
+      "name": "block_asm",
+      "scaling": "block128",
+      "weight": "packed",
+      "rows": 8192,
+      "backend": "asm",
+      "kernel": "_ZN5aiter43fp8gemm_bf16_blockscale_BpreShuffle_128x128E",
+      "kernel_id": "40",
+      "calls": 1,
+      "rounds_us": [
+        [
+          2442.183017730713,
+          2420.7472801208496
+        ],
+        [
+          2445.0833002726235,
+          2434.432029724121
+        ],
+        [
+          2495.265324910482,
+          2463.3782704671225
+        ],
+        [
+          2431.598981221517,
+          2456.3490549723306
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0033823614724727623,
+      "max_over_rms": 0.012862158769843231,
+      "median_us": 2443.633159001668,
+      "tflops": 899.899089784163
+    },
+    "block_flydsl": {
+      "name": "block_flydsl",
+      "scaling": "block128",
+      "weight": "packed",
+      "rows": 8192,
+      "backend": "flydsl",
+      "kernel": "flydsl_blockscale_gfx942_128x128x128_ps1",
+      "kernel_id": "11",
+      "calls": 1,
+      "rounds_us": [
+        [
+          4984.744071960449,
+          4908.087730407715
+        ],
+        [
+          4835.801124572754,
+          4891.128222147624
+        ],
+        [
+          4833.448727925618,
+          4926.275889078776
+        ],
+        [
+          4901.99343363444,
+          5033.255894978841
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0016159862808059616,
+      "max_over_rms": 0.006422540860199609,
+      "median_us": 4905.040582021078,
+      "tflops": 448.3190747926314
+    },
+    "block_lds_m": {
+      "name": "block_lds_m",
+      "scaling": "block128",
+      "weight": "packed",
+      "rows": 8192,
+      "backend": "FlyDSL prototype",
+      "kernel": "lds_a2_two_m",
+      "kernel_id": "",
+      "calls": 1,
+      "rounds_us": [
+        [
+          2951.382319132487,
+          2961.418787638346
+        ],
+        [
+          3018.416404724121,
+          2975.0099182128906
+        ],
+        [
+          2967.619260152181,
+          2988.0800247192383
+        ],
+        [
+          3007.1773529052734,
+          2966.0558700561523
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0016159862808059616,
+      "max_over_rms": 0.006422540860199609,
+      "median_us": 2971.314589182536,
+      "tflops": 740.0842925073754
+    },
+    "block_lds_n": {
+      "name": "block_lds_n",
+      "scaling": "block128",
+      "weight": "packed",
+      "rows": 8192,
+      "backend": "FlyDSL prototype",
+      "kernel": "lds_a2_n",
+      "kernel_id": "",
+      "calls": 1,
+      "rounds_us": [
+        [
+          2802.278518676758,
+          2785.132726033529
+        ],
+        [
+          2788.1530125935874,
+          2789.9039586385093
+        ],
+        [
+          2843.0391947428384,
+          2805.5801391601562
+        ],
+        [
+          2817.206700642904,
+          2789.155642191569
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0016159862808059616,
+      "max_over_rms": 0.006422540860199609,
+      "median_us": 2796.0912386576338,
+      "tflops": 786.463340376447
+    },
+    "block_register": {
+      "name": "block_register",
+      "scaling": "block128",
+      "weight": "packed",
+      "rows": 8192,
+      "backend": "FlyDSL prototype",
+      "kernel": "reg_four_m_a_mbuf",
+      "kernel_id": "",
+      "calls": 1,
+      "rounds_us": [
+        [
+          3599.1271336873374,
+          3452.228546142578
+        ],
+        [
+          3403.8642247517905,
+          3392.8918838500977
+        ],
+        [
+          3355.7666142781577,
+          3366.0704294840493
+        ],
+        [
+          3316.7969385782876,
+          3372.966448465983
+        ]
+      ],
+      "status": "passed",
+      "relative_rms": 0.0016159862808059616,
+      "max_over_rms": 0.006422540860199609,
+      "median_us": 3382.92916615804,
+      "tflops": 650.0352645720363
+    },
+    "block_opus": {
+      "status": "unavailable",
+      "detail": "No qualified signed-input plan"
+    }
+  }
+}

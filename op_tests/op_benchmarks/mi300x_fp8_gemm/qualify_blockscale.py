@@ -13,7 +13,7 @@ from statistics import median
 
 import torch
 from bench_fp8_scaling_comparison import capture, time_group
-from common import Inputs, error_metric, opus_offsets_fit, packed_scales, read_csv
+from common import Inputs, error_metric, opus_offsets_fit, packed_scales, read_shapes
 
 # Import the checkout's tuner and its sibling kernel registries.
 sys.path.insert(
@@ -148,7 +148,11 @@ def main():
         help="Weight layout to qualify. Write a separate runtime CSV for each layout.",
     )
     p.add_argument(
-        "--family", choices=("ck", "cktile", "asm", "opus", "flydsl"), required=True
+        "--family",
+        choices=("ck", "cktile", "asm", "opus", "flydsl"),
+        nargs="+",
+        required=True,
+        help="Screen these families and keep the fastest passing row per shape",
     )
     p.add_argument(
         "--output",
@@ -157,11 +161,9 @@ def main():
         help="Runtime CSV; candidate diagnostics go beside it",
     )
     args = p.parse_args()
-    shapes = (
-        [tuple(args.shape)]
-        if args.shape
-        else [tuple(int(r[t]) for t in ("M", "N", "K")) for r in read_csv(args.input)]
-    )
+    shapes = [tuple(args.shape)] if args.shape else read_shapes(args.input)
+    if not shapes:
+        p.error("the input CSV has no shapes")
     props = torch.cuda.get_device_properties(0)
     if not props.gcnArchName.startswith("gfx942") or props.multi_processor_count != 304:
         p.error("the MI300X replay requires 304-CU gfx942")
@@ -174,13 +176,17 @@ def main():
         )
         profile.writeheader()
         for shape in shapes:
-            row = qualify(shape, args.family, args.layout, tuner, profile)
+            best = None
+            for family in args.family:
+                row = qualify(shape, family, args.layout, tuner, profile)
+                if row and (best is None or row["us"] < best["us"]):
+                    best = row
             fp.flush()
-            if row:
-                winners.append(row)
+            if best:
+                winners.append(best)
             print(
                 shape,
-                row["kernelName"] if row else "no qualified direct row",
+                best["kernelName"] if best else "no qualified direct row",
                 flush=True,
             )
     # Publish the runtime table only once all requested shapes have been screened.

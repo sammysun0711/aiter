@@ -27,6 +27,14 @@ def read_csv(path):
         return list(csv.DictReader(stream))
 
 
+def shape_key(row):
+    return tuple(int(row[key]) for key in ("M", "N", "K"))
+
+
+def read_shapes(path):
+    return list(dict.fromkeys(shape_key(row) for row in read_csv(path)))
+
+
 def save(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -57,6 +65,10 @@ def sample_indices(dim):
 def error_metric(fn, out, ri, ci, reference):
     out[ri[:, None], ci[None, :]] = float("nan")
     fn()
+    return sample_error(out, ri, ci, reference)
+
+
+def sample_error(out, ri, ci, reference):
     sample = out[ri[:, None], ci[None, :]].cpu().double()
     diff = sample - reference
     relative = (diff.square().mean() / reference.square().mean()).sqrt().item()

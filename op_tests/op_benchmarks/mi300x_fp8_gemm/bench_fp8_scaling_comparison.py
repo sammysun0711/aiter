@@ -278,7 +278,7 @@ def methods(d, plan, configs, selected=None, all_flydsl=False):
         yield Method(name, "block128", "packed", m, "FlyDSL", kernel), run
 
 
-def capture(fn, stream, ops):
+def capture_result(fn, stream, ops):
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         fn()
@@ -286,7 +286,12 @@ def capture(fn, stream, ops):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         for _ in range(ops):
-            fn()
+            result = fn()
+    return graph, result
+
+
+def capture(fn, stream, ops):
+    graph, _ = capture_result(fn, stream, ops)
     return graph
 
 

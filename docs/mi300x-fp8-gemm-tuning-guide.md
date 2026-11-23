@@ -1,198 +1,173 @@
-# MI300X FP8 GEMM tuning guide
+# Tune FP8 GEMM on MI300X
 
-This guide covers single-GPU FP8 linear projections on a **304-CU MI300X (gfx942)**. For the customer’s reference shape `[M, 32768] @ [4096, 32768]` with `M = 8192`, tuned hipBLASLt with per-token/per-channel scales reached **1,154.8 TFLOP/s** and packed ASM with K128 block scales reached **899.9 TFLOP/s** in the same replay. A separate eight-round comparison measured **1,173.2** and **911.0** respectively. [All kernels by shape](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/mi300x-fp8-ptpc-vs-blockscale.md) · [Unrounded CSV](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/mi300x-fp8-ptpc-vs-blockscale.csv)
+Use this guide for bias-free FP8 linear projections on one **304-CU MI300X (gfx942)**, with E4M3 FNUZ (`torch.float8_e4m3fnuz`) inputs, FP32 dequantization scales and BF16 output. Enter shapes as **M,N,K**. AITER takes `X[M,K]` and `W[N,K]` and computes `X @ W.T`. The customer's direct `q_proj` is `8192,32768,4096`. Its `o_proj` is `8192,4096,32768`.
 
-## 1. API and layouts
+1. [Set up the checkout and GPU](#set-up-the-checkout-and-gpu).
+2. **For a known shape**, [replay a saved winner](#replay-a-saved-winner) and use the matching layout in your application.
+3. **For a new shape**, follow [block-scale tuning](#tune-a-block-scaled-projection) or [PTPC hipBLASLt tuning](#tune-a-ptpc-projection). Choose the path from the scales your model actually supplies.
 
-Both examples compute `Y[M, N] = X[M, K] @ W[N, K].T`. They start with prequantized `X_fp8` and ordinary row-major `W_fp8` tensors of dtype `torch.float8_e4m3fnuz` on the GPU. All scales are FP32 dequantization multipliers on the same device. The output is BF16 with no bias.
+## Choose the API and layout
 
-### Per-token/per-channel FP8 (PTPC) GEMM API and layouts
+### Per-token/per-channel FP8 (PTPC) GEMM
 
-PTPC uses one activation scale per token and one weight scale per output channel. Output element `Y[m, n]` is the full dot product multiplied by `token_scales[m] * channel_scales[n]`. The tensor × channel control in the full report repeats one activation multiplier across all rows.
-
-| API                                 | Weight argument                                      | Activation scale | Weight scale |
-| ----------------------------------- | ---------------------------------------------------- | ---------------- | ------------ |
-| `torch._scaled_mm`                | `W_fp8.T`, shape `[K, N]`                        | `[M, 1]`       | `[1, N]`   |
-| `tgemm.mm`                        | Ordinary or (16, 16)-packed weight, shape `[N, K]` | `[M, 1]`       | `[1, N]`   |
-| `aiter.gemm_a8w8_bpreshuffle_out` | (16, 16)-packed weight, shape `[N, K]`             | `[M, 1]`       | `[N, 1]`   |
-
-The example uses packed `tgemm.mm` with the `hipblaslt` table from section 3. [PTPC dispatch](../aiter/tuned_gemm.py)
+One FP32 activation scale per token and one FP32 weight scale per output channel multiply the whole dot product. Supply contiguous scales `[M,1]` and `[1,N]` on the GPU. `tgemm.mm` accepts ordinary and packed weights. All 21 recorded PTPC winners use packed weights and hipBLASLt. The PyTorch baseline uses `torch._scaled_mm` with ordinary `W_fp8.T`. [PTPC dispatch](../aiter/tuned_gemm.py)
 
 ```python
 import torch
 from aiter.ops.shuffle import shuffle_weight
 from aiter.tuned_gemm import tgemm
 
-# Once at weight load. Keep the returned tensor and its layout metadata.
-W_packed = shuffle_weight(W_fp8, layout=(16, 16))
-
-# Supply one scale per activation row and one per weight row.
-sx = token_scales.reshape(-1, 1).float().contiguous()
-sw = channel_scales.reshape(1, -1).float().contiguous()
-Y_ptpc = tgemm.mm(X_fp8, W_packed, otype=torch.bfloat16, scale_a=sx, scale_b=sw)
+W_packed = shuffle_weight(W_fp8, layout=(16, 16))  # Once at weight load
+Y = tgemm.mm(
+    X_fp8, W_packed, otype=torch.bfloat16,
+    scale_a=token_scales.reshape(-1, 1).float().contiguous(),
+    scale_b=channel_scales.reshape(1, -1).float().contiguous(),
+)
 ```
 
-### FP8 block GEMM API and layout
+Keep the tensor returned by `shuffle_weight`, including its layout metadata. For per-tensor activation × per-channel weight scaling, the study repeated one activation multiplier across M rows. Two scalar scales have a [separate runtime table](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/scalar.csv). Scalar and row-scaled solutions share the `scaleAB=True` dispatch key, so select the table for your contract before starting the process.
 
-Block scaling uses one activation scale per row and group of 128 K features, and one weight scale per 128×128 tile. For each K group `g`, the kernel multiplies the partial dot product by `activation_block_scales[m, g] * weight_block_scales[n // 128, g]` before summing across groups.
+### FP8 block GEMM
 
-| API                                        | Weight argument            | Activation scale                                      | Weight scale                 |
-| ------------------------------------------ | -------------------------- | ----------------------------------------------------- | ---------------------------- |
-| `aiter.gemm_a8w8_blockscale`             | Ordinary `[N, K]`        | Row-major `[M, K/128]`                              | Row-major `[N/128, K/128]` |
-| `aiter.gemm_a8w8_blockscale_bpreshuffle` | (16, 16)-packed `[N, K]` | K-group-major storage, passed below as `[M, K/128]` | Row-major `[N/128, K/128]` |
+Each K128 partial dot product has its own multiplier. The logical activation scales are `[M,K/128]`. Weight scales are ordinary row-major `[ceil(N/128),K/128]`, one value per 128×128 weight tile. The `sx_block` and `sw_block` in this example start as contiguous row-major FP32 tensors. [Block-scale dispatch](../aiter/ops/gemm_op_a8w8.py)
 
-The example starts with ordinary row-major FP32 scale tensors. Transposing and copying the activation scales places all `M` scales for each K group next to each other. The final view supplies the shape expected by the packed call. Use this full-shape example for a direct tuning row. Section 4 shows how to pack each activation-scale slice for a chunked row plan. [Block-scale dispatch](../aiter/ops/gemm_op_a8w8.py) · [Scale packing in the benchmark](../op_tests/op_benchmarks/mi300x_fp8_gemm/common.py)
+| Weight storage | Public API | Activation-scale storage | Runtime table variable |
+|---|---|---|---|
+| Ordinary `W[N,K]` | `gemm_a8w8_blockscale` | Row-major `[M,K/128]` | `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE` |
+| `shuffle_weight(W, layout=(16,16))` | `gemm_a8w8_blockscale_bpreshuffle` | K-group-major bytes exposed as `[M,K/128]` | `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE` |
 
 ```python
 import torch
-from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
+from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale, gemm_a8w8_blockscale_bpreshuffle
 from aiter.ops.shuffle import shuffle_weight
 
-# Once at weight load.
-W_packed = shuffle_weight(W_fp8, layout=(16, 16))
+# Ordinary weights, as in the direct q_proj example below.
+Y = gemm_a8w8_blockscale(X_fp8, W_fp8, sx_block, sw_block, torch.bfloat16)
 
-# Pack the logical [M, K/128] activation scales for this call.
-sx_block = activation_block_scales.T.contiguous().view_as(activation_block_scales)
-Y_block = gemm_a8w8_blockscale_bpreshuffle(
-    X_fp8, W_packed, sx_block, weight_block_scales, torch.bfloat16
-)
+# Packed weights for a direct (single-call) row.
+W_packed = shuffle_weight(W_fp8, layout=(16, 16))  # Once at weight load
+sx_packed = sx_block.T.contiguous().view_as(sx_block)
+Y = gemm_a8w8_blockscale_bpreshuffle(X_fp8, W_packed, sx_packed, sw_block, torch.bfloat16)
 ```
 
-#### FlyDSL kernel selection and tensor layouts on gfx942
+A quantizer that already emits K-group-major scale bytes can pass them directly. FlyDSL uses the same public APIs and layouts. Ordinary candidates are IDs 2, 4, 6, 8 and 10. Packed candidates are IDs 3, 5, 7, 9 and 11 (direct loads), 12 and 13 (two-stage LDS, M-first and N-first traversal), and 14 (register cache). The registry checks tile alignment and descriptor limits. [FlyDSL registry](../aiter/ops/flydsl/gemm_tune/flydsl_gemm_a8w8_blockscale_common.py) · [Layout adapter](../aiter/ops/flydsl/gemm_a8w8_blockscale.py)
 
-FlyDSL is a `libtype` for the FP32 K128 block-scale APIs above. Choose the API by the weight layout. The packed direct-load, M-first LDS, N-first LDS and register-cache kernels all take **the same caller tensors**. Grid order controls how workgroups visit output tiles. The register kernel transposes its MFMA computation internally and writes the usual `[M, N]` output.
+## Set up the checkout and GPU
 
-| Weight layout | Public API and tuning-table environment variable | FlyDSL candidates | Activation scales passed by the caller |
-|---|---|---|---|
-| Ordinary row-major `[N, K]` | `aiter.gemm_a8w8_blockscale` · `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE` | IDs **2, 4, 6, 8, 10** (`ps0`), direct loads | Ordinary row-major `[M, K/128]`. The FlyDSL adapter transposes these scales internally. |
-| `shuffle_weight(W_fp8, layout=(16, 16))`, still `[N, K]` | `aiter.gemm_a8w8_blockscale_bpreshuffle` · `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE` | Direct loads **3, 5, 7, 9, 11** (`ps1`), M-first LDS **12**, N-first LDS **13**, register cache **14** | K-group-major bytes, e.g. `scales.T.contiguous().view_as(scales)` starting from logical row-major `[M, K/128]`. |
-
-Both APIs take ordinary FP8 activations `[M, K]` and row-major FP32 weight scales `[ceil(N/128), K/128]`. For the customer shapes, `ceil(N/128) = N/128`. Set the ordinary table to `$CFG/flydsl-ordinary.csv` or the packed table to `$CFG/flydsl-final.csv` before importing AITER. The runtime row’s `kernelName` selects the implementation for that shape. A quantizer that already returns K-group-major activation-scale bytes can pass those bytes directly in the packed layout shown above. [FlyDSL layout adapter](../aiter/ops/flydsl/gemm_a8w8_blockscale.py) · [Candidate IDs](../aiter/ops/flydsl/gemm_tune/flydsl_gemm_a8w8_blockscale_common.py)
-
-For the customer’s `[M, 32768] @ [4096, 32768]` at `M = 8192`, the logical activation scales are `[8192, 256]`. The packed call stores them in `[256, 8192]` order. The weight scales are `[32, 256]` and the output is `[8192, 4096]` for every eligible FlyDSL candidate.
-
-For a direct check of one FlyDSL candidate, the named launcher takes a caller-owned output buffer and an explicit layout flag. This example reuses the packed block-scale inputs above and selects ID 13. The ordinary equivalent takes `W_fp8`, row-major `activation_block_scales`, a matching `ps0` kernel name and `isBpreshuffled=False`.
-
-```python
-from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_flydsl
-
-out = torch.empty((X_fp8.shape[0], W_packed.shape[0]), dtype=torch.bfloat16, device=X_fp8.device)
-gemm_a8w8_blockscale_flydsl(
-    X_fp8, W_packed, sx_block, weight_block_scales, out,
-    {"kernelName": "flydsl_blockscale_gfx942_128x128x128_ps1_lds_n"},
-    isBpreshuffled=True,
-)
-```
-
-## 2. Shapes, source and setup
-
-The customer’s first and third shape labels show the right-hand operand in stored weight order `[N, K]`. The second shows it in multiplication order `[K, N]`, with `K = 1536` and `N = 32768`. AITER computes `X @ W.T` for all three.
-
-| Customer shape                 | AITER logical weight `W[N, K]` | Output `Y[M, N]` |
-| ------------------------------ | -------------------------------- | ------------------ |
-| `[M, 4096] @ [1536, 4096]`   | `[1536, 4096]`                 | `[M, 1536]`      |
-| `[M, 1536] @ [1536, 32768]`  | `[32768, 1536]`                | `[M, 32768]`     |
-| `[M, 32768] @ [4096, 32768]` | `[4096, 32768]`                | `[M, 4096]`      |
-
-The seven M values are **2,048, 4,096, 8,192, 16,384, 32,768, 65,536 and 131,072**. The recorded run used ROCm 7.2.0, PyTorch `2.9.1+rocm7.2.0.git7e1940d4`, hipBLASLt `1.2.1.70200-43~22.04` and FlyDSL **0.5.0**. hipBLASLt solution IDs depend on the installed library version. [Run environment](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/environment.json)
-
-The source is this AITER checkout, branch `tuning/gfx942-flydsl-fp8-blockscale`, based on upstream commit `1dd04e9cf13282352a4e11dd2a2114ccae475f4a` with Composable Kernel `f93c029e09f67c983696eecac8e0e0350f3dbb54`. The original hipBLASLt and CK baselines used the clean base. The recorded cross-scaling study used the local gfx942 port, with the LDS and transposed register kernels launched by the study harness. This branch includes those final three candidates in the native FlyDSL tuner and named dispatch. [Base revision](https://github.com/ROCm/aiter/tree/1dd04e9cf13282352a4e11dd2a2114ccae475f4a) · [FlyDSL registry](../aiter/ops/flydsl/gemm_tune/flydsl_gemm_a8w8_blockscale_common.py) · [Launch adapter](../aiter/ops/flydsl/gemm_a8w8_blockscale.py)
-
-Start at the checkout root in a ROCm environment with this checkout’s AITER dependencies and the pinned FlyDSL installed. The following commands put the checkout first on the Python import path and create a fresh output directory. All input CSVs ship with the benchmark. [AITER installation](installation.rst)
+The recorded stack used ROCm **7.2.0**, ROCm PyTorch **2.9.1**, hipBLASLt **1.2.1.70200-43~22.04**, FlyDSL **0.5.0** and Composable Kernel `f93c029e09f6`. The study started from upstream AITER `1dd04e9cf132`. Use a dedicated ROCm development environment with a compatible PyTorch build and GPU access. hipBLASLt solution IDs are version dependent. Record your checkout revision and requalify after a GPU or library change. [Recorded environment](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/environment.json) · [Source installation](installation.rst)
 
 ```bash
-export AITER_SRC="$(git rev-parse --show-toplevel)"
-export BENCH="$AITER_SRC/op_tests/op_benchmarks/mi300x_fp8_gemm"
-export CFG="$BENCH/configs"
-export WORK="$(mktemp -d)"
-git -C "$AITER_SRC" submodule update --init 3rdparty/composable_kernel
-export CK_DIR="$AITER_SRC/3rdparty/composable_kernel"
-unset AITER_ROOT
-export AITER_META_DIR="$AITER_SRC"
-export PYTHONPATH="$AITER_SRC${PYTHONPATH:+:$PYTHONPATH}"
+git clone --branch mimo/fp8-gemm-tuning-guide-mi300x --recurse-submodules https://github.com/sammysun0711/aiter.git
+cd aiter
+export AITER_SRC="$PWD" BENCH="$PWD/op_tests/op_benchmarks/mi300x_fp8_gemm"
+export CFG="$BENCH/configs" WORK="$(mktemp -d)"
 export GPU_ARCHS=gfx942 HIP_VISIBLE_DEVICES=0
-export AITER_CONFIG_GEMM_BF16="$CFG/ptpc.csv"
-python -c 'import aiter, flydsl; print(aiter.__file__, flydsl.__version__)'
+unset AITER_ROOT
+export AITER_META_DIR="$AITER_SRC" CK_DIR="$AITER_SRC/3rdparty/composable_kernel"
+export AITER_JIT_DIR="$WORK/jit"
+mkdir -p "$AITER_JIT_DIR"
+python -m pip install 'flydsl==0.5.0'
+python setup.py develop
+export PYTHONPATH="$AITER_SRC${PYTHONPATH:+:$PYTHONPATH}"
+git rev-parse HEAD
+python - <<'PY'
+import aiter, flydsl, torch
+p = torch.cuda.get_device_properties(0)
+print(aiter.__file__, torch.__version__, torch.version.hip, flydsl.__version__)
+print(p.name, p.gcnArchName, p.multi_processor_count)
+assert p.gcnArchName.startswith("gfx942") and p.multi_processor_count == 304
+PY
 ```
 
-## 3. PTPC hipBLASLt tuning
+Use a fresh Python process for each table change. The verifier's `--table` sets the appropriate variable before importing AITER. Use an idle GPU for timing and a writable JIT directory. First-use compilation can take longer than the benchmark.
 
-**Use the selected solutions.** Set `AITER_CONFIG_GEMM_BF16` before importing AITER. The included table contains **42 rows** for the 21 shapes with ordinary and (16,16)-packed weights. All packed rows use the verified hipBLASLt solution ID for their shape. For a two-scalar calibration, set the variable to `$CFG/scalar.csv` in a separate process. Both layouts of FP32 scales share the boolean `scaleAB` dispatch key. [PTPC solutions](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/ptpc.csv) · [Two-scalar solutions](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/scalar.csv) · [Gradlib](../gradlib/README.md)
+## Replay a saved winner
 
-**Retune a shape on the deployment GPU.** The stock AITER tuner invokes gradlib through `--with-hipblaslt`. For the full matrix use the supplied `$CFG/ptpc-tune-input.csv` in place of the one-row input below. The qualifier checks the incumbent, stock winner and up to three stock finalists on signed data. A challenger replaces a valid incumbent only when faster in both launch orders. Its output merges the verified row into the supplied baseline table.
+Select the command for your scaling contract. Both examples use the original reference `o_proj`. The output CSV records the resolved table, library, kernel name or solution ID, number of calls, median microseconds, TFLOP/s and numerical errors.
 
 ```bash
-printf 'M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle\n8192,4096,32768,False,torch.float8_e4m3fnuz,torch.bfloat16,True,True\n' > "$WORK/ptpc-input.csv"
-CACHE_INVALIDATE_BUFFERS=1 python "$AITER_SRC/csrc/gemm_a16w16/gemm_a16w16_tune.py" \
-  --libtype hipblaslt --with-hipblaslt --mp 1 \
-  -i "$WORK/ptpc-input.csv" -o "$WORK/stock.csv" --profile_file "$WORK/ptpc-profile.csv"
-python "$BENCH/qualify_ptpc.py" --baseline "$CFG/ptpc.csv" --stock "$WORK/stock.csv" \
-  --profile "$WORK/ptpc-profile.csv" --output "$WORK/ptpc-verified.csv"
+python "$BENCH/verify_gemm.py" --shape 8192 4096 32768 --scaling ptpc --layout packed \
+  --table "$CFG/ptpc.csv" --output "$WORK/known-ptpc.csv"
+python "$BENCH/verify_gemm.py" --shape 8192 4096 32768 --scaling block128 --layout packed \
+  --table "$CFG/best-direct.csv" --plans "$CFG/best-plans.csv" --output "$WORK/known-block.csv"
 ```
 
-## 4. FP8 block-scale GEMM tuning and dispatch
+| File | How to use it |
+|---|---|
+| [ptpc.csv](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/ptpc.csv) | 42 hipBLASLt runtime rows for 21 shapes × two layouts. Export `AITER_CONFIG_GEMM_BF16` for `tgemm.mm`. |
+| [best-direct.csv](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/best-direct.csv) and [best-plans.csv](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/best-plans.csv) | Set the packed block runtime variable to `best-direct.csv`. Look up the full M,N,K in `best-plans.csv`. Its 21 caller plans reuse 18 runtime rows. |
+| [fp8-tuned-gemm.csv](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/fp8-tuned-gemm.csv) | Comparison index with one winner per M,N,K, scaling contract and library, including layout and timing. AITER loads the per-API runtime files above. |
 
-**Use the mixed public table.** Set `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE="$CFG/best-direct.csv"` for the packed operator. The table has **18 unique runtime rows**. Look up each full M/N/K in `best-plans.csv` before calling the operator. It selects classic CK on **14** shapes and ASM on **7**. Three of the CK calls use caller-side row chunking. Each chunk shares the original packed weights and weight scales and packs its own activation scales. [Runtime table](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/best-direct.csv) · [21 caller plans](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/best-plans.csv)
+To replay all 21 shapes, replace `--shape 8192 4096 32768` in either command with `--input "$CFG/best-plans.csv"`. The verifier reads each distinct M,N,K once.
 
-|       M |      N |      K | CK calls × rows |
-| ------: | -----: | -----: | ---------------: |
-|  65,536 | 32,768 |  1,536 |      4 × 16,384 |
-| 131,072 | 32,768 |  1,536 |      8 × 16,384 |
-| 131,072 |  4,096 | 32,768 |      2 × 65,536 |
+Eighteen packed block-scale plans use one call. Three use classic CK in equal M slices. `(65536,32768,1536)` uses 4 × 16,384, `(131072,32768,1536)` uses 8 × 16,384, and `(131072,4096,32768)` uses 2 × 65,536. The caller applies the plan and packs the activation scales **for each slice**. The CLI applies the supplied plan automatically. [Replay implementation](../op_tests/op_benchmarks/mi300x_fp8_gemm/common.py)
 
 ```python
-# plan is the matching CSV row. Activation scales here are logical row-major.
+# plan is the best-plans.csv row for the full shape.
 step = int(plan["chunk_m"])
 Y = torch.empty((X_fp8.shape[0], W_packed.shape[0]), device=X_fp8.device, dtype=torch.bfloat16)
 for start in range(0, X_fp8.shape[0], step):
     rows = slice(start, start + step)
-    scales = activation_block_scales[rows]
+    scales = sx_block[rows]
     gemm_a8w8_blockscale_bpreshuffle(
         X_fp8[rows], W_packed, scales.T.contiguous().view_as(scales),
-        weight_block_scales, torch.bfloat16, out=Y[rows],
+        sw_block, torch.bfloat16, out=Y[rows],
     )
 ```
 
-**Tune the packed layout.** The native tuner accepts `ck`, `cktile`, `asm`, `opus`, `flydsl`, `both` (CK and CK Tile) and `all`. Use `--splitK` when searching ASM. The 18 shapes used with its dense reference are in `$CFG/block-tune-input.csv`. On the three large shapes above, the separate qualifier uses the same native candidates with a sampled CPU FP64 reference. It screens signed inputs, checks eager and captured results, and writes the fastest passing direct row for the selected family. A failed large descriptor can still use a previously validated caller chunk plan. [Native block tuner](../csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py) · [Qualification tool](../op_tests/op_benchmarks/mi300x_fp8_gemm/qualify_blockscale.py)
+## Tune a block-scaled projection
+
+**Direct `q_proj` with ordinary weights.** For `M=8192, N=32768, K=4096`, the historical ordinary-weight default reached **282.9 TFLOP/s** with Triton. Loading CK row 0 (split-K 0) raised the same public operator to **776.6 TFLOP/s**. Both passed the signed-input reference check. To reproduce the recorded selection immediately, pass the [example CK table](../op_tests/op_benchmarks/mi300x_fp8_gemm/examples/q-proj/ordinary-ck.csv) to the verifier. [Recorded samples and errors](../op_tests/op_benchmarks/mi300x_fp8_gemm/examples/q-proj/recorded-replay.json)
 
 ```bash
-printf 'M,N,K\n8192,4096,32768\n' > "$WORK/block-input.csv"
-python "$AITER_SRC/csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py" \
-  --preshuffle --libtype flydsl --mp 1 --warmup 3 --iters 10 \
-  -i "$WORK/block-input.csv" -o "$WORK/flydsl-stock.csv" --profile_file "$WORK/flydsl-profile.csv"
-python "$BENCH/qualify_blockscale.py" --family flydsl --shape 8192 4096 32768 \
-  --output "$WORK/flydsl-verified.csv"
+# Replace this row or add shapes from your own model.
+printf 'M,N,K\n8192,32768,4096\n' > "$WORK/shapes.csv"
+unset AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
+python "$BENCH/verify_gemm.py" --input "$WORK/shapes.csv" --scaling block128 --layout ordinary \
+  --output "$WORK/block-before.csv"
 
-# Regenerate the ordinary-weight FlyDSL winners for all customer shapes.
-python "$BENCH/qualify_blockscale.py" --family flydsl --layout ordinary \
-  --input "$CFG/replay-plans.csv" --output "$WORK/flydsl-ordinary.csv"
+# Start with classic CK, the family used in the recorded example.
+python "$BENCH/qualify_blockscale.py" --input "$WORK/shapes.csv" --layout ordinary \
+  --family ck --output "$WORK/block-ordinary.csv"
+
+# Check that the public operator selects the winning row for each shape.
+python "$BENCH/verify_gemm.py" --input "$WORK/shapes.csv" --scaling block128 --layout ordinary \
+  --table "$WORK/block-ordinary.csv" --output "$WORK/block-after.csv"
 ```
 
-On gfx942, the original five tile sizes have both ordinary- and packed-weight variants. The following additional **packed 128×128×128** candidates accept FNUZ inputs, FP32 scales and BF16/FP16 output. M and N must be divisible by 128. K must be divisible by 128. The register candidate also requires the rebased 128-row buffer descriptor to fit in a signed 32-bit byte offset. Existing gfx950 IDs 0/1 and gfx942 IDs 2–11 retain their meaning.
+For a quick replay of the historical example, use `--shape 8192 32768 4096 --scaling block128 --layout ordinary --table "$BENCH/examples/q-proj/ordinary-ck.csv"` with the same verifier. A baseline can print `default (no tuned row)`. On this revision, an ordinary gfx942 FP32 block-scale lookup miss at M ≥ 2,048 routes to the Triton fallback.
 
-| FlyDSL ID | Suffix in `kernelName` | Implementation                                                                          |
-| --------: | ------------------------ | --------------------------------------------------------------------------------------- |
-|        12 | `_lds_m`               | Two 16 KiB activation tiles in LDS, M-first workgroup traversal.                        |
-|        13 | `_lds_n`               | Same two-stage pipeline, N-first traversal.                                             |
-|        14 | `_reg_a`               | Four waves along M, transposed MFMA and next-K128 A fragment prefetched into registers. |
+Compare `median_us` before and after. Check `table`, `libtype`, `kernelName` and `splitK` in the after CSV. The qualifier also writes `.profile.csv` with candidate timings, errors and rejections. A shape with no passing candidate has no winning row. To broaden the ordinary search, use `--family ck cktile flydsl` and a separate output path. For **packed** weights, use `--layout packed` for all three steps and begin with `--family ck cktile asm`. Add `flydsl opus` to screen those families too. To produce a winner per library for your own shapes, run one family at a time with separate output paths. The qualifier sweeps ASM split-K candidates. OPUS passed on seven study shapes and exceeded the signed-input error budget on the reference `o_proj`. [Qualifier](../op_tests/op_benchmarks/mi300x_fp8_gemm/qualify_blockscale.py) · [Native tuner](../csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py)
 
-To run the best recorded **FlyDSL-only** choice per shape through the public packed operator, use `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE="$CFG/flydsl-final.csv"`. In the per-library replay, the 21 packed rows selected N-first LDS on ten shapes, M-first LDS on nine and the register cache on two. The historical `flydsl.csv` selects the original packed port used as the control. The ordinary FlyDSL table contains one signed-input-qualified `ps0` winner per shape. [Ordinary FlyDSL winners](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/flydsl-ordinary.csv) For ordinary CK, use the `block_ck_plain` row length in the replay plans and the matching `block-plain.csv` row. The ordinary block operator takes its own `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE` table. [FlyDSL-only table](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/flydsl-final.csv) · [Direct-load and LDS implementation](../aiter/ops/flydsl/kernels/gemm_a8w8_blockscale_gfx942.py) · [Register implementation](../aiter/ops/flydsl/kernels/gemm_a8w8_blockscale_gfx942_register.py)
+For deployment, export `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE="$WORK/block-ordinary.csv"` before starting the application, or set `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE` for the packed API. A table override applies to the whole process. Include the other shapes that service needs, with one qualified row per runtime key and weight layout. Keep new runs under `$WORK` to preserve the shipped tables.
 
-The consolidated implementations passed the signed-input replay at all 21 shapes. At the reference shape the emitted gfx942 instruction sequences for all three matched the corresponding measured study kernels.
+The customer verifier and qualifiers cover positive M, N divisible by 16, and K divisible by 128. Individual kernels impose additional constraints. For the three large descriptors above, use their validated chunk plans. For a new packed shape that needs chunking, retune a smaller M that divides the full M, reuse N and K, and copy the selected row’s library, kernel ID, split-K and kernel name into a plan with the full M, `chunk_m` and `calls=M/chunk_m`. Replay the full shape with `--table` and `--plans` to check both sides of each boundary. If an existing CK build lacks the newly selected kernel name, start with a fresh writable `AITER_JIT_DIR` and select the runtime table before the first production call. [Packed CK build and replay](../csrc/ck_gemm_a8w8_blockscale_bpreshuffle/README.md)
 
-## 5. Results by scaling method
+## Tune a PTPC projection
 
-Each cell gives the fastest validated **median TFLOP/s** for that shape, followed by the winning backend’s `libtype` in parentheses. The first column supplies `M` for the three customer shapes. One multiply and one add count as two FLOPs. Timings include all launches required by each row plan. Quantization, offline packing and JIT compilation precede timing.
+AITER’s `gemm_a16w16_tune.py` invokes gradlib for hipBLASLt. The example uses packed weights. Edit the M,N,K rows in the stock input, or use the [original tuning input](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/ptpc-tune-input.csv). Both the stock tuner and the verifier below read this same CSV. For ordinary weights change `bpreshuffle` to `False` and the verifier layout to `ordinary`. [Gradlib tuning options](../gradlib/README.md)
 
-### One tuning candidate per library
+```bash
+printf 'M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle\n8192,4096,32768,False,torch.float8_e4m3fnuz,torch.bfloat16,True,True\n' > "$WORK/ptpc-input.csv"
+unset AITER_CONFIG_GEMM_BF16
+python "$BENCH/verify_gemm.py" --input "$WORK/ptpc-input.csv" --scaling ptpc --layout packed \
+  --output "$WORK/ptpc-before.csv"
+CACHE_INVALIDATE_BUFFERS=1 python "$AITER_SRC/csrc/gemm_a16w16/gemm_a16w16_tune.py" \
+  --libtype hipblaslt --with-hipblaslt --mp 1 -i "$WORK/ptpc-input.csv" \
+  -o "$WORK/stock.csv" --profile_file "$WORK/ptpc-profile.csv"
+python "$BENCH/qualify_ptpc.py" --baseline "$CFG/ptpc.csv" --stock "$WORK/stock.csv" \
+  --profile "$WORK/ptpc-profile.csv" --output "$WORK/ptpc-verified.csv"
+python "$BENCH/verify_gemm.py" --input "$WORK/ptpc-input.csv" --scaling ptpc --layout packed \
+  --table "$WORK/ptpc-verified.csv" --output "$WORK/ptpc-after.csv"
+```
 
-For a shape and scaling contract, look up the row for the desired `libtype` in **`fp8-tuned-gemm.csv`**. There is one winning candidate per **`(M, N, K, scaling, libtype)`**. Ordinary and packed weights compete within that group. The row records the winning weight layout, method, kernel name or solution ID when available, split-K setting when known, rows per call, call count, median µs, TFLOP/s and numerical errors. The scaling keys are `ptpc`, `block128`, and `tensor_channel` for the constant-activation-scale control. `torch` identifies PyTorch-managed dispatch. [Per-library winners CSV](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/fp8-tuned-gemm.csv)
+Give the stock tuner a fresh output path when repeating a search. It can skip rows already present. The qualifier checks solution IDs against the installed hipBLASLt library, screens the incumbent and stock finalists with signed data, and tests challengers in both launch orders. The output merges qualified rows into a copy of the supplied baseline. Use `AITER_CONFIG_GEMM_BF16="$WORK/ptpc-verified.csv"` for serving. The historical `BF16` variable name also covers FP8. Compare the public before/after medians on the same idle card. If the difference is small or changes sign, repeat in reverse order before choosing a serving row.
 
-Of the **238 winners**, **63** use PTPC, **112** use K128 block scaling and **63** use the tensor × channel control. Each winner has the lowest validated median latency in its group in a dedicated replay. The replay uses the tuned solution IDs for ordinary and packed hipBLASLt and enumerates all five ordinary and eight packed FlyDSL candidates per shape. All 273 FlyDSL shape/layout/kernel combinations passed the signed CPU FP64 sample check. A library with no passing candidate for a shape has no winner row. For example, block-scale OPUS contributed seven winners at `N = 1536, K = 4096`. The FlyDSL winner for `[M, 32768] @ [4096, 32768]` at `M = 8192` was packed ID **13**, two-stage N-first LDS, at **783.0 TFLOP/s**. Use the per-API runtime CSVs in sections 3 and 4 for dispatch. The winners index has multiple libraries and scale contracts for the same AITER runtime lookup key. The summary tables below report the original cross-scaling sweep.
+## Measured performance
 
-### Per-token/per-channel FP8 (PTPC)
+These are median single-GPU TFLOP/s from the original 21-shape comparison. The column headers preserve the customer's notation. The middle column shows the right operand in multiplication order (`K=1536, N=32768`). AITER stores that weight as `[32768,1536]`. [Full per-method report](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/mi300x-fp8-ptpc-vs-blockscale.md) · [Unrounded CSV](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/mi300x-fp8-ptpc-vs-blockscale.csv)
 
-AITER’s `tgemm.mm` with packed weights selected `hipblaslt` for all 21 winners. [PTPC solution IDs](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/ptpc.csv)
+### PTPC winners
 
 |       M | `[M, 4096] @ [1536, 4096]` | `[M, 1536] @ [1536, 32768]` | `[M, 32768] @ [4096, 32768]` |
 | ------: | ---------------------------: | ----------------------------: | -----------------------------: |
@@ -204,9 +179,7 @@ AITER’s `tgemm.mm` with packed weights selected `hipblaslt` for all 21 winners
 |  65,536 |      1,118.3 (`hipblaslt`) |         978.2 (`hipblaslt`) |        1,177.0 (`hipblaslt`) |
 | 131,072 |      1,085.9 (`hipblaslt`) |         958.0 (`hipblaslt`) |        1,170.5 (`hipblaslt`) |
 
-### FP8 block-scale GEMM
-
-Packed classic Composable Kernel (`ck`) led on 14 shapes and packed assembly (`asm`) on seven. The full report also gives the rates for `flydsl` and the other measured backends. [CK tuning rows](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/ck.csv) · [ASM tuning rows](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/asm.csv)
+### FP8 block-scale winners
 
 |       M | `[M, 4096] @ [1536, 4096]` | `[M, 1536] @ [1536, 32768]` | `[M, 32768] @ [4096, 32768]` |
 | ------: | ---------------------------: | ----------------------------: | -----------------------------: |
@@ -218,36 +191,22 @@ Packed classic Composable Kernel (`ck`) led on 14 shapes and packed assembly (`a
 |  65,536 |               802.4 (`ck`) |                740.8 (`ck`) |                 838.4 (`ck`) |
 | 131,072 |               809.6 (`ck`) |                736.1 (`ck`) |                 836.3 (`ck`) |
 
-Across the 21 shapes, the fastest PTPC path delivered **17.5–45.8%** more throughput than the fastest K128 block-scale path, with a median advantage of **31.1%**. The complete report covers PyTorch, ordinary and packed hipBLASLt, native AITER PTPC, Triton, ordinary and packed CK, CK Tile, ASM, OPUS, the original FlyDSL port, both LDS orders and the register kernel. It also covers the four constant-activation-scale controls. There are **364 validated medians**. OPUS had a qualified plan on seven shapes, including row-chunk replays. At the reference shape its direct kernel exceeded the signed-input error budget. [Full report](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/mi300x-fp8-ptpc-vs-blockscale.md) · [Dispatch and row lengths by method](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/replay-plans.csv) · [OPUS diagnostics](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/opus-reference-diagnostic.json)
+At the reference `o_proj` (`8192,4096,32768`), PyTorch PTPC reached **1,120.0**, packed hipBLASLt PTPC **1,154.8**, packed block CK **821.0** and packed block ASM **899.9**. Classic CK won 14 block-scale shapes and ASM won seven. The main sweep peaked at **1,180.9** PTPC and **899.9** block-scale. An earlier PTPC experiment reached **1,205.9** at a different M on this projection. Treat 1,200 TFLOP/s as a target to check on each shape. [Earlier PTPC data](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/ptpc-scalar-and-ck.csv) · [Native backend comparisons](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/native-block-comparison.csv)
 
-The earlier packed PTPC, two-scalar and CK/CK Tile experiment reached **1,205.9 TFLOP/s** for PTPC on `[M, 32768] @ [4096, 32768]`. This is a separate GPU 0 replay. In the additional native backend comparison, ASM improved the reference shape by **9.21%** over CK in paired tests. [Scalar, PTPC and CK measurements](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/ptpc-scalar-and-ck.csv) · [Native block-scale comparisons](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/native-block-comparison.csv)
+**FlyDSL.** All 273 eligible tile/shape combinations passed the sampled check in the separate per-library replay. The best FlyDSL result at the reference shape used packed ID 13 at **783.0 TFLOP/s**. In the sustained 750 W study the register variant reached **668.0**, two-stage LDS **788.4**, and ASM **902.0**. The [ordinary](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/flydsl-ordinary.csv) and [packed](../op_tests/op_benchmarks/mi300x_fp8_gemm/configs/flydsl-final.csv) FlyDSL tables give the fastest validated choice within that library for each layout. [Power and clocks](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/power-summary.csv)
 
-The earlier two-backend comparisons favored M-first LDS over CK for `[M, 1536] @ [1536, 32768]` at `M = 4096` and `[M, 4096] @ [1536, 4096]` at `M = 16384`. The later paired medians favored CK on both. The opt-in mixed table uses the validated CK/ASM choices, and the family-specific tables allow direct comparison when retuning another card. [Earlier LDS comparisons](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/lds-comparison.csv) · [Later paired samples](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/cross-scaling/confirmation/)
+## What the benchmark measures
 
-In a separate sustained 750 W run at the reference shape, the register kernel reached **668.0 TFLOP/s** at 1,315 MHz, two-stage LDS reached **788.4** at 1,245 MHz, and ASM reached **902.0** at 1,050 MHz. The register implementation beat the original FlyDSL port on all 21 shapes. Its advantage over LDS was shape-specific. For `[M, 4096] @ [1536, 4096]` at `M = 2048`, it sustained 484.3 TFLOP/s versus 409.9 for M-first LDS and 664.9 for ASM. [Power, clocks and energy](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/power-summary.csv) · [Register-kernel comparison](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/matrix-summary.csv)
+Throughput is `2 × M × N × K / (median_us × 10⁶)` TFLOP/s. The verifier checks signed FNUZ inputs and non-unit FP32 scales against sampled CPU FP64 dot products, in eager mode and graph replay. The limits are relative RMS < 0.006 and maximum absolute error / reference RMS < 0.035. Chunked cases sample both sides of every boundary. HIP events time the GEMM launches in the plan. Quantization, offline weight packing, preparation of packed activation scales and JIT compilation precede timing. Measure per-request preparation separately when evaluating a serving path.
 
-## 6. Benchmark and report
-
-The harness checks each path against the matching sampled CPU FP64 computation using signed inputs and varying scales. It checks chunk boundaries, eager output and captured graph replay. The limits are **0.006** relative RMS and **0.035** maximum absolute error divided by reference RMS. The recorded full sweep used four rounds, two HIP-event samples per method per round and three complete operations per graph. [Benchmark](../op_tests/op_benchmarks/mi300x_fp8_gemm/bench_fp8_scaling_comparison.py) · [Recorded samples](../op_tests/op_benchmarks/mi300x_fp8_gemm/results/cross-scaling/)
+The verifier writes one result per requested shape. For the fixed 21-shape study, the commands below reproduce the full comparison and its 238 per-library winners (63 PTPC, 112 block-scale, 63 tensor × channel). The two offline commands use only the Python standard library.
 
 ```bash
-# One reference shape, the full 21-shape sweep, or only the mixed public dispatch.
-python "$BENCH/bench_fp8_scaling_comparison.py" --shape 8192 4096 32768 --output "$WORK/reference"
-python "$BENCH/bench_fp8_scaling_comparison.py" --output "$WORK/replay"
-python "$BENCH/bench_fp8_scaling_comparison.py" --methods block_best --output "$WORK/deployment"
+python "$BENCH/summarize_fp8_scaling_comparison.py" --output "$WORK/study"
+python "$BENCH/export_fp8_tuned_gemm.py" --output "$WORK/fp8-tuned-gemm.csv"
 
-# Export new live samples or rebuild the historical tables from the bundled samples.
-python "$BENCH/summarize_fp8_scaling_comparison.py" --raw "$WORK/replay" --output "$WORK/report"
-python "$BENCH/summarize_fp8_scaling_comparison.py" --output "$WORK/recorded"
-
-# Replay the complete FlyDSL catalog with the other benchmark paths and export one winner per libtype.
-python "$BENCH/bench_fp8_scaling_comparison.py" --all-flydsl --output "$WORK/per-lib-replay"
-python "$BENCH/export_fp8_tuned_gemm.py" --raw "$WORK/per-lib-replay" \
-  --output "$WORK/fp8-tuned-gemm.csv" --flydsl-runtime-dir "$WORK/flydsl-tables"
-
-# Time the three final kernels under sustained load with AMD SMI telemetry.
-python "$BENCH/bench_register_power.py" --shape 8192 4096 32768 \
-  --variants block_register block_lds_n block_asm --output "$WORK/power.json"
+# Repeat the study on an idle MI300X with the supplied runtime tables.
+AITER_CONFIG_GEMM_BF16="$CFG/ptpc.csv" python "$BENCH/bench_fp8_scaling_comparison.py" --output "$WORK/live"
+AITER_CONFIG_GEMM_BF16="$CFG/ptpc.csv" python "$BENCH/bench_fp8_scaling_comparison.py" --all-flydsl --output "$WORK/per-lib"
+python "$BENCH/export_fp8_tuned_gemm.py" --raw "$WORK/per-lib" --output "$WORK/live-winners.csv"
 ```
-
-For new tables, copy `$CFG` into the run directory, replace the relevant CSVs there, pass that directory through `--config-dir`, and set `AITER_CONFIG_GEMM_BF16` to its `ptpc.csv` before starting Python. Keep the per-family and deployment row plans consistent with the selected kernels. The exporter reads only saved JSON and runs with the Python standard library. [Exporter](../op_tests/op_benchmarks/mi300x_fp8_gemm/summarize_fp8_scaling_comparison.py)

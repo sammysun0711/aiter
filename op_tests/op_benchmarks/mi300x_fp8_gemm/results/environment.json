@@ -1,0 +1,15 @@
+{
+  "commit": "1dd04e9cf13282352a4e11dd2a2114ccae475f4a",
+  "ck_commit": "f93c029e09f67c983696eecac8e0e0350f3dbb54",
+  "torch": "2.9.1+rocm7.2.0.git7e1940d4",
+  "hip": "7.2.26015-fc0010cf6a",
+  "rocm": "7.2.0",
+  "hipblaslt": "hipblaslt\t1.2.1.70200-43~22.04",
+  "device": "AMD Instinct MI300X",
+  "cu": 304,
+  "gfx": "gfx942:sramecc+:xnack-",
+  "flydsl": "0.5.0",
+  "matrix_device": "GPU 0",
+  "hardware_power_cap_w": 750,
+  "source": "Upstream ROCm/aiter with the local gfx942 port; the two LDS layouts and transposed register kernel were launched by the study harness for the recorded sweep."
+}
