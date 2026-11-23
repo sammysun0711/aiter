@@ -100,6 +100,12 @@ def _compile_gemm(
         from .kernels.gemm_a8w8_blockscale_gfx942_register import compile_register_gemm
 
         launch = compile_register_gemm(N, K, kernel_name)
+    elif ki.variant == "2x4_lds_pf1":
+        from .kernels.gemm_a8w8_blockscale_gfx942_2x4_lds import (
+            compile_blockscale_gfx942_2x4_lds,
+        )
+
+        launch = compile_blockscale_gfx942_2x4_lds(N, K, ki.preshuffle_b, kernel_name)
     elif ki.gfx == "gfx942":
         from .kernels.gemm_a8w8_blockscale_gfx942 import compile_blockscale_gfx942
 
@@ -168,8 +174,9 @@ def run_gemm_a8w8_blockscale(
             b = (
                 b.clone() if b.storage_offset() % 8 or b.data_ptr() % alignment else b
             ).view(torch.int64)
-            # The transposed MFMA epilogue writes four BF16/FP16 columns at once.
-            if ki.variant == "reg_a" and out_contiguous.data_ptr() % 8:
+            # The transposed MFMA epilogue writes four BF16/FP16 columns at once;
+            # the 2x4 LDS epilogue stores four as one 8-byte buffer write.
+            if ki.variant in ("reg_a", "2x4_lds_pf1") and out_contiguous.data_ptr() % 8:
                 out_contiguous = torch.empty_like(out_contiguous)
         else:
             a, b = a.view(torch.int8), b.view(torch.int8)

@@ -43,6 +43,15 @@ the other backends. Inputs are FP8 E4M3FN with FP32 scales; output is BF16.
 Public API defaults are unchanged; FlyDSL runs only where a tuned CSV row
 selects it.
 
+### FlyDSL blockscale (gfx942)
+
+Inputs are FP8 E4M3FNUZ with FP32 scales and the same scale layouts as above;
+output is BF16 or FP16. IDs 2-11 are 4-wave tiles (even: plain B, odd:
+`--preshuffle`) and 12-14 packed 128x128 LDS and register variants; these need
+M and N to be multiples of the tile. IDs 15 (plain B) and 16 (`--preshuffle`)
+are the 8-wave 256x256 kernel with A and B staged through LDS. They accept any
+M and N that is a multiple of 16.
+
 ### Output Configuration
 
 #### `-o2, --profile_file`
