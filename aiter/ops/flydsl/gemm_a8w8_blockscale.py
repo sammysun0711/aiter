@@ -96,7 +96,11 @@ def _compile_gemm(
     # The output tensor specializes the epilogue. Keep separate launchers since
     # _run_compiled caches the first typed CompiledFunction on each launcher.
     ki = kernels_by_name[kernel_name]
-    if ki.variant == "reg_a":
+    if ki.variant.startswith("pf2"):
+        from .kernels.gemm_a8w8_blockscale_gfx942_pf2 import compile_pf2
+
+        launch = compile_pf2(N, K, kernel_name, ki.variant, out_dtype == torch.float16)
+    elif ki.variant == "reg_a":
         from .kernels.gemm_a8w8_blockscale_gfx942_register import compile_register_gemm
 
         launch = compile_register_gemm(N, K, kernel_name)
@@ -174,22 +178,30 @@ def run_gemm_a8w8_blockscale(
             b = (
                 b.clone() if b.storage_offset() % 8 or b.data_ptr() % alignment else b
             ).view(torch.int64)
-            # The transposed MFMA epilogue writes four BF16/FP16 columns at once;
-            # the 2x4 LDS epilogue stores four as one 8-byte buffer write.
-            if ki.variant in ("reg_a", "2x4_lds_pf1") and out_contiguous.data_ptr() % 8:
+            # Vectorized output stores need either 8- or 16-byte alignment.
+            output_alignment = (
+                16
+                if ki.variant.startswith("pf2_vec")
+                or ki.variant in ("pf2_split2", "pf2_ldsout")
+                else 8
+            )
+            if (
+                ki.variant in ("reg_a", "2x4_lds_pf1") or ki.variant.startswith("pf2")
+            ) and out_contiguous.data_ptr() % output_alignment:
                 out_contiguous = torch.empty_like(out_contiguous)
         else:
             a, b = a.view(torch.int8), b.view(torch.int8)
-        _run_compiled(
-            launch,
-            a,
-            b,
-            out_contiguous,
-            sa,
-            sb,
-            M,
-            fx.Stream(torch.cuda.current_stream(XQ.device)),
-        )
+        stream = fx.Stream(torch.cuda.current_stream(XQ.device))
+        if ki.variant == "pf2_split2":
+            partials = torch.empty((2 * M * N,), dtype=torch.float32, device=XQ.device)
+            _run_compiled(launch, a, b, out_contiguous, sa, sb, M, partials, stream)
+        else:
+            target = (
+                out_contiguous.view(torch.int32)
+                if ki.variant.startswith("pf2")
+                else out_contiguous
+            )
+            _run_compiled(launch, a, b, target, sa, sb, M, stream)
         if out_contiguous is not Out:
             Out.copy_(out_contiguous)
     return Out

@@ -13,17 +13,18 @@ from statistics import median
 from tempfile import TemporaryDirectory
 
 
-def benchmark(shape, args, row, plan):
+def benchmark(shape, args, row):
     import torch
-    from bench_fp8_scaling_comparison import capture_result, time_group
     from common import (
         BF16,
         FP8,
         Inputs,
+        capture_result,
         error_metric,
         packed_scales,
-        public_block,
         sample_error,
+        time_group,
+        validate_runtime_row,
     )
 
     from aiter.jit.core import AITER_CONFIGS
@@ -35,38 +36,23 @@ def benchmark(shape, args, row, plan):
     from aiter.tuned_gemm import get_GEMM_A16W16_config, tgemm
 
     m, n, k = shape
-    step = int(plan["chunk_m"]) if plan else m
-    if step <= 0 or m % step or (plan and m // step != int(plan["calls"])):
-        raise ValueError(f"Invalid chunk plan for {shape}: {plan}")
     packed = args.layout == "packed"
     ptpc = args.scaling == "ptpc"
     table = getattr(AITER_CONFIGS, args.config_env + "_FILE")
     if ptpc:
         cfg = get_GEMM_A16W16_config(m, n, k, False, str(FP8), str(BF16), True, packed)
     else:
-        cfg = get_CKGEMM_config(step, n, k, table)
+        cfg = get_CKGEMM_config(m, n, k, table)
     cfg = cfg or {}
     # Compare the requested exact row with the public dispatch lookup, which can
     # otherwise select a padded shape or the library default.
     if row:
-        keys = (
-            ("libtype", "solidx", "kernelName")
-            if ptpc
-            else ("libtype", "kernelId", "kernelName", "splitK")
-        )
-        for key in keys:
-            if str(cfg.get(key)) != row[key]:
-                raise ValueError(
-                    f"{shape}: requested {key}={row[key]}, dispatch returned {cfg.get(key)}"
-                )
-    if plan and any(
-        str(cfg.get(key)) != plan[key]
-        for key in ("libtype", "kernelName", "kernelId", "splitK")
-    ):
-        raise ValueError(f"Chunk plan and runtime selection disagree for {shape}")
+        validate_runtime_row(shape, row, cfg, packed=packed, ptpc=ptpc)
+    elif cfg:
+        validate_runtime_row(shape, cfg, cfg, packed=packed, ptpc=ptpc)
 
-    d = Inputs(shape)
-    ri, ci, ptpc_ref, block_ref = d.reference([step] if step < m else ())
+    d = Inputs(shape, ptpc=ptpc, allocate_output=packed or ptpc)
+    ri, ci, ptpc_ref, block_ref = d.reference()
     ref = ptpc_ref if ptpc else block_ref
     if ptpc:
         run = partial(
@@ -78,8 +64,6 @@ def benchmark(shape, args, row, plan):
             scale_b=d.sw,
             out=d.out,
         )
-    elif plan:
-        run, _ = public_block(d, plan["libtype"], step)
     elif packed:
         run = partial(
             gemm_a8w8_blockscale_bpreshuffle,
@@ -105,14 +89,16 @@ def benchmark(shape, args, row, plan):
         "K": k,
         "scaling": args.scaling,
         "layout": args.layout,
+        "input_recipe": d.recipe,
+        "input_seed": d.seed,
         "table": str(table),
         "libtype": cfg.get("libtype", "default (no tuned row)"),
         "kernelName": cfg.get("kernelName", ""),
         "solidx": cfg.get("solidx", ""),
         "kernelId": cfg.get("kernelId", ""),
         "splitK": cfg.get("splitK", ""),
-        "rows_per_call": step,
-        "calls": m // step,
+        "rows_per_call": m,
+        "calls": 1,
         "median_us": us,
         "tflops": 2 * math.prod(shape) / us / 1e6,
         "sampled_outputs": ref.numel(),
@@ -132,16 +118,9 @@ def main():
         "--table", type=Path, help="Runtime CSV; require a matching row for each call"
     )
     parser.add_argument(
-        "--plans", type=Path, help="Full-shape to chunk plans for a packed block table"
-    )
-    parser.add_argument(
         "--output", type=Path, help="Write one verified result per shape to CSV"
     )
     args = parser.parse_args()
-    if args.plans and (args.scaling, args.layout) != ("block128", "packed"):
-        parser.error("--plans applies to packed block128 calls")
-    if args.plans and not args.table:
-        parser.error("pass the runtime --table matching --plans")
     if args.scaling == "ptpc":
         args.config_env = "AITER_CONFIG_GEMM_BF16"
     elif args.layout == "packed":
@@ -152,45 +131,40 @@ def main():
         os.environ[args.config_env] = str(args.table.resolve(strict=True))
     # AITER reads table overrides during import.
     import torch
-    from common import BF16, FP8, read_csv, read_shapes, shape_key
+    from common import (
+        is_mi300x_row,
+        is_ptpc_row,
+        read_csv,
+        read_shapes,
+        require_mi300x,
+        shape_key,
+    )
 
     targets = [tuple(args.shape)] if args.shape else read_shapes(args.input)
     if not targets:
         parser.error("the input CSV has no shapes")
-    plans = {shape_key(r): r for r in read_csv(args.plans)} if args.plans else {}
     exact = {}
     for r in read_csv(args.table) if args.table else ():
-        if r["gfx"] != "gfx942" or r["cu_num"] != "304":
+        if not is_mi300x_row(r):
             continue
-        if args.scaling == "ptpc" and (
-            r["dtype"],
-            r["outdtype"],
-            r["bias"],
-            r["scaleAB"],
-            r["bpreshuffle"],
-        ) != (str(FP8), str(BF16), "False", "True", str(args.layout == "packed")):
+        if args.scaling == "ptpc" and not is_ptpc_row(r, args.layout == "packed"):
             continue
         key = shape_key(r)
         if key in exact:
             parser.error(f"duplicate runtime rows for {key} in {args.table}")
         exact[key] = r
 
-    props = torch.cuda.get_device_properties(0)
-    if props.multi_processor_count != 304 or not props.gcnArchName.startswith("gfx942"):
-        parser.error("expected a 304-CU gfx942 MI300X on device 0")
+    torch.cuda.set_device(0)
+    require_mi300x()
     results = []
     with torch.inference_mode():
         for shape in targets:
-            plan = plans.get(shape)
-            if args.plans and not plan:
-                parser.error(f"no plan for {shape} in {args.plans}")
-            key = (int(plan["chunk_m"]), *shape[1:]) if plan else shape
-            row = exact.get(key)
+            row = exact.get(shape)
             if args.table and not row:
                 parser.error(
-                    f"no exact {args.scaling}/{args.layout} row for {key} in {args.table}"
+                    f"no exact {args.scaling}/{args.layout} row for {shape} in {args.table}"
                 )
-            result = benchmark(shape, args, row, plan)
+            result = benchmark(shape, args, row)
             results.append(result)
             print(
                 f"{shape} {args.scaling}/{args.layout}: {result['libtype']} "

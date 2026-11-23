@@ -12,8 +12,16 @@ from pathlib import Path
 from statistics import median
 
 import torch
-from bench_fp8_scaling_comparison import capture, time_group
-from common import Inputs, error_metric, opus_offsets_fit, packed_scales, read_shapes
+from common import (
+    Inputs,
+    capture,
+    error_metric,
+    opus_offsets_fit,
+    packed_scales,
+    read_shapes,
+    require_mi300x,
+    time_group,
+)
 
 # Import the checkout's tuner and its sibling kernel registries.
 sys.path.insert(
@@ -164,9 +172,8 @@ def main():
     shapes = [tuple(args.shape)] if args.shape else read_shapes(args.input)
     if not shapes:
         p.error("the input CSV has no shapes")
-    props = torch.cuda.get_device_properties(0)
-    if not props.gcnArchName.startswith("gfx942") or props.multi_processor_count != 304:
-        p.error("the MI300X replay requires 304-CU gfx942")
+    torch.cuda.set_device(0)
+    require_mi300x()
     tuner = GemmA8W8BlockScaleTuner("MI300X", ["gfx", "cu_num", "M", "N", "K"], ["us"])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     winners = []
@@ -190,6 +197,10 @@ def main():
                 flush=True,
             )
     # Publish the runtime table only once all requested shapes have been screened.
+    if len(winners) != len(shapes):
+        p.error(
+            "Some shapes have no qualified candidate; see the profile CSV. No winner table was published."
+        )
     tmp = args.output.with_suffix(".tmp")
     with tmp.open("w", newline="") as fp:
         writer = csv.DictWriter(fp, COLUMNS)

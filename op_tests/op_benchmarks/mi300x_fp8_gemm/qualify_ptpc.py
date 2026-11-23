@@ -10,8 +10,18 @@ from pathlib import Path
 from statistics import median
 
 import torch
-from bench_fp8_scaling_comparison import capture, time_group
-from common import BF16, CONFIGS, FP8, Inputs, error_metric, read_csv, save
+from common import (
+    BF16,
+    CONFIGS,
+    FP8,
+    Inputs,
+    capture,
+    error_metric,
+    read_csv,
+    require_mi300x,
+    save,
+    time_group,
+)
 
 import aiter
 
@@ -36,7 +46,7 @@ def row_key(row):
 def select(stock, profile, incumbent):
     m, n, k = (int(stock[v]) for v in ("M", "N", "K"))
     packed = stock["bpreshuffle"] == "True"
-    d = Inputs((m, n, k))
+    d = Inputs((m, n, k), ptpc=True)
     weight = (d.packed if packed else d.w).T
     ri, ci, ref, _ = d.reference()
     supported = set(
@@ -128,6 +138,8 @@ def select(stock, profile, incumbent):
     }
     return row, {
         "chosen": chosen,
+        "input_recipe": d.recipe,
+        "input_seed": d.seed,
         "sampled_outputs": ref.numel(),
         "numerical_errors": errors,
         "rejected": rejected,
@@ -147,10 +159,8 @@ def main():
         "--output", type=Path, required=True, help="Merged AITER runtime table"
     )
     args = p.parse_args()
-    props = torch.cuda.get_device_properties(0)
-    if not props.gcnArchName.startswith("gfx942") or props.multi_processor_count != 304:
-        p.error("expected a 304-CU MI300X")
     torch.cuda.set_device(0)
+    require_mi300x()
     aiter.hipb_create_extension()
     with args.baseline.open(newline="") as baseline:
         reader = csv.DictReader(baseline)

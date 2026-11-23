@@ -1,2 +1,0 @@
-gfx,cu_num,M,N,K,libtype,kernelId,splitK,us,kernelName,tflops
-gfx942,304,8192,32768,4096,ck,0,0,2860.7945442199707,a8w8_blockscale_1x128x128_256x128x128x128_16x16_32x32_2x2_8x32x1_8x32x1_1x32x1x8_8_1x1_intrawave_v3,768.6757023481355

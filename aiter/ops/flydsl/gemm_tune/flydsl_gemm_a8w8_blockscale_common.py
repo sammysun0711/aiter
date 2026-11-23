@@ -8,7 +8,7 @@ pipeline. On gfx942 IDs 2-11 pair a plain and a preshuffled variant of each
 4-wave tile, 12-14 add packed 128x128 LDS and register variants, and 15/16
 are the plain/preshuffled 8-wave 256x256 kernel with both operands staged
 through LDS (2x4 wave grid, one-stage load lead). The output tensor
-specializes the epilogue for BF16 or FP16.
+specializes the epilogue for BF16 or FP16. IDs 17–23 add packed PF2 variants.
 """
 
 from dataclasses import dataclass
@@ -53,6 +53,15 @@ for packed in (False, True):
     kernels_list[len(kernels_list)] = kernelInstance(
         packed, "gfx942", 256, 256, "2x4_lds_pf1"
     )
+for variant in ("pf2", "pf2_bscale", "pf2_split2"):
+    kernels_list[len(kernels_list)] = kernelInstance(True, "gfx942", 256, 256, variant)
+for tm, variant in (
+    (256, "pf2_vec"),
+    (224, "pf2_vec224"),
+    (224, "pf2_ldsout"),
+    (256, "pf2_vec_glc"),
+):
+    kernels_list[len(kernels_list)] = kernelInstance(True, "gfx942", tm, 256, variant)
 kernels_by_name = {ki.name: ki for ki in kernels_list.values()}
 
 
@@ -79,11 +88,29 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int, gfx: str) -> b
             < 2**31
         )
     if gfx == "gfx942":
+        # PF2 rebases matrix resources per tile in i64; scale resources span the
+        # full tensors. Descriptor lengths and local byte offsets are signed i32.
+        if (
+            ki.variant.startswith("pf2")
+            and max(
+                256 * K,
+                256 * N * 2,
+                (M * (K // 128) + (-M) % ki.tile_m) * 4,
+                ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n),
+                ((N + 127) // 128) * (K // 128) * 4,
+            )
+            >= 2**31
+        ):
+            return False
+        # Split a K loop only when a full-M/N grid underfills the 304-CU MI300X.
+        # This also bounds the temporary (two FP32 planes, <152 MiB).
+        if ki.variant == "pf2_split2" and (K % 256 or (M // 256) * (N // 256) >= 304):
+            return False
         # Exact register tiles, i32 dimensions, i64 matrix addresses. Flattened
         # scale tensors also have to fit the FlyDSL launcher extent ABI.
         return (
             min(M, N, K) > 0
-            and M % ki.tile_m == 0
+            and M % (32 if ki.tile_m == 224 else ki.tile_m) == 0
             and N % ki.tile_n == 0
             and K % 128 == 0
             and (ki.variant != "reg_a" or 128 * K < 2**31)
