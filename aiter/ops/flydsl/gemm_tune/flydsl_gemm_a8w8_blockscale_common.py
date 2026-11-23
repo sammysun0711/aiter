@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tune spaces for the gfx950 8-wave and gfx942 4-wave FP8 blockscale GEMMs.
+"""Tune spaces for the gfx950 8-wave and gfx942 FP8 blockscale GEMMs.
 
 On gfx950 IDs 0 and 1 select plain and preshuffled B with the fixed 8-wave
-pipeline. On gfx942 each tile has a plain and a preshuffled variant. The
-output tensor specializes the epilogue for BF16 or FP16.
+pipeline. On gfx942 IDs 2-11 pair a plain and a preshuffled variant of each
+4-wave tile, 12-14 add packed 128x128 LDS and register variants, and 15/16
+are the plain/preshuffled 8-wave 256x256 kernel with both operands staged
+through LDS (2x4 wave grid, one-stage load lead). The output tensor
+specializes the epilogue for BF16 or FP16.
 """
 
 from dataclasses import dataclass
@@ -46,6 +49,10 @@ for tm, tn in ((32, 64), (64, 64), (64, 128), (128, 64), (128, 128)):
 # Append packed candidates so existing tuned IDs keep their meaning.
 for variant in ("lds_m", "lds_n", "reg_a"):
     kernels_list[len(kernels_list)] = kernelInstance(True, "gfx942", 128, 128, variant)
+for packed in (False, True):
+    kernels_list[len(kernels_list)] = kernelInstance(
+        packed, "gfx942", 256, 256, "2x4_lds_pf1"
+    )
 kernels_by_name = {ki.name: ki for ki in kernels_list.values()}
 
 
@@ -58,6 +65,19 @@ def lds_bytes(K: int) -> int:
 def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int, gfx: str) -> bool:
     if gfx != ki.gfx:
         return False
+    if gfx == "gfx942" and ki.variant == "2x4_lds_pf1":
+        # Partial M/N tiles are range checked. A/B/C descriptors start at each
+        # tile in i64; ScaleA spans all of M, and its offsets are i32.
+        kb = K // 128
+        return (
+            M > 0
+            and N > 0
+            and K >= 128
+            and N % 16 == 0
+            and K % 128 == 0
+            and max(M, 256 * K, 256 * N * 2, M * kb * 4, ((N + 127) // 128) * kb * 4)
+            < 2**31
+        )
     if gfx == "gfx942":
         # Exact register tiles, i32 dimensions, i64 matrix addresses. Flattened
         # scale tensors also have to fit the FlyDSL launcher extent ABI.

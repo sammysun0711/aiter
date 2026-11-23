@@ -145,6 +145,11 @@ def test_fp16_output_on_asm_row_uses_ck(monkeypatch):
         (128, 256, k, "128x128", "_" + v)
         for k in (128, 256, 384)
         for v in ("lds_m", "lds_n", "reg_a")
+    ]
+    # The 2x4 LDS kernel also serves partial M/N tiles and M = 1.
+    + [
+        (m, n, k, "256x256", "_2x4_lds_pf1")
+        for m, n, k in ((128, 256, 384), (257, 272, 256), (1, 528, 128))
     ],
 )
 def test_gfx942_flydsl_packed_out(monkeypatch, dtype, m, n, k, tile, variant):
@@ -178,7 +183,7 @@ def test_gfx942_flydsl_packed_out(monkeypatch, dtype, m, n, k, tile, variant):
     assert bool((outer[:, n:] == SENTINEL).all())
     assert checkAllclose(ref.float(), out.float(), rtol=0.01, atol=0.01) == 0
 
-    if variant == "_reg_a":
+    if variant in ("_reg_a", "_2x4_lds_pf1"):
         # The vector epilogue also accepts a contiguous but offset output view.
         storage = torch.full((m * n + 1,), SENTINEL, dtype=dtype, device="cuda")
         offset_out = storage[1:].view(m, n)
@@ -208,6 +213,54 @@ def test_gfx942_flydsl_padded_lookup(tmp_path):
 
     assert lookup(128)["libtype"] == "flydsl"
     assert lookup(127) is None
+
+
+def test_gfx942_flydsl_2x4_lds_padded_lookup(tmp_path):
+    # The 2x4 LDS kernel range-checks M, so a row tuned at a padded M serves the smaller M too.
+    name = "flydsl_blockscale_gfx942_256x256x128_ps1_2x4_lds_pf1"
+    table = tmp_path / "flydsl.csv"
+    table.write_text(
+        f"gfx,cu_num,M,N,K,libtype,kernelName\ngfx942,304,128,256,384,flydsl,{name}\n"
+    )
+
+    def lookup(m):
+        return gemm_mod.get_CKGEMM_config(
+            m, 256, 384, str(table), gfx="gfx942", cu_num=304
+        )
+
+    assert lookup(128)["kernelName"] == name
+    assert lookup(127)["kernelName"] == name
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or gemm_mod.get_gfx() != "gfx942",
+    reason="CDNA3 FNUZ kernel",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m,n,k", [(128, 256, 384), (257, 272, 256), (1, 528, 128)])
+def test_gfx942_flydsl_2x4_lds_plain(monkeypatch, dtype, m, n, k):
+    # Plain B: gemm_a8w8_blockscale takes row-major x_scale[M, K/128].
+    torch.manual_seed(942)
+    x = torch.randn(m, k, device="cuda").to(dtypes.fp8)
+    w = torch.randn(n, k, device="cuda").to(dtypes.fp8)
+    sx = torch.rand(m, k // 128, device="cuda") + 0.25
+    sw = torch.rand((n + 127) // 128, k // 128, device="cuda") + 0.25
+    ref = (x.double() * sx.repeat_interleave(128, 1)) @ (
+        w.double() * sw.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)
+    ).T
+    row = {
+        "libtype": "flydsl",
+        "kernelName": "flydsl_blockscale_gfx942_256x256x128_ps0_2x4_lds_pf1",
+    }
+    monkeypatch.setattr(gemm_mod, "get_CKGEMM_config", lambda *a, **kw: row)
+
+    def unexpected_ck(*args, **kwargs):
+        pytest.fail("a tuned FlyDSL row dispatched to CK")
+
+    monkeypatch.setattr(gemm_mod, "gemm_a8w8_blockscale_ck", unexpected_ck)
+    y = gemm_mod.gemm_a8w8_blockscale(x, w, sx, sw, dtype)
+    assert y.dtype == dtype and tuple(y.shape) == (m, n)
+    assert checkAllclose(ref.float(), y.float(), rtol=0.01, atol=0.01) == 0
 
 
 if __name__ == "__main__":

@@ -50,7 +50,7 @@ sx_packed = sx_block.T.contiguous().view_as(sx_block)
 Y = gemm_a8w8_blockscale_bpreshuffle(X_fp8, W_packed, sx_packed, sw_block, torch.bfloat16)
 ```
 
-A quantizer that already emits K-group-major scale bytes can pass them directly. FlyDSL uses the same public APIs and layouts. Ordinary candidates are IDs 2, 4, 6, 8 and 10. Packed candidates are IDs 3, 5, 7, 9 and 11 (direct loads), 12 and 13 (two-stage LDS, M-first and N-first traversal), and 14 (register cache). The registry checks tile alignment and descriptor limits. [FlyDSL registry](../aiter/ops/flydsl/gemm_tune/flydsl_gemm_a8w8_blockscale_common.py) · [Layout adapter](../aiter/ops/flydsl/gemm_a8w8_blockscale.py)
+A quantizer that already emits K-group-major scale bytes can pass them directly. FlyDSL uses the same public APIs and layouts. Ordinary candidates are IDs 2, 4, 6, 8, 10 and 15. Packed candidates are IDs 3, 5, 7, 9 and 11 (direct loads), 12 and 13 (two-stage LDS, M-first and N-first traversal), 14 (register cache) and 16. IDs 15 and 16 are the eight-wave 256×256 kernel that stages A and B through LDS; unlike the others it also takes partial M and N tiles (N a multiple of 16). They were added after the recorded study below, whose tables do not include them. The registry checks tile alignment and descriptor limits. [FlyDSL registry](../aiter/ops/flydsl/gemm_tune/flydsl_gemm_a8w8_blockscale_common.py) · [Layout adapter](../aiter/ops/flydsl/gemm_a8w8_blockscale.py)
 
 ## Set up the checkout and GPU
 
