@@ -142,14 +142,21 @@ def sample_error(out, ri, ci, reference):
 
 
 class Inputs:
-    def __init__(self, dims, *, ptpc=False, allocate_output=True):
+    def __init__(self, dims, *, ptpc=False, block_tuner=False, allocate_output=True):
+        if ptpc and block_tuner:
+            raise ValueError("Choose either PTPC or block-scale tuner inputs")
         self.m, self.n, self.k = m, n, k = dims
         if min(m, n, k) <= 0 or n % 16 or k % 128:
             raise ValueError(
                 "Packed FNUZ inputs need positive M, 16-aligned N, and whole K128 groups"
             )
-        self.seed = 0 if ptpc else 2026
-        self.recipe = "gradlib_ptpc" if ptpc else "block128_signed"
+        self.seed = 0 if ptpc or block_tuner else 2026
+        self.recipe = (
+            "gradlib_ptpc"
+            if ptpc
+            else "native_blockscale" if block_tuner else "block128_signed"
+        )
+        self.sx = self.sw = self.bx = self.bw = None
         torch.manual_seed(self.seed)
         if ptpc:
             from aiter import pertoken_quant
@@ -161,14 +168,25 @@ class Inputs:
             self.x, self.sx = pertoken_quant(x, quant_dtype=FP8)
             self.w, weight_scales = pertoken_quant(w, quant_dtype=FP8)
             self.sw = weight_scales.T.contiguous()
+        elif block_tuner:
+            # Match the native block-scale tuner's seed, draw order and scales.
+            self.x = (torch.rand((m, k), dtype=torch.float16, device="cuda") / 10).to(
+                FP8
+            )
+            self.w = (torch.rand((n, k), dtype=torch.float16, device="cuda") / 10).to(
+                FP8
+            )
+            self.bx = torch.rand((m, k // 128), dtype=torch.float32, device="cuda")
+            self.bw = torch.rand(
+                ((n + 127) // 128, k // 128), dtype=torch.float32, device="cuda"
+            )
         else:
             self.x, self.w = make_input(m, k), make_input(n, k)
         self.packed = shuffle_weight(self.w, layout=(16, 16))
         self.out = (
             torch.empty((m, n), device="cuda", dtype=BF16) if allocate_output else None
         )
-        self.bx = self.bw = None
-        if not ptpc:
+        if not ptpc and not block_tuner:
             self.sx = torch.rand((m, 1), device="cuda") + 0.5
             self.sw = torch.rand((1, n), device="cuda") + 0.25
             self.bx = torch.rand((m, k // 128), device="cuda") + 0.5
@@ -178,7 +196,11 @@ class Inputs:
         ri, ci = sample_indices(self.m), sample_indices(self.n)
         x = self.x.view(torch.uint8)[ri].view(FP8).cpu().double()
         w = self.w.view(torch.uint8)[ci].view(FP8).cpu().double()
-        ptpc = (x @ w.T) * self.sx[ri].cpu().double() * self.sw[:, ci].cpu().double()
+        ptpc = None
+        if self.sx is not None:
+            ptpc = (
+                (x @ w.T) * self.sx[ri].cpu().double() * self.sw[:, ci].cpu().double()
+            )
         block = None
         if self.bx is not None:
             block = (x * self.bx[ri].cpu().double().repeat_interleave(128, dim=1)) @ (

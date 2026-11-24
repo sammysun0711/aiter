@@ -51,46 +51,70 @@ def benchmark(shape, args, row):
     elif cfg:
         validate_runtime_row(shape, cfg, cfg, packed=packed, ptpc=ptpc)
 
-    d = Inputs(shape, ptpc=ptpc, allocate_output=packed or ptpc)
-    ri, ci, ptpc_ref, block_ref = d.reference()
-    ref = ptpc_ref if ptpc else block_ref
-    if ptpc:
-        run = partial(
-            tgemm.mm,
-            d.x,
-            d.packed if packed else d.w,
-            otype=BF16,
-            scale_a=d.sx,
-            scale_b=d.sw,
-            out=d.out,
-        )
-    elif packed:
-        run = partial(
-            gemm_a8w8_blockscale_bpreshuffle,
-            d.x,
-            d.packed,
-            packed_scales(d.bx),
-            d.bw,
-            BF16,
-            out=d.out,
-        )
-    else:
-        run = partial(gemm_a8w8_blockscale, d.x, d.w, d.bx, d.bw, BF16)
+    def replay(d, *, measure):
+        ri, ci, ptpc_ref, block_ref = d.reference()
+        ref = ptpc_ref if ptpc else block_ref
+        if ptpc:
+            run = partial(
+                tgemm.mm,
+                d.x,
+                d.packed if packed else d.w,
+                otype=BF16,
+                scale_a=d.sx,
+                scale_b=d.sw,
+                out=d.out,
+            )
+        elif packed:
+            run = partial(
+                gemm_a8w8_blockscale_bpreshuffle,
+                d.x,
+                d.packed,
+                packed_scales(d.bx),
+                d.bw,
+                BF16,
+                out=d.out,
+            )
+        else:
+            run = partial(gemm_a8w8_blockscale, d.x, d.w, d.bx, d.bw, BF16)
 
-    eager_error = sample_error(run(), ri, ci, ref)
-    graph, out = capture_result(run, torch.cuda.Stream(), 3)
-    graph_error = error_metric(graph.replay, out, ri, ci, ref)
-    us = median(time_group(graph, 3) for _ in range(9))
-    final_error = error_metric(graph.replay, out, ri, ci, ref)
-    rms, peak = map(max, zip(eager_error, graph_error, final_error))
+        eager_error = sample_error(run(), ri, ci, ref)
+        graph, out = capture_result(run, torch.cuda.Stream(), 3)
+        graph_error = error_metric(graph.replay, out, ri, ci, ref)
+        us = median(time_group(graph, 3) for _ in range(9)) if measure else None
+        final_error = error_metric(graph.replay, out, ri, ci, ref)
+        rms, peak = map(max, zip(eager_error, graph_error, final_error))
+        return {
+            "recipe": d.recipe,
+            "seed": d.seed,
+            "us": us,
+            "rms": rms,
+            "peak": peak,
+            "sampled_outputs": ref.numel(),
+        }
+
+    # Keep the signed-input correctness gate independent of the tuner's
+    # positive input recipe. Release its tensors/graph before timing.
+    validation = None
+    if not ptpc:
+        validation = replay(Inputs(shape, allocate_output=packed), measure=False)
+        torch.cuda.empty_cache()
+    timed = replay(
+        Inputs(shape, ptpc=ptpc, block_tuner=not ptpc, allocate_output=packed or ptpc),
+        measure=True,
+    )
+    if validation is None:
+        validation = timed
+    us = timed["us"]
     return {
         "M": m,
         "N": n,
         "K": k,
         "scaling": args.scaling,
         "layout": args.layout,
-        "input_recipe": d.recipe,
-        "input_seed": d.seed,
+        "input_recipe": timed["recipe"],
+        "input_seed": timed["seed"],
+        "validation_recipe": validation["recipe"],
+        "validation_seed": validation["seed"],
         "table": str(table),
         "libtype": cfg.get("libtype", "default (no tuned row)"),
         "kernelName": cfg.get("kernelName", ""),
@@ -101,9 +125,13 @@ def benchmark(shape, args, row):
         "calls": 1,
         "median_us": us,
         "tflops": 2 * math.prod(shape) / us / 1e6,
-        "sampled_outputs": ref.numel(),
-        "relative_rms": rms,
-        "max_error_over_rms": peak,
+        "sampled_outputs": timed["sampled_outputs"],
+        "relative_rms": max(timed["rms"], validation["rms"]),
+        "max_error_over_rms": max(timed["peak"], validation["peak"]),
+        "timing_relative_rms": timed["rms"],
+        "timing_max_error_over_rms": timed["peak"],
+        "validation_relative_rms": validation["rms"],
+        "validation_max_error_over_rms": validation["peak"],
     }
 
 

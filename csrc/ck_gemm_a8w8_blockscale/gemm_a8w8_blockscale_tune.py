@@ -503,6 +503,11 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 continue
             if not kernel.has_oob and M % kernel.B_M != 0:
                 continue
+            # gfx942 forms A/C tile pointers with signed int32 row * stride.
+            # Use Python integers so NumPy scalar inputs cannot wrap the guard.
+            last_row = ((int(M) - 1) // kernel.B_M) * kernel.B_M
+            if max(last_row * int(K), last_row * int(N)) > 2**31 - 1:
+                continue
             info = (info_keys, kernel_id, 0, kernel.name, "opus", preshuffleB)
             gemm_args = (gemm_keys, kernel_id)
             tasks_opus.append(

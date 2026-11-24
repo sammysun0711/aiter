@@ -14,10 +14,16 @@ import torch
 from aiter import dtypes, logger
 from aiter.test_common import checkAllclose
 from aiter.utility.tune_result import TuneResult
-from aiter_worker_limits import configure_worker_subprocesses
+from aiter_worker_limits import (
+    configure_worker_subprocesses,
+    get_compile_worker_count,
+    split_worker_budget,
+    worker_ceiling,
+)
 
 _TASK_START_TIMES = None
 _TASK_PIDS = None
+_COMPILE_WORKERS = 1
 # rocprofiler-sdk exports these (setenv, so os.environ doesn't see them) when this
 # process initializes the GPU runtime. Spawned workers inherit them, and then the
 # torch profiler there records no GPU kernels, so every candidate times as 0 us.
@@ -25,13 +31,18 @@ _ROCPROFILER_ENV = ("ROCPROFILER_REGISTER_LIBRARY", "HSA_TOOLS_ROCPROFILER_V1_TO
 
 
 def _new_pool(parallel_num, task_start_times, task_pids):
+    # Split the parent's live compiler budget before worker initialization
+    # resets nested builds to one job. Recompute it on pool restarts too.
+    _, compile_workers = split_worker_budget(
+        get_compile_worker_count(), parallel_num, max_outer=parallel_num
+    )
     for name in _ROCPROFILER_ENV:
         os.environ.pop(name, None)
         os.unsetenv(name)
     return mp.Pool(
         processes=parallel_num,
         initializer=_init_task_start_times,
-        initargs=(task_start_times, task_pids),
+        initargs=(task_start_times, task_pids, compile_workers),
     )
 
 
@@ -64,11 +75,12 @@ def _raise_if_gpu_fault(exc: BaseException):
         raise GpuContextLost(_candidate_failure_detail(exc)) from error
 
 
-def _init_task_start_times(task_start_times, task_pids=None):
-    global _TASK_START_TIMES, _TASK_PIDS
+def _init_task_start_times(task_start_times, task_pids=None, compile_workers=1):
+    global _TASK_START_TIMES, _TASK_PIDS, _COMPILE_WORKERS
     configure_worker_subprocesses()
     _TASK_START_TIMES = task_start_times
     _TASK_PIDS = task_pids
+    _COMPILE_WORKERS = compile_workers
 
 
 def _run_with_start_tracking(task_index, func, args):
@@ -77,7 +89,8 @@ def _run_with_start_tracking(task_index, func, args):
     if _TASK_PIDS is not None:
         _TASK_PIDS[task_index] = os.getpid()
     _TASK_START_TIMES[task_index] = time.monotonic()
-    return func(*args)
+    with worker_ceiling(_COMPILE_WORKERS):
+        return func(*args)
 
 
 def _task_worker_exited(task_pids, task_index):
