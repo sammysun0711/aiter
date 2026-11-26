@@ -268,7 +268,7 @@ def gemm_a8w8_blockscale_flydsl(
 ) -> Tensor:
     # A tuned FlyDSL row must execute FlyDSL, never silently select another backend.
     gfx = get_gfx()
-    assert gfx == "gfx950", f"FlyDSL blockscale only supports gfx950, got {gfx}"
+    assert gfx in ("gfx942", "gfx950"), f"FlyDSL blockscale unsupported on {gfx}"
     assert Out.dtype in (
         dtypes.bf16,
         dtypes.fp16,
@@ -629,6 +629,26 @@ def get_CKGEMM_config(
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         key = (gfx, cu_num, padded_M, N, K) if has_gfx else (cu_num, padded_M, N, K)
         config = _CKGEMM_CONFIG_CACHE[tuned_file].get(key, None)
+        if (
+            config is not None
+            and padded_M != M
+            and config.get("libtype") == "flydsl"
+            and str(config.get("kernelName", "")).startswith(
+                "flydsl_blockscale_gfx942_"
+            )
+        ):
+            # A padded-M lookup does not pad the actual tensors. PF2's exact
+            # tile requirements must hold for the caller's M; otherwise keep
+            # searching and use the existing fallback on a config miss.
+            from .flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+                kernel_fits_shape,
+                kernels_by_name,
+            )
+
+            ki = kernels_by_name.get(str(config["kernelName"]))
+            if ki is None or not kernel_fits_shape(ki, M, N, K, gfx):
+                config = None
+                continue
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
@@ -2049,7 +2069,9 @@ def _gemm_a8w8_blockscale_bpreshuffle_native(
                 w_scale=w_scale,
                 family="a8w8_blockscale_bpreshuffle",
             )
-        elif libtype == "flydsl" and kernelName.startswith("flydsl_blockscale_8w_"):
+        elif libtype == "flydsl" and kernelName.startswith(
+            ("flydsl_blockscale_8w_", "flydsl_blockscale_gfx942_")
+        ):
             return gemm_a8w8_blockscale_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config, isBpreshuffled=True
             )

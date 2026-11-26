@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tune space for the gfx950 8-wave FP8 blockscale GEMM.
+"""gfx950 8-wave and gfx942 PF1/PF2 FP8 blockscale tuning candidates.
 
-The tile, half-M pipeline, raw DMA, PID swizzle and permlane epilogue are fixed.
-The preshuffle bit distinguishes the two weight layouts: ID 0 is plain B and
-ID 1 is preshuffled B. Kernel names omit the fixed pipeline and DMA flags.
-The historical B16 names also serve FP16 calls; the output tensor specializes
-the epilogue, with separate runtime/AOT cache entries for the two dtypes.
-No FlyDSL compiler imports are needed to read this table.
+IDs 0/1 retain the gfx950 kernels. IDs 15/16 select ordinary/packed gfx942
+PF1; IDs 17-23 select packed PF2 variants. IDs 2-14 are reserved for historical
+experimental kernels and are intentionally absent. BF16 and FP16 outputs
+specialize separate launchers.
 """
 
 from dataclasses import dataclass
@@ -22,20 +20,42 @@ KERNEL_PREFIX = "flydsl_blockscale_8w_"
 @dataclass(frozen=True)
 class kernelInstance:
     preshuffle_b: bool
+    gfx: str = "gfx950"
+    tile_m: int = TILE_M
+    tile_n: int = TILE_N
+    variant: str = ""
 
     @property
     def name(self) -> str:
+        if self.gfx == "gfx942":
+            suffix = f"_{self.variant}" if self.variant else ""
+            return f"flydsl_blockscale_gfx942_{self.tile_m}x{self.tile_n}x128_ps{int(self.preshuffle_b)}{suffix}"
         return (
             f"{KERNEL_PREFIX}{TILE_M}x{TILE_N}x{TILE_K}_F8_F8_B16_"
             f"ps{int(self.preshuffle_b)}"
         )
 
 
-# Candidate IDs are consecutive; --preshuffle selects the B layout.
+# Stable IDs: do not renumber saved tuned tables.
 kernels_list = {
     0: kernelInstance(False),
     1: kernelInstance(True),
+    15: kernelInstance(False, "gfx942", 256, 256, "2x4_lds_pf1"),
+    16: kernelInstance(True, "gfx942", 256, 256, "2x4_lds_pf1"),
 }
+for kernel_id, (tm, variant) in enumerate(
+    (
+        (256, "pf2"),
+        (256, "pf2_bscale"),
+        (256, "pf2_split2"),
+        (256, "pf2_vec"),
+        (224, "pf2_vec224"),
+        (224, "pf2_ldsout"),
+        (256, "pf2_vec_glc"),
+    ),
+    start=17,
+):
+    kernels_list[kernel_id] = kernelInstance(True, "gfx942", tm, 256, variant)
 kernels_by_name = {ki.name: ki for ki in kernels_list.values()}
 
 
@@ -46,6 +66,52 @@ def lds_bytes(K: int) -> int:
 
 
 def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int, gfx: str) -> bool:
+    if gfx != ki.gfx:
+        return False
+    if gfx == "gfx942" and ki.variant == "2x4_lds_pf1":
+        # Partial M/N tiles are range checked. A/B/C descriptors start at each
+        # tile in i64; ScaleA spans all of M, and its offsets are i32.
+        kb = K // 128
+        grid = ((M + 255) // 256) * ((N + 255) // 256)
+        return (
+            M > 0
+            and N > 0
+            and K >= 128
+            and N % 16 == 0
+            and K % 128 == 0
+            # The tile swizzle rounds the i32 grid up to eight groups.
+            and ((grid + 7) // 8) * 8 < 2**31
+            and max(M, 256 * K, 256 * N * 2, M * kb * 4, ((N + 127) // 128) * kb * 4)
+            < 2**31
+        )
+    if gfx == "gfx942":
+        # PF2 rebases matrix resources per tile in i64; scale resources span the
+        # full tensors. Descriptor lengths and local byte offsets are signed i32.
+        if (
+            ki.variant.startswith("pf2")
+            and max(
+                256 * K,
+                256 * N * 2,
+                (M * (K // 128) + (-M) % ki.tile_m) * 4,
+                ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n),
+                ((N + 127) // 128) * (K // 128) * 4,
+            )
+            >= 2**31
+        ):
+            return False
+        # Split a K loop only when a full-M/N grid underfills the 304-CU MI300X.
+        # This also bounds the temporary (two FP32 planes, <152 MiB).
+        if ki.variant == "pf2_split2" and (K % 256 or (M // 256) * (N // 256) >= 304):
+            return False
+        # Exact register tiles, i32 dimensions, i64 matrix addresses. Flattened
+        # scale tensors also have to fit the FlyDSL launcher extent ABI.
+        return (
+            min(M, N, K) > 0
+            and M % (32 if ki.tile_m == 224 else ki.tile_m) == 0
+            and N % ki.tile_n == 0
+            and K % 128 == 0
+            and max(M, N, K, M * (K // 128), ((N + 127) // 128) * (K // 128)) < 2**31
+        )
     if gfx != "gfx950" or M <= 0 or N <= 0 or K < 256 or K % 256:
         return False
     if N % (16 if ki.preshuffle_b else 8):

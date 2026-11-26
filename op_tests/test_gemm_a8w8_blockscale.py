@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import itertools
 import os
 import sys
 
@@ -25,7 +26,7 @@ from aiter.ops.gemm_op_a8w8 import (
     gemm_a8w8_blockscale_flydsl,
 )
 from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
@@ -348,229 +349,368 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
     )
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=dtypes.str2Dtype,
-    choices=[dtypes.d_dtypes["bf16"]],
-    nargs="*",
-    default=[dtypes.d_dtypes["bf16"]],
-    metavar="{bf16}",
-    help="""Data type.
-    e.g.: -d bf16""",
-)
-parser.add_argument(
-    "-m",
-    type=int,
-    nargs="*",
-    default=[
-        1,
-        2,
-        4,
-        8,
-        16,
-        32,
-        64,
-        96,
-        128,
-        160,
-        192,
-        224,
-        256,
-        288,
-        320,
-        352,
-        384,
-        416,
-        448,
-        480,
-        512,
-        1024,
-        2048,
-        4096,
-        6144,
-        8192,
-        10240,
-    ],
-    help="""M of mnk.
-    e.g.: -m 32""",
-)
-parser.add_argument(
-    "-nk",
-    type=dtypes.str2tuple,
-    nargs="*",
-    default=[
-        (24576, 1536),
-        # (32768, 512),
-        # (7168, 16384),
-        # (36864, 7168),
-    ],
-    help="""N&K of mnk.
-    e.g.: -nk 24576,1536""",
-)
-parser.add_argument(
-    "--data-init",
-    dest="data_init",
-    nargs="+",
-    choices=bench_init.DATA_DISTS,
-    default=None,
-    help="DATA initialization distribution(s), paired position-wise with "
-    "--scale-init (length-1 broadcasts). Default: constant uniform",
-)
-parser.add_argument(
-    "--scale-init",
-    dest="scale_init",
-    nargs="+",
-    choices=bench_init.E8M0_SCALE_DISTS,
-    default=None,
-    help="E8M0 SCALE initialization distribution(s), paired position-wise "
-    "with --data-init (length-1 broadcasts). Default: constant auto",
-)
-parser.add_argument(
-    "--seed",
-    type=int,
-    default=0,
-    help="RNG seed for input, weight, and scales (default: 0)",
-)
-parser.add_argument(
-    "--ck_preshuffle",
-    type=dtypes.str2bool,
-    nargs="*",
-    default=None,
-    help="""weight ck_preshuffle or not.
-    e.g.: --ck_preshuffle True
-        or --ck_preshuffle False
-    """,
-)
-parser.add_argument(
-    "--flydsl",
-    action="store_true",
-    help="use flydsl fp8 e8m0 scale path (requires --ck_preshuffle True)",
-)
-parser.add_argument(
-    "--apre",
-    type=dtypes.str2bool,
-    nargs="*",
-    default=[False],
-    help="""also measure the FlyDSL A-preshuffle candidate (requires --flydsl
-    --ck_preshuffle True). Odd M is padded to M+1 rows for A only.
-    Sweeps like --ck_preshuffle.
-    e.g.: --apre True
-        or --apre True False""",
-)
-parser.add_argument(
-    "--w-scale-block",
-    dest="w_scale_block",
-    choices=["128x128", "32x32"],
-    default="128x128",
-    help="""Weight scale block. 32x32 runs native E8M0 group32 scales (1x32
-    row-major x_scale) on the preshuffled weight.
-    e.g.: --w-scale-block 32x32""",
-)
-parser.add_argument(
-    "--csv",
-    type=str,
-    default=None,
-    help="""CSV file containing M, N, K columns (one shape per row).
-    e.g.: --csv shapes.csv""",
-)
-parser.add_argument(
-    "--table",
-    action="store_true",
-    help="""Also print the summary as a human-readable table.
-    The default output is the single-line JSON record.""",
-)
-parser.add_argument(
-    "-o",
-    "--output",
-    type=str,
-    default=None,
-    help="""Directory to save results CSV.
-    e.g.: -o results/""",
-)
-parser.add_argument(
-    "--suffix",
-    type=str,
-    default="results",
-    help="""Suffix for output CSV filename.
-    e.g.: --suffix branch""",
-)
-
-args = parser.parse_args()
-
-data_init_list = args.data_init or ["constant", "uniform"]
-scale_init_list = args.scale_init or ["constant", "auto"]
-if len(data_init_list) == 1:
-    data_init_list *= len(scale_init_list)
-if len(scale_init_list) == 1:
-    scale_init_list *= len(data_init_list)
-if len(data_init_list) != len(scale_init_list):
-    parser.error(
-        "--data-init and --scale-init must have equal length "
-        "(or length 1 to broadcast)"
+@benchmark()
+def test_flydsl_fp32_scales(m, n, k, dtype, packed, storage):
+    """FP32 K128 scales, offset views, caller output and changed-input graph replay."""
+    from aiter.ops.flydsl.gemm_a8w8_blockscale import run_gemm_a8w8_blockscale
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+        kernel_fits_shape,
+        kernels_list,
     )
-init_pairs = list(zip(data_init_list, scale_init_list))
 
-if args.ck_preshuffle is None:
-    args.ck_preshuffle = (
-        [True] if args.flydsl or args.w_scale_block == "32x32" else [True, False]
+    torch.manual_seed(2026)
+    x = (torch.randn(m, k, device="cuda") / 3).to(dtypes.fp8)
+    w = (torch.randn(n, k, device="cuda") / 3).to(dtypes.fp8)
+    sa = torch.rand(m, k // 128, device=x.device) + 0.1
+    sb = torch.rand((n + 127) // 128, k // 128, device=x.device) + 0.1
+    weight = shuffle_weight(w, (16, 16)) if packed else w
+    scales = sa.T.contiguous() if packed else sa
+    if storage == "offset":
+
+        def offset_copy(t):
+            base = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)
+            view = base[1:].view(t.shape)
+            view.copy_(t)
+            return view
+
+        x, weight = offset_copy(x), offset_copy(weight)
+        out = offset_copy(torch.empty(m, n, dtype=dtype, device=x.device))
+    elif storage == "singleton":
+        assert m == 1
+        x = x.as_strided(x.shape, (1, 1))
+        sa = sa.as_strided(sa.shape, (3, 5))
+        sb = sb.as_strided(sb.shape, (3, 5))
+        scales = sa.T.clone().as_strided(sa.T.shape, (5, 3)) if packed else sa
+        out = torch.empty(m, n, dtype=dtype, device=x.device).as_strided((m, n), (1, 1))
+    elif storage == "strided":
+        out = torch.empty(m, n * 2, dtype=dtype, device=x.device)[:, ::2]
+        if packed:
+            scales = scales.T  # the public (M, KB), stride (1, M) contract
+    else:
+        out = torch.empty(m, n, dtype=dtype, device=x.device)
+
+    def reference():
+        a = x.float() * sa.repeat_interleave(128, 1)
+        b = w.float() * sb.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)
+        return a @ b.T
+
+    def check(value, expected, name):
+        assert value is out, "caller output must be returned"
+        assert torch.isfinite(value).all(), f"{name}: unwritten/nonfinite output"
+        err = checkAllclose(expected, value.float(), rtol=1e-2, atol=1e-3, msg=name)
+        assert err == 0, f"{name}: {err:.2%} of elements outside tolerance"
+        return err
+
+    candidates = {
+        ki.name: (
+            lambda ki=ki: run_gemm_a8w8_blockscale(
+                x, weight, scales, sb, out, ki.name, packed
+            )
+        )
+        for ki in kernels_list.values()
+        if ki.preshuffle_b == packed and kernel_fits_shape(ki, m, n, k, get_gfx())
+    }
+    assert candidates, "test shape must exercise a FlyDSL candidate"
+    ret = {"gfx": get_gfx()}
+    nbytes = x.nbytes + weight.nbytes + scales.nbytes + sb.nbytes + out.nbytes
+    for name, call in candidates.items():
+        out.fill_(float("nan"))
+        check(call(), reference(), name + " eager")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+        # Change the captured data, preserving pointers. A launcher/cache that
+        # bakes values or loses a scale-transpose/copy-back fails this replay.
+        x.copy_((torch.randn(m, k, device=x.device) / 3).to(x.dtype))
+        sa.mul_(0.91)
+        if packed:
+            if storage == "strided":
+                scales.copy_(sa)
+            else:
+                scales.copy_(sa.T)
+        sb.mul_(1.03)
+        out.fill_(float("nan"))
+        graph.replay()
+        check(out, reference(), name + " graph changed data")
+        value, us = run_perftest(call, num_warmup=2, num_iters=10)
+        err = check(value, reference(), name + " timed")
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = 2 * m * n * k / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def test_flydsl_shape_guards():
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+        kernel_fits_shape,
+        kernels_list,
     )
-l_preshuffle = (
-    args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
-)
-l_apre = args.apre if isinstance(args.apre, list) else [args.apre]
-if args.w_scale_block == "32x32" and (False in l_preshuffle or True in l_apre):
-    parser.error("--w-scale-block 32x32 needs --ck_preshuffle True and no --apre")
-if args.w_scale_block == "32x32" and get_gfx() not in (
-    "gfx950",
-    "gfx1250",
-    "gfx1250-strict",
-):
-    print(f"skip: native 32x32 E8M0 preshuffle is unsupported on {get_gfx()}")
-    sys.exit(0)
 
-df = []
-if args.csv is not None:
-    if not os.path.exists(args.csv):
-        raise FileNotFoundError(f"CSV file not found: {args.csv}")
-    shapes_df = pd.read_csv(args.csv)
-    print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
-    for dtype in args.dtype:
-        for preshuffle in l_preshuffle:
-            for data_init, scale_init in init_pairs:
-                for apre in l_apre:
-                    for _, row in shapes_df.iterrows():
-                        ret = test_gemm(
-                            dtype,
-                            int(row["M"]),
-                            int(row["N"]),
-                            int(row["K"]),
-                            ck_preshuffle=preshuffle,
-                            use_flydsl=args.flydsl,
-                            data_init=data_init,
-                            scale_init=scale_init,
-                            seed=args.seed,
-                            apre=apre,
-                            w_scale_block=args.w_scale_block,
-                        )
-                        df.append(ret)
-else:
-    for dtype in args.dtype:
-        for m in args.m:
-            for n, k in args.nk:
-                for ck_p in l_preshuffle:
+    assert set(kernels_list) == {0, 1, *range(15, 24)}
+    for kid in (15, 16):
+        ki = kernels_list[kid]
+        assert kernel_fits_shape(ki, 333, 528, 384, "gfx942")
+        assert kernel_fits_shape(ki, 131072, 32768, 1536, "gfx942")
+        for dims in ((0, 256, 128), (1, 17, 128), (256, 256, 129), (2**28, 2**21, 128)):
+            assert not kernel_fits_shape(ki, *dims, "gfx942")
+        assert not kernel_fits_shape(ki, 256, 256, 256, "gfx950")
+    assert kernel_fits_shape(kernels_list[19], 256, 512, 512, "gfx942")
+    assert not kernel_fits_shape(kernels_list[19], 256, 512, 128, "gfx942")
+    assert not kernel_fits_shape(kernels_list[19], 4096, 8192, 512, "gfx942")
+    assert not kernel_fits_shape(kernels_list[20], 257, 512, 128, "gfx942")
+    for kid in (21, 22):
+        assert kernel_fits_shape(kernels_list[kid], 256, 512, 128, "gfx942")
+        assert not kernel_fits_shape(kernels_list[kid], 255, 512, 128, "gfx942")
+    for kid in (0, 1):
+        assert kernel_fits_shape(kernels_list[kid], 256, 512, 512, "gfx950")
+        assert not kernel_fits_shape(kernels_list[kid], 256, 512, 512, "gfx942")
+
+
+def test_flydsl_padded_dispatch():
+    """A PF2 row found at rounded M must still fit the actual unpadded input."""
+    from unittest.mock import patch
+
+    from aiter.ops import gemm_op_a8w8 as op
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+        kernels_list,
+    )
+
+    table = "test-flydsl-padded-row"
+    for kid in (16, 20):
+        row = {
+            "libtype": "flydsl",
+            "kernelId": kid,
+            "kernelName": kernels_list[kid].name,
+            "splitK": 0,
+        }
+        with patch.dict(
+            op._CKGEMM_CONFIG_CACHE, {table: {("gfx942", 304, 256, 512, 512): row}}
+        ), patch.dict(op._CKGEMM_HAS_GFX, {table: True}), patch.object(
+            op, "get_padded_m", lambda m, n, k, gl: 256
+        ):
+            op.get_CKGEMM_config.cache_clear()
+            assert (
+                op.get_CKGEMM_config(256, 512, 512, table, gfx="gfx942", cu_num=304)
+                == row
+            )
+            actual = op.get_CKGEMM_config(
+                257, 512, 512, table, gfx="gfx942", cu_num=304
+            )
+            assert actual == (row if kid == 16 else None)
+        op.get_CKGEMM_config.cache_clear()
+
+
+def main():
+    test_flydsl_shape_guards()
+    test_flydsl_padded_dispatch()
+    if get_gfx() not in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
+        aiter.logger.warning("FP8 blockscale test unsupported on %s", get_gfx())
+        return
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.d_dtypes["bf16"]],
+        nargs="*",
+        default=[dtypes.d_dtypes["bf16"]],
+        metavar="{bf16}",
+        help="""Data type.
+        e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-m",
+        type=int,
+        nargs="*",
+        default=[
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            96,
+            128,
+            160,
+            192,
+            224,
+            256,
+            288,
+            320,
+            352,
+            384,
+            416,
+            448,
+            480,
+            512,
+            1024,
+            2048,
+            4096,
+            6144,
+            8192,
+            10240,
+        ],
+        help="""M of mnk.
+        e.g.: -m 32""",
+    )
+    parser.add_argument(
+        "-nk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[
+            (24576, 1536),
+            # (32768, 512),
+            # (7168, 16384),
+            # (36864, 7168),
+        ],
+        help="""N&K of mnk.
+        e.g.: -nk 24576,1536""",
+    )
+    parser.add_argument(
+        "--data-init",
+        dest="data_init",
+        nargs="+",
+        choices=bench_init.DATA_DISTS,
+        default=None,
+        help="DATA initialization distribution(s), paired position-wise with "
+        "--scale-init (length-1 broadcasts). Default: constant uniform",
+    )
+    parser.add_argument(
+        "--scale-init",
+        dest="scale_init",
+        nargs="+",
+        choices=bench_init.E8M0_SCALE_DISTS,
+        default=None,
+        help="E8M0 SCALE initialization distribution(s), paired position-wise "
+        "with --data-init (length-1 broadcasts). Default: constant auto",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed for input, weight, and scales (default: 0)",
+    )
+    parser.add_argument(
+        "--ck_preshuffle",
+        type=dtypes.str2bool,
+        nargs="*",
+        default=None,
+        help="""weight ck_preshuffle or not.
+        e.g.: --ck_preshuffle True
+            or --ck_preshuffle False
+        """,
+    )
+    parser.add_argument(
+        "--flydsl",
+        action="store_true",
+        help="use flydsl fp8 e8m0 scale path (requires --ck_preshuffle True)",
+    )
+    parser.add_argument(
+        "--apre",
+        type=dtypes.str2bool,
+        nargs="*",
+        default=[False],
+        help="""also measure the FlyDSL A-preshuffle candidate (requires --flydsl
+        --ck_preshuffle True). Odd M is padded to M+1 rows for A only.
+        Sweeps like --ck_preshuffle.
+        e.g.: --apre True
+            or --apre True False""",
+    )
+    parser.add_argument(
+        "--w-scale-block",
+        dest="w_scale_block",
+        choices=["128x128", "32x32"],
+        default="128x128",
+        help="""Weight scale block. 32x32 runs native E8M0 group32 scales (1x32
+        row-major x_scale) on the preshuffled weight.
+        e.g.: --w-scale-block 32x32""",
+    )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default=None,
+        help="""CSV file containing M, N, K columns (one shape per row).
+        e.g.: --csv shapes.csv""",
+    )
+    parser.add_argument(
+        "--table",
+        action="store_true",
+        help="""Also print the summary as a human-readable table.
+        The default output is the single-line JSON record.""",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default=None,
+        help="""Directory to save results CSV.
+        e.g.: -o results/""",
+    )
+    parser.add_argument(
+        "--suffix",
+        type=str,
+        default="results",
+        help="""Suffix for output CSV filename.
+        e.g.: --suffix branch""",
+    )
+
+    args = parser.parse_args()
+
+    data_init_list = args.data_init or ["constant", "uniform"]
+    scale_init_list = args.scale_init or ["constant", "auto"]
+    if len(data_init_list) == 1:
+        data_init_list *= len(scale_init_list)
+    if len(scale_init_list) == 1:
+        scale_init_list *= len(data_init_list)
+    if len(data_init_list) != len(scale_init_list):
+        parser.error(
+            "--data-init and --scale-init must have equal length "
+            "(or length 1 to broadcast)"
+        )
+    init_pairs = list(zip(data_init_list, scale_init_list))
+
+    if args.ck_preshuffle is None:
+        args.ck_preshuffle = (
+            [True] if args.flydsl or args.w_scale_block == "32x32" else [True, False]
+        )
+    l_preshuffle = (
+        args.ck_preshuffle
+        if isinstance(args.ck_preshuffle, list)
+        else [args.ck_preshuffle]
+    )
+    l_apre = args.apre if isinstance(args.apre, list) else [args.apre]
+    if args.w_scale_block == "32x32" and (False in l_preshuffle or True in l_apre):
+        parser.error("--w-scale-block 32x32 needs --ck_preshuffle True and no --apre")
+    if args.w_scale_block == "32x32" and get_gfx() not in (
+        "gfx950",
+        "gfx1250",
+        "gfx1250-strict",
+    ):
+        print(f"skip: native 32x32 E8M0 preshuffle is unsupported on {get_gfx()}")
+        sys.exit(0)
+
+    df = []
+    if args.csv is not None:
+        if not os.path.exists(args.csv):
+            raise FileNotFoundError(f"CSV file not found: {args.csv}")
+        shapes_df = pd.read_csv(args.csv)
+        print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
+        for dtype in args.dtype:
+            for preshuffle in l_preshuffle:
+                for data_init, scale_init in init_pairs:
                     for apre in l_apre:
-                        for data_init, scale_init in init_pairs:
+                        for _, row in shapes_df.iterrows():
                             ret = test_gemm(
                                 dtype,
-                                m,
-                                n,
-                                k,
-                                ck_preshuffle=ck_p,
+                                int(row["M"]),
+                                int(row["N"]),
+                                int(row["K"]),
+                                ck_preshuffle=preshuffle,
                                 use_flydsl=args.flydsl,
                                 data_init=data_init,
                                 scale_init=scale_init,
@@ -579,31 +719,86 @@ else:
                                 w_scale_block=args.w_scale_block,
                             )
                             df.append(ret)
-
-df = pd.DataFrame([row for row in df if row is not None])
-print_json_table("gemm_a8w8_blockscale summary", df)
-if args.table and not df.empty:
-    print("\n" + "=" * 150)
-    print("COMPLETE PERFORMANCE SUMMARY (All Columns)")
-    print("=" * 150)
-    print(df.to_string(index=False))
-    print("=" * 150)
-
-# Correctness check: verify split-K produces matching results
-print("\nRunning split-K correctness checks ...")
-for splitK in [1, 2]:
-    test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
-# Two K loops per split for the default CK-Tile tile, the shortest split it runs.
-for m, n, k, splitK in [(8, 256, 512, 1), (8, 256, 1024, 2), (32, 512, 2048, 3)]:
-    test_splitk_correctness(m=m, n=n, k=k, splitK=splitK)
-
-# Save results from benchmarks
-if args.output:
-    os.makedirs(args.output, exist_ok=True)
-    if args.csv:
-        csv_filename = os.path.basename(args.csv).replace(".csv", f"_{args.suffix}.csv")
     else:
-        csv_filename = f"gemm_a8w8_blockscale_{args.suffix}.csv"
-    out_path = os.path.join(args.output, csv_filename)
-    df.to_csv(out_path, index=False)
-    print(f"Saved results to: {out_path}")
+        for dtype in args.dtype:
+            for m in args.m:
+                for n, k in args.nk:
+                    for ck_p in l_preshuffle:
+                        for apre in l_apre:
+                            for data_init, scale_init in init_pairs:
+                                ret = test_gemm(
+                                    dtype,
+                                    m,
+                                    n,
+                                    k,
+                                    ck_preshuffle=ck_p,
+                                    use_flydsl=args.flydsl,
+                                    data_init=data_init,
+                                    scale_init=scale_init,
+                                    seed=args.seed,
+                                    apre=apre,
+                                    w_scale_block=args.w_scale_block,
+                                )
+                                df.append(ret)
+
+    df = pd.DataFrame([row for row in df if row is not None])
+    print_json_table("gemm_a8w8_blockscale summary", df)
+    if args.table and not df.empty:
+        print("\n" + "=" * 150)
+        print("COMPLETE PERFORMANCE SUMMARY (All Columns)")
+        print("=" * 150)
+        print(df.to_string(index=False))
+        print("=" * 150)
+
+    # Correctness check: verify split-K produces matching results
+    print("\nRunning split-K correctness checks ...")
+    for splitK in [1, 2]:
+        test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
+    # Two K loops per split for the default CK-Tile tile, the shortest split it runs.
+    for m, n, k, splitK in [(8, 256, 512, 1), (8, 256, 1024, 2), (32, 512, 2048, 3)]:
+        test_splitk_correctness(m=m, n=n, k=k, splitK=splitK)
+
+    # Save results from benchmarks
+    if args.output:
+        os.makedirs(args.output, exist_ok=True)
+        if args.csv:
+            csv_filename = os.path.basename(args.csv).replace(
+                ".csv", f"_{args.suffix}.csv"
+            )
+        else:
+            csv_filename = f"gemm_a8w8_blockscale_{args.suffix}.csv"
+        out_path = os.path.join(args.output, csv_filename)
+        df.to_csv(out_path, index=False)
+        print(f"Saved results to: {out_path}")
+
+    if get_gfx() in ("gfx942", "gfx950"):
+        # Exact tiles exercise all PF2 variants; tails/odd KB exercise PF1.
+        shapes = (
+            [(256, 512, 512), (256, 512, 128), (333, 528, 384), (1, 16, 128)]
+            if get_gfx() == "gfx942"
+            else [(256, 512, 512)]
+        )
+        rows = [
+            test_flydsl_fp32_scales(m, n, k, dtype, packed, storage)
+            for (m, n, k), dtype, packed, storage in itertools.product(
+                shapes,
+                (dtypes.bf16, dtypes.fp16),
+                (False, True),
+                ("contiguous", "offset", "strided"),
+            )
+        ]
+        if get_gfx() == "gfx942":
+            rows.extend(
+                test_flydsl_fp32_scales(1, 16, 128, dtype, packed, "singleton")
+                for dtype, packed in itertools.product(
+                    (dtypes.bf16, dtypes.fp16), (False, True)
+                )
+            )
+        aiter.logger.info(
+            "FlyDSL FP32 blockscale summary:\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
+
+
+if __name__ == "__main__":
+    main()

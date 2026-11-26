@@ -467,7 +467,7 @@ Also verified (`AITER_FLYDSL_AOT_CACHE_DIR` fresh each time):
   `kernels/preshuffle_gemm.py` or the wrapper rebuilds only these entries,
   and restoring it hits the earlier variants with no rebuild.
 
-### 5.2 gfx950: `run_gemm_a8w8_blockscale`
+### 5.2 gfx942 / gfx950: `run_gemm_a8w8_blockscale`
 
 ```python
 _run_compiled(
@@ -475,6 +475,13 @@ _run_compiled(
     ...
 )
 ```
+
+On gfx942 the same factory covers ordinary/packed PF1 and packed PF2.
+Its key is `(N, K, kernel_name, device, out_dtype)`; the wrapper normalizes
+operand dtypes, ranks and contiguous layouts before launch. The PF1 and PF2
+kernel files and their registry are declared sources. PF2 split-K workspace
+is allocated on the input device and remains a runtime tensor argument.
+The standard GEMM CSV replay also discovers these tuned rows.
 
 `_compile_gemm` (an `aot_factory`) keeps one launcher per device, so the
 device is one of its arguments and so in `key`

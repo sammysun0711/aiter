@@ -28,10 +28,12 @@ If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `A
 
 ## More Options
 
-### FlyDSL blockscale (gfx950)
+### FlyDSL blockscale (gfx942 and gfx950)
 
 Use `--libtype flydsl` for FlyDSL only, or `--libtype all` to compare it with
-the other backends. Inputs are FP8 E4M3FN with FP32 scales; output is BF16.
+the other backends. Inputs use FP8 E4M3FNUZ on gfx942 and E4M3FN on gfx950,
+with FP32 block scales. The tuner measures BF16 output; the public adapter
+also supports FP16 output.
 
 - Plain B: row-major `x_scale[M, K/128]`; the adapter transposes it to
   `[K/128, M]` inside the timed call.
@@ -40,8 +42,18 @@ the other backends. Inputs are FP8 E4M3FN with FP32 scales; output is BF16.
   Pass `-o aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv`, and keep
   `--preshuffle` when replaying with `--run_config`.
 
-Public API defaults are unchanged; FlyDSL runs only where a tuned CSV row
-selects it.
+On gfx942, PF1 IDs 15/16 use 256×256 tiles for ordinary/packed weights,
+including partial M/N tiles (N must be divisible by 16, K by 128).
+Packed PF2 IDs 17–23 tune the prefetch pipeline, B-scale reuse, split-K and
+output stores. PF2 uses N divisible by 256 and either M divisible by 256
+or, for the 224-row variants, by 32. The registry applies additional offset
+and split-K bounds before launching candidates. Historical prototype IDs
+2–14 are reserved and are not searched.
+
+FlyDSL runs where a tuned CSV row selects it; the fallback policy is unchanged.
+Compare public-API timings with the rows being replaced before promoting
+native-tuner winners. Native profiler and public graph timings can rank
+candidates differently.
 
 ### Output Configuration
 

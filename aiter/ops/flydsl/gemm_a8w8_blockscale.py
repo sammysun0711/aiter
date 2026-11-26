@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Aiter adapter for the rebased half-M, raw-DMA FP8 blockscale kernel."""
+"""AITER launch adapter for FP32 block-scaled FP8 GEMM."""
 
 import functools
 
 import torch
 from torch import Tensor
+
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .aot_launch import aot_factory
 from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
@@ -14,8 +16,8 @@ from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
     TILE_M,
     TILE_N,
     kernel_fits_shape,
-    kernelInstance,
     kernels_by_name,
+    kernels_list,
 )
 
 
@@ -29,13 +31,17 @@ def is_supported(XQ: Tensor, WQ: Tensor, Out: Tensor, preshuffle_b: bool) -> boo
         return False
     if not XQ.is_cuda or WQ.device != XQ.device or Out.device != XQ.device:
         return False
-    fp8_storage = (torch.float8_e4m3fn, torch.int8, torch.uint8)
+    gfx = get_gfx_runtime()
+    fp8_dtype = torch.float8_e4m3fnuz if gfx == "gfx942" else torch.float8_e4m3fn
+    fp8_storage = (fp8_dtype, torch.int8, torch.uint8)
     if XQ.dtype not in fp8_storage or WQ.dtype not in fp8_storage:
         return False
     if Out.dtype not in (torch.bfloat16, torch.float16):
         return False
-    gfx = torch.cuda.get_device_properties(XQ.device).gcnArchName.split(":", 1)[0]
-    return kernel_fits_shape(kernelInstance(preshuffle_b), M, N, K, gfx)
+    return any(
+        ki.preshuffle_b == preshuffle_b and kernel_fits_shape(ki, M, N, K, gfx)
+        for ki in kernels_list.values()
+    )
 
 
 def _prepare_scales(
@@ -83,6 +89,8 @@ def _prepare_scales(
     sources=[
         "gemm_tune/flydsl_gemm_a8w8_blockscale_common.py",
         "kernels/gemm_a8w8_blockscale_8wave.py",
+        "kernels/gemm_a8w8_blockscale_gfx942_2x4_lds.py",
+        "kernels/gemm_a8w8_blockscale_gfx942_pf2.py",
     ],
 )
 @functools.lru_cache(maxsize=1024)
@@ -93,21 +101,27 @@ def _compile_gemm(
     device: torch.device,
     out_dtype: torch.dtype = torch.bfloat16,
 ):
-    from .kernels.gemm_a8w8_blockscale_8wave import compile_gemm_fp8_8wave
-
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("FlyDSL blockscale requires BF16 or FP16 output")
     # The output tensor specializes the epilogue. Keep separate launchers since
-    # each caches the first typed CompiledFunction it compiles.
+    # _run_compiled caches the first typed CompiledFunction on each launcher.
     ki = kernels_by_name[kernel_name]
-    launch = compile_gemm_fp8_8wave(
-        TILE_M,
-        TILE_N,
-        TILE_K,
-        N,
-        K,
-        preshuffle_b=ki.preshuffle_b,
-    )
+    if ki.variant.startswith("pf2"):
+        from .kernels.gemm_a8w8_blockscale_gfx942_pf2 import compile_pf2
+
+        launch = compile_pf2(N, K, kernel_name, ki.variant, out_dtype == torch.float16)
+    elif ki.variant == "2x4_lds_pf1":
+        from .kernels.gemm_a8w8_blockscale_gfx942_2x4_lds import (
+            compile_blockscale_gfx942_2x4_lds,
+        )
+
+        launch = compile_blockscale_gfx942_2x4_lds(N, K, ki.preshuffle_b, kernel_name)
+    else:
+        from .kernels.gemm_a8w8_blockscale_8wave import compile_gemm_fp8_8wave
+
+        launch = compile_gemm_fp8_8wave(
+            TILE_M, TILE_N, TILE_K, N, K, preshuffle_b=ki.preshuffle_b
+        )
     # Match the prototype's flyc.compile[{"opt_level": 2}] without a global knob.
     launch.compile_hints["opt_level"] = 2
     return launch
@@ -126,7 +140,7 @@ def run_gemm_a8w8_blockscale(
 
     Plain B: XQ[M,K], WQ[N,K], row-major x_scale[M,K/128].
     Preshuffled B: shuffle_weight(WQ, (16,16)) and column-major x_scale.
-    Both use w_scale[ceil(N/128),K/128] and BF16/FP16 output on gfx950.
+    Both use w_scale[ceil(N/128),K/128] and BF16/FP16 output.
     """
     ki = kernels_by_name.get(kernel_name)
     if ki is None:
@@ -142,25 +156,67 @@ def run_gemm_a8w8_blockscale(
 
     M, K = XQ.shape
     N = WQ.shape[0]
+    if not kernel_fits_shape(ki, M, N, K, get_gfx_runtime()):
+        raise ValueError(f"{kernel_name} cannot serve this device or shape")
     with torch.cuda.device(XQ.device):
         sa, sb = _prepare_scales(x_scale, w_scale, M, N, K, preshuffle_b)
+        launch = _compile_gemm.lazy(int(N), int(K), kernel_name, XQ.device, Out.dtype)
         out_contiguous = Out.contiguous()
-        # Every tensor is contiguous and only Out's dtype varies, so the
-        # compile arguments determine the launcher's argument signature. The
-        # device keeps one launcher per device on the JIT path; on disk the
-        # entry is shared by every device.
+        copy_back = out_contiguous is not Out
         # Keep matrix dimensions separate in the launch ABI: flattening a
         # >2**31-element matrix overflows a dynamic i32 FlyDSL extent.
-        _run_compiled(
-            _compile_gemm.lazy(N, K, kernel_name, XQ.device, Out.dtype),
-            XQ.contiguous().view(torch.int8),
-            WQ.contiguous().view(torch.int8),
-            out_contiguous,
-            sa,
-            sb,
-            M,
-            current_stream_arg(XQ.device),
-        )
-        if out_contiguous is not Out:
+        a, b = XQ.contiguous(), WQ.contiguous()
+        if ki.gfx == "gfx942":
+            # Each MFMA operand is eight FP8 bytes. Offset views may require
+            # realignment even if PyTorch considers the matrix contiguous.
+            # Canonicalize strides on singleton dimensions too: contiguous()
+            # may preserve stride(0)=1 for M=1, which cannot be viewed as i64.
+            # This also fixes the rank/unit-stride signature per cached launcher.
+            if a.stride() != (K, 1):
+                a = a.reshape(-1).view(M, K)
+            if b.stride() != (K, 1):
+                b = b.reshape(-1).view(N, K)
+            if out_contiguous.stride() != (N, 1):
+                out_contiguous = out_contiguous.reshape(-1).view(M, N)
+            # A one-element contiguous scale can retain an arbitrary stride;
+            # canonicalize its launcher signature without moving its data.
+            if sa.stride() != (1,):
+                sa = sa.as_strided(sa.shape, (1,))
+            if sb.stride() != (1,):
+                sb = sb.as_strided(sb.shape, (1,))
+            # Both pipelines issue 16-byte operand loads.
+            alignment = 16
+            a = (
+                a.clone() if a.storage_offset() % 8 or a.data_ptr() % alignment else a
+            ).view(torch.int64)
+            b = (
+                b.clone() if b.storage_offset() % 8 or b.data_ptr() % alignment else b
+            ).view(torch.int64)
+            # Vectorized output stores need either 8- or 16-byte alignment.
+            output_alignment = (
+                16
+                if ki.variant.startswith("pf2_vec")
+                or ki.variant in ("pf2_split2", "pf2_ldsout")
+                else 8
+            )
+            if (
+                ki.variant == "2x4_lds_pf1" or ki.variant.startswith("pf2")
+            ) and out_contiguous.data_ptr() % output_alignment:
+                out_contiguous = torch.empty_like(out_contiguous)
+                copy_back = True
+        else:
+            a, b = a.view(torch.int8), b.view(torch.int8)
+        stream = current_stream_arg(XQ.device)
+        if ki.variant == "pf2_split2":
+            partials = torch.empty((2 * M * N,), dtype=torch.float32, device=XQ.device)
+            _run_compiled(launch, a, b, out_contiguous, sa, sb, M, partials, stream)
+        else:
+            target = (
+                out_contiguous.view(torch.int32)
+                if ki.variant.startswith("pf2")
+                else out_contiguous
+            )
+            _run_compiled(launch, a, b, target, sa, sb, M, stream)
+        if copy_back:
             Out.copy_(out_contiguous)
     return Out
